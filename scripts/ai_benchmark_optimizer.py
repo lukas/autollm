@@ -2,11 +2,11 @@
 """
 AI-driven vLLM optimization: run baseline, get AI suggestion, apply, benchmark, compare.
 
-Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY. Uses VLLM_CONFIG (default: ../runllm/vllm-qwen.yaml).
+Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY. Uses VLLM_CONFIG (default: runllm/vllm-qwen.yaml).
 
 Usage:
   ANTHROPIC_API_KEY=xxx make ai-benchmark-optimize
-  VLLM_CONFIG=../runllm/vllm-qwen.yaml make ai-benchmark-optimize
+  VLLM_CONFIG=runllm/vllm-qwen.yaml make ai-optimize
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_VLLM = PROJECT_ROOT.parent / "runllm" / "vllm-qwen.yaml"
+_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "vllm-qwen.yaml"
 VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
 RESULTS_DIR = PROJECT_ROOT / "results"
 RUNS_DIR = RESULTS_DIR / "runs"

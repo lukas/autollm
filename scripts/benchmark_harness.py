@@ -6,7 +6,7 @@ Each run is saved to results/runs/YYYYMMDD_HHMMSS/. Requires vLLM port-forward.
 
 Usage:
   python scripts/benchmark_harness.py [--description "My change"]
-  VLLM_CONFIG=../runllm/vllm-qwen.yaml make benchmark-run
+  VLLM_CONFIG=runllm/vllm-qwen.yaml make benchmark-run
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
-# Default: ../runllm/vllm-qwen.yaml when autollm is sibling of runllm
-_DEFAULT_VLLM = PROJECT_ROOT.parent / "runllm" / "vllm-qwen.yaml"
+# Default: runllm/vllm-qwen.yaml (runllm is submodule inside autollm)
+_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "vllm-qwen.yaml"
 VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
 BENCHMARK_LIVE_FILE = PROJECT_ROOT / "results" / "benchmark_live.txt"
 

@@ -79,7 +79,7 @@ class ResultsHandler(SimpleHTTPRequestHandler):
             env["AI_OPTIMIZER_LOG"] = str(AGENT_LOG_FILE)
             env["BENCHMARK_MODE"] = benchmark_mode
             if "VLLM_CONFIG" not in env:
-                env["VLLM_CONFIG"] = str(PROJECT_ROOT.parent / "runllm" / "vllm-qwen.yaml")
+                env["VLLM_CONFIG"] = str(PROJECT_ROOT / "runllm" / "vllm-qwen.yaml")
             proc = subprocess.Popen(
                 ["uv", "run", "python", "-u", str(PROJECT_ROOT / "scripts" / "ai_benchmark_optimizer.py")],
                 cwd=str(PROJECT_ROOT),

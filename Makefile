@@ -1,5 +1,5 @@
 # autollm - Benchmark harness, AI optimizer, dashboard
-# Requires: runllm (sibling) for vLLM config, vllm-qwen pod + port-forward
+# Requires: runllm submodule (runllm/) for vLLM config, vllm-qwen pod + port-forward
 
 -include ../.env
 -include .env
@@ -37,10 +37,10 @@ guidellm-bench-quick: sync
 # Harness: saves to results/runs/YYYYMMDD_HHMMSS/
 benchmark-run: sync
 	@echo "Requires: cd runllm && make forward"
-	VLLM_CONFIG=../runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
+	VLLM_CONFIG=runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
 
 benchmark-run-quick: sync
-	VLLM_CONFIG=../runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
+	VLLM_CONFIG=runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
 
 # Results
 results-summary:
@@ -68,4 +68,4 @@ dashboard:
 # AI optimizer (CLI)
 ai-optimize: sync
 	@echo "Requires: runllm forward, ANTHROPIC_API_KEY or OPENAI_API_KEY"
-	VLLM_CONFIG=../runllm/vllm-qwen.yaml uv run python scripts/ai_benchmark_optimizer.py
+	VLLM_CONFIG=runllm/vllm-qwen.yaml uv run python scripts/ai_benchmark_optimizer.py
