@@ -20,10 +20,19 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
+RUNLLM_DIR = PROJECT_ROOT / "runllm"
 # Default: runllm/vllm-qwen.yaml (runllm is submodule inside autollm)
 _DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "vllm-qwen.yaml"
 VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
 BENCHMARK_LIVE_FILE = PROJECT_ROOT / "results" / "benchmark_live.txt"
+
+
+BENCHMARK_PRESETS = {
+    "quick": ("synchronous", "5", "30", "prompt_tokens=64,output_tokens=64"),
+    "sync": ("synchronous", "20", "60", "prompt_tokens=64,output_tokens=64"),
+    "sweep": ("sweep", None, "60", "prompt_tokens=256,output_tokens=128"),
+    "full": ("synchronous", "200", "600", "prompt_tokens=256,output_tokens=128"),
+}
 
 
 def main() -> None:
@@ -41,7 +50,36 @@ def main() -> None:
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Quick benchmark: 5 requests, 30s max (for agent experimentation)",
+        help="Quick benchmark: 5 requests, 30s max (alias for --benchmark quick)",
+    )
+    parser.add_argument(
+        "--benchmark", "-b",
+        choices=list(BENCHMARK_PRESETS),
+        default="full",
+        help="Preset: quick (5 req), sync (20 req), sweep (60s), full (200 req)",
+    )
+    parser.add_argument(
+        "--profile",
+        help="Override profile (synchronous, sweep, etc.)",
+    )
+    parser.add_argument(
+        "--data",
+        help="Override data config (e.g. prompt_tokens=64,output_tokens=64)",
+    )
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        help="Override max requests",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        help="Override max seconds",
+    )
+    parser.add_argument(
+        "--start-llm",
+        action="store_true",
+        help="Start vLLM first (make -C runllm start) before benchmark",
     )
     args = parser.parse_args()
 
@@ -70,22 +108,57 @@ def main() -> None:
     except Exception as e:
         _log(run_dir, "run.log", f"Could not capture pod status: {e}")
 
+    # Resolve benchmark config
+    preset = BENCHMARK_PRESETS.get("quick" if args.fast else args.benchmark, BENCHMARK_PRESETS["full"])
+    cfg = {
+        "profile": args.profile or preset[0],
+        "max_requests": str(args.max_requests) if args.max_requests is not None else preset[1],
+        "max_seconds": str(args.max_seconds) if args.max_seconds is not None else preset[2],
+        "data": args.data or preset[3],
+    }
+
     # 3. Write run metadata
     metadata = {
         "timestamp": ts,
         "description": args.description,
+        "benchmark": args.benchmark if not args.fast else "quick",
+        "benchmark_config": cfg,
         "vllm_config": str(VLLM_YAML),
     }
     (run_dir / "run_metadata.json").write_text(
         __import__("json").dumps(metadata, indent=2)
     )
 
-    # 4. Run benchmark
-    _log(run_dir, "run.log", "Starting Guideline benchmark...")
-    if args.skip_port_forward:
-        result = _run_guideline(run_dir, fast=args.fast)
+    # 4. Optionally start LLM
+    if args.start_llm:
+        _log(run_dir, "run.log", "Starting vLLM (runllm)...")
+        proc = subprocess.Popen(
+            ["make", "start"],
+            cwd=str(RUNLLM_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        out_lines = []
+        if proc.stdout:
+            for line in proc.stdout:
+                out_lines.append(line)
+                with open(run_dir / "run.log", "a", encoding="utf-8") as f:
+                    f.write(line)
+                    f.flush()
+                print(line, end="")
+        proc.wait()
+        if proc.returncode != 0:
+            _log(run_dir, "run.log", f"runllm start failed: exit {proc.returncode}")
+            sys.exit(proc.returncode)
+        _log(run_dir, "run.log", "vLLM ready")
+
+    # 5. Run benchmark
+    _log(run_dir, "run.log", f"Starting Guideline benchmark: profile={cfg['profile']} {cfg['max_requests'] or '?'} req, {cfg['max_seconds']}s max...")
+    if args.skip_port_forward or args.start_llm:
+        result = _run_guideline(run_dir, config=cfg)
     else:
-        result = _run_with_port_forward(run_dir, fast=args.fast)
+        result = _run_with_port_forward(run_dir, config=cfg)
 
     if result != 0:
         _log(run_dir, "run.log", "Benchmark failed")
@@ -93,14 +166,14 @@ def main() -> None:
 
     _log(run_dir, "run.log", "Benchmark complete")
 
-    # 5. Generate summary for this run
+    # 6. Generate summary for this run
     subprocess.run(
         [sys.executable, str(PROJECT_ROOT / "scripts" / "benchmark_summary.py"), str(run_dir)],
         cwd=str(PROJECT_ROOT),
         check=True,
     )
 
-    # 6. Regenerate runs index
+    # 7. Regenerate runs index
     generate_runs_index()
 
     print(f"Run saved to {run_dir}")
@@ -116,30 +189,30 @@ def _log(run_dir: Path, filename: str, msg: str) -> None:
     print(msg)
 
 
-def _run_guideline(run_dir: Path, *, fast: bool = False) -> int:
+def _run_guideline(run_dir: Path, *, config: dict) -> int:
     """Run Guideline benchmark via CLI, streaming output to benchmark_live.txt."""
-    if fast:
-        max_requests, max_seconds = "5", "30"
-        data = "prompt_tokens=64,output_tokens=64"
-    else:
-        max_requests, max_seconds = "200", "600"
-        data = "prompt_tokens=256,output_tokens=128"
+    profile = config["profile"]
+    max_requests = config["max_requests"]
+    max_seconds = config["max_seconds"]
+    data = config["data"]
 
     cmd = [
         "uv", "run", "guidellm", "benchmark",
         "--target", "http://localhost:8000",
         "--backend-args", '{"http2":false}',
-        "--profile", "synchronous",
+        "--profile", profile,
         "--request-type", "chat_completions",
-        "--max-requests", max_requests,
         "--max-seconds", max_seconds,
         "--data", data,
-        "--output-path", str(run_dir),
-        "--outputs", "json", "--outputs", "csv",
+        "--output-dir", str(run_dir),
+        "--outputs", "json",
+        "--outputs", "csv",
         "--disable-progress",
     ]
+    if max_requests:
+        cmd.extend(["--max-requests", max_requests])
     BENCHMARK_LIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BENCHMARK_LIVE_FILE.write_text(f"Starting benchmark ({max_requests} requests, {max_seconds}s max)...\n")
+    BENCHMARK_LIVE_FILE.write_text(f"Starting benchmark (profile={profile}, {max_requests or '?'} req, {max_seconds}s max)...\n")
 
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     log_lines = []
@@ -160,10 +233,13 @@ def _run_guideline(run_dir: Path, *, fast: bool = False) -> int:
             run_log.read_text() + "\n--- Guideline stdout ---\n" + "".join(log_lines),
             encoding="utf-8",
         )
+    # Guideline may write benchmark.json (singular); ensure benchmarks.json exists
+    if proc.returncode == 0 and (run_dir / "benchmark.json").exists() and not (run_dir / "benchmarks.json").exists():
+        shutil.copy(run_dir / "benchmark.json", run_dir / "benchmarks.json")
     return proc.returncode
 
 
-def _run_with_port_forward(run_dir: Path, *, fast: bool = False) -> int:
+def _run_with_port_forward(run_dir: Path, *, config: dict) -> int:
     """Start port-forward, run Guideline, stop port-forward."""
     import time
     import urllib.request
@@ -192,7 +268,7 @@ def _run_with_port_forward(run_dir: Path, *, fast: bool = False) -> int:
             _log(run_dir, "run.log", "Timeout: vllm-qwen not reachable. Run: cd runllm && make forward")
             return 1
 
-        return _run_guideline(run_dir, fast=fast)
+        return _run_guideline(run_dir, config=config)
     finally:
         pf.terminate()
         pf.wait(timeout=5)

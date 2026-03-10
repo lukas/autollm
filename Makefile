@@ -4,7 +4,10 @@
 -include ../.env
 -include .env
 
-.PHONY: sync bench bench-quick benchmark-run benchmark-run-quick results-summary results-index serve dashboard ai-optimize
+BENCHMARK ?= full
+DESCRIPTION ?=
+
+.PHONY: sync bench bench-quick benchmark benchmark-run benchmark-run-quick results-summary results-index serve dashboard ai-optimize
 
 # Install deps
 sync:
@@ -34,7 +37,15 @@ guidellm-bench-quick: sync
 		--data "prompt_tokens=64,output_tokens=64" \
 		--output-path results
 
-# Harness: saves to results/runs/YYYYMMDD_HHMMSS/
+# One-shot: start LLM, run Guideline benchmark, save to results/runs/YYYYMMDD_HHMMSS/
+# Usage: make benchmark
+#        make benchmark BENCHMARK=quick
+#        make benchmark BENCHMARK=sweep DESCRIPTION="baseline"
+# Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req)
+benchmark: sync
+	@python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)"
+
+# Harness: saves to results/runs/YYYYMMDD_HHMMSS/ (requires port-forward)
 benchmark-run: sync
 	@echo "Requires: cd runllm && make forward"
 	VLLM_CONFIG=runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
