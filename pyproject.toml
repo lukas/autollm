@@ -1,0 +1,10 @@
+[project]
+name = "autollm"
+version = "0.1.0"
+description = "Benchmark harness, AI optimizer agent, and dashboard for vLLM"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+guidellm = ["guidellm[recommended]>=0.5.3"]
+ai_optimizer = ["anthropic>=0.39", "openai>=1.0"]

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>API Request & Response</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --surface: #1a1a1f;
+      --border: #2a2a32;
+      --text: #e4e4e7;
+      --muted: #a1a1aa;
+      --link: #60a5fa;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace; background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem; }
+    h1 { font-size: 1.25rem; margin-bottom: 1rem; }
+    a { color: var(--link); }
+    .back { margin-bottom: 1rem; }
+    .section { margin-bottom: 2rem; }
+    .section h2 { font-size: 0.95rem; color: var(--muted); margin-bottom: 0.5rem; }
+    .section pre { background: #08080a; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 0.8rem; max-height: 60vh; overflow-y: auto; }
+    .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .pending { color: var(--muted); font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="back"><a href="ai_optimizer.html">← Back to dashboard</a></div>
+  <h1>API request & response</h1>
+  <p class="meta">Live view — refreshes every 2s. Shows the latest optimizer API call.</p>
+
+  <div class="section">
+    <h2>Request (prompt to model)</h2>
+    <div id="request-meta" class="meta"></div>
+    <pre id="request-body"></pre>
+  </div>
+  <div class="section">
+    <h2>Response</h2>
+    <div id="response-meta" class="meta"></div>
+    <pre id="response-body"></pre>
+  </div>
+
+  <script>
+    function load() {
+      fetch('ai_api_exchange.json')
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (!data) {
+            document.getElementById('request-body').textContent = 'No data yet. Click Start on the dashboard — the request appears as soon as the optimizer sends it (after a few seconds of initialization).';
+            document.getElementById('response-body').textContent = '';
+            document.getElementById('request-meta').textContent = '';
+            document.getElementById('response-meta').textContent = '';
+            return;
+          }
+          const req = data.request;
+          const res = data.response;
+          document.getElementById('request-meta').textContent = req && req.provider && req.model
+            ? `${req.provider} / ${req.model} · ${data.request_at || ''}`
+            : (data.message || '');
+          document.getElementById('request-body').textContent = req && req.prompt != null
+            ? req.prompt
+            : (data.message || 'Waiting for request...');
+          document.getElementById('response-meta').textContent = res
+            ? `Received ${data.response_at || ''}`
+            : 'Waiting for response...';
+          document.getElementById('response-body').textContent = res && res.raw != null
+            ? res.raw
+            : (res === null ? 'Waiting for response...' : '');
+        })
+        .catch(() => {
+          document.getElementById('request-body').textContent = 'Failed to load. Is the optimizer running?';
+          document.getElementById('response-body').textContent = '';
+        });
+    }
+    load();
+    setInterval(load, 2000);
+  </script>
+</body>
+</html>

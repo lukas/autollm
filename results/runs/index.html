@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Benchmark Runs</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { color: #333; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 10px 12px; text-align: left; }
+    th { background: #f5f5f5; font-weight: 600; }
+    tr:nth-child(even) { background: #fafafa; }
+    a { color: #2A8EFD; }
+  </style>
+</head>
+<body>
+  <h1>Benchmark Run History</h1>
+  <p>Each run is saved to <code>results/runs/YYYYMMDD_HHMMSS/</code>. Use <code>make benchmark-run</code> to add a new run.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>Description</th>
+        <th>Metrics</th>
+        <th>Links</th>
+      </tr>
+    </thead>
+    <tbody>
+      
+        <tr>
+            <td>20260310_122050</td>
+            <td>AI suggestion (anthropic)</td>
+            <td>576ms · TTFT 134ms · 298 tok/s</td>
+            <td><a href="20260310_122050/summary.html">summary</a> · <a href="20260310_122050/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_121902</td>
+            <td>baseline</td>
+            <td>259ms · TTFT 118ms · 718 tok/s</td>
+            <td><a href="20260310_121902/summary.html">summary</a> · <a href="20260310_121902/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_121229</td>
+            <td>AI suggestion (anthropic)</td>
+            <td>—</td>
+            <td><a href="20260310_121229/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_121044</td>
+            <td>baseline</td>
+            <td>537ms · TTFT 103ms · 305 tok/s</td>
+            <td><a href="20260310_121044/summary.html">summary</a> · <a href="20260310_121044/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_120727</td>
+            <td>baseline</td>
+            <td>—</td>
+            <td><a href="20260310_120727/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_120404</td>
+            <td>baseline</td>
+            <td>570ms · TTFT 134ms · 303 tok/s</td>
+            <td><a href="20260310_120404/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_115956</td>
+            <td>baseline</td>
+            <td>—</td>
+            <td><a href="20260310_115956/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_093014</td>
+            <td>AI suggestion (anthropic)</td>
+            <td>—</td>
+            <td><a href="20260310_093014/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260310_092605</td>
+            <td>AI suggestion (anthropic)</td>
+            <td>—</td>
+            <td><a href="20260310_092605/vllm_config.yaml">config</a></td>
+        </tr>
+        <tr>
+            <td>20260309_183510</td>
+            <td>baseline</td>
+            <td>242ms · TTFT 97ms · 661 tok/s</td>
+            <td><a href="20260309_183510/summary.html">summary</a> · <a href="20260309_183510/benchmarks.html">full report</a></td>
+        </tr>
+    </tbody>
+  </table>
+</body>
+</html>

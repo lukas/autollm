@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Benchmark Optimizer</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --surface: #1a1a1f;
+      --border: #2a2a32;
+      --text: #e4e4e7;
+      --muted: #a1a1aa;
+      --accent: #22c55e;
+      --accent-dim: #16a34a;
+      --warn: #eab308;
+      --error: #ef4444;
+      --link: #60a5fa;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace; background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem; min-height: 100vh; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; }
+    .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+    .live-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
+    .live-card.running { border-color: var(--accent-dim); box-shadow: 0 0 0 1px var(--accent-dim); }
+    .live-card.error { border-color: var(--error); }
+    .status-badge { display: inline-block; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; }
+    .status-badge.running { background: rgba(34, 197, 94, 0.2); color: var(--accent); }
+    .status-badge.error { background: rgba(239, 68, 68, 0.2); color: var(--error); }
+    .status-badge.idle { background: rgba(161, 161, 170, 0.2); color: var(--muted); }
+    .step { font-size: 1rem; margin-top: 0.5rem; color: var(--text); }
+    .strategy { color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem; font-style: italic; }
+    .history-section { margin-top: 2rem; }
+    .history-section h2 { font-size: 1.1rem; margin-bottom: 1rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    tr:hover { background: rgba(255,255,255,0.02); }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .metrics { font-family: inherit; color: var(--muted); font-size: 0.8rem; max-width: 420px; }
+    .pulse { animation: pulse 1.5s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .poll-info { color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }
+    .controls { margin-top: 1rem; display: flex; gap: 0.5rem; align-items: center; }
+    .controls-bar { margin-bottom: 1rem; }
+    .btn { padding: 0.5rem 1rem; border-radius: 6px; font-family: inherit; font-size: 0.9rem; font-weight: 500; cursor: pointer; border: none; }
+    .btn-start { background: var(--accent); color: var(--bg); }
+    .btn-start:hover { background: var(--accent-dim); filter: brightness(1.1); }
+    .btn-stop { background: var(--error); color: white; }
+    .btn-stop:hover { filter: brightness(1.15); }
+    .log-panel { margin-top: 1.5rem; }
+    .log-panel h3 { font-size: 0.9rem; color: var(--muted); margin-bottom: 0.5rem; }
+    .log-output { background: #08080a; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; max-height: 320px; overflow-y: auto; font-size: 0.8rem; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+    .log-output:empty::before { content: 'No output yet...'; color: var(--muted); }
+    .fix-suggestion { margin-top: 1rem; padding: 1rem; background: rgba(234, 179, 8, 0.1); border: 1px solid var(--warn); border-radius: 6px; }
+    .fix-suggestion pre { white-space: pre-wrap; margin: 0.5rem 0 0; font-size: 0.85rem; }
+    select { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0.35rem 0.5rem; font-family: inherit; }
+  </style>
+</head>
+<body>
+  <h1>AI Benchmark Optimizer</h1>
+  <p class="subtitle">Live updates · History of attempts · <a href="api_exchange.html" target="_blank">View API request & response</a></p>
+
+  <div class="controls controls-bar">
+    <label style="display: flex; align-items: center; gap: 0.5rem;">
+      <span style="color: var(--muted); font-size: 0.9rem;">Benchmark:</span>
+      <select id="benchmark-mode">
+        <option value="fast">Fast (5 req, ~15s)</option>
+        <option value="full">Full (200 req, ~10 min)</option>
+      </select>
+    </label>
+    <button id="btn-start" class="btn btn-start">Start</button>
+    <button id="btn-stop" class="btn btn-stop" style="display: none;">Stop</button>
+  </div>
+
+  <div id="log-panel" class="log-panel">
+    <h3>Output</h3>
+    <pre id="log-output" class="log-output"></pre>
+  </div>
+  <div id="benchmark-progress-panel" class="log-panel" style="display: none;">
+    <h3>Benchmark progress</h3>
+    <pre id="benchmark-progress-output" class="log-output"></pre>
+  </div>
+
+  <div id="live" class="live-card" style="display: none;"></div>
+  <div id="idle" class="live-card" style="display: none;">
+    <span class="status-badge idle">Idle</span>
+    <p class="step">No optimization in progress. Click Start above.</p>
+  </div>
+  <div class="history-section">
+    <h2>Benchmark runs</h2>
+    <p class="subtitle" style="margin-top: -0.5rem; margin-bottom: 1rem;">All runs from results/runs/ — baseline and optimization</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Description</th>
+          <th>Strategy</th>
+          <th>Changes</th>
+          <th>Metrics</th>
+          <th>Links</th>
+        </tr>
+      </thead>
+      <tbody id="history"></tbody>
+    </table>
+  </div>
+
+  <p class="poll-info">Auto-refreshes every 2s. Serve with <code>make results-serve</code> then open this page.</p>
+
+  <script>
+    const liveEl = document.getElementById('live');
+    const idleEl = document.getElementById('idle');
+    const historyEl = document.getElementById('history');
+    const logPanel = document.getElementById('log-panel');
+    const logOutput = document.getElementById('log-output');
+    const benchmarkProgressPanel = document.getElementById('benchmark-progress-panel');
+    const benchmarkProgressOutput = document.getElementById('benchmark-progress-output');
+
+    function render() {
+      fetch('ai_optimizer_state.json')
+        .then(r => r.ok ? r.json() : { history: [] })
+        .catch(() => ({ history: [] }))
+        .then(data => {
+          const current = data.current_run;
+          const history = data.history || [];
+
+          if (current) {
+            idleEl.style.display = 'none';
+            liveEl.style.display = 'block';
+            document.getElementById('btn-stop').style.display = 'inline-block';
+            document.getElementById('btn-start').style.display = 'none';
+            const bmSel = document.getElementById('benchmark-mode');
+            if (bmSel) bmSel.disabled = true;
+            const showBenchmarkProgress = current.status === 'baseline' || current.status === 'benchmarking';
+            benchmarkProgressPanel.style.display = showBenchmarkProgress ? 'block' : 'none';
+            if (showBenchmarkProgress) fetchBenchmarkProgress();
+            liveEl.className = 'live-card ' + (current.status === 'error' ? 'error' : 'running');
+            const badgeClass = current.status === 'error' ? 'error' : 'running';
+            const status = current.status.replace(/_/g, ' ');
+            liveEl.innerHTML = `
+              <span class="status-badge ${badgeClass}">${status}</span>
+              <p class="step ${current.status !== 'error' ? 'pulse' : ''}">${escapeHtml(current.step || '')}</p>
+              ${current.strategy ? `<p class="strategy">"${escapeHtml(current.strategy)}"</p>` : ''}
+              ${current.changes_summary ? `<p class="metrics">Changes: ${escapeHtml(current.changes_summary)}</p>` : ''}
+              ${current.fix_suggestion ? `<div class="fix-suggestion"><strong>Fix suggestion:</strong><pre>${escapeHtml(current.fix_suggestion)}</pre></div>` : ''}
+              <a href="api_exchange.html" target="_blank" class="btn" style="background: var(--border); color: var(--text); margin-top: 0.75rem; display: inline-block;">View request & response</a>
+            `;
+          } else {
+            liveEl.style.display = 'none';
+            idleEl.style.display = 'block';
+            benchmarkProgressPanel.style.display = 'none';
+            stopBenchmarkProgressPolling();
+            document.getElementById('btn-stop').style.display = 'none';
+            document.getElementById('btn-start').style.display = 'inline-block';
+            const bmSel = document.getElementById('benchmark-mode');
+            if (bmSel) bmSel.disabled = false;
+          }
+          bindButtons();
+          if (current) {
+            fetchLogs();
+            if (current.status === 'baseline' || current.status === 'benchmarking') {
+              startBenchmarkProgressPolling();
+            } else {
+              stopBenchmarkProgressPolling();
+            }
+          }
+
+          fetchRuns();
+        });
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return '';
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    function api(path) {
+      return fetch(path, { method: 'POST' }).then(r => r.json());
+    }
+
+    function bindButtons() {
+      const startBtn = document.getElementById('btn-start');
+      const stopBtn = document.getElementById('btn-stop');
+      if (startBtn) startBtn.onclick = () => {
+        const mode = document.getElementById('benchmark-mode')?.value || 'fast';
+        fetch('/api/agent/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({benchmark: mode}) })
+          .then(r => r.json()).then(d => {
+            if (d.ok) {
+              logOutput.textContent = 'Starting...';
+              startLogPolling();
+              render();
+            }
+          });
+      };
+      if (stopBtn) stopBtn.onclick = () => api('/api/agent/stop').then(d => {
+        if (d.ok) {
+          stopLogPolling();
+          stopBenchmarkProgressPolling();
+          fetchLogs();
+          render();
+        }
+      });
+    }
+
+    let logInterval = null;
+    let benchmarkProgressInterval = null;
+    function fetchBenchmarkProgress() {
+      fetch('/api/agent/benchmark-progress').then(r => r.json()).then(d => {
+        const txt = d.progress || '';
+        benchmarkProgressOutput.textContent = txt || 'Waiting for benchmark output...';
+        benchmarkProgressOutput.scrollTop = benchmarkProgressOutput.scrollHeight;
+      }).catch(() => {});
+    }
+    function startBenchmarkProgressPolling() {
+      if (benchmarkProgressInterval) return;
+      benchmarkProgressInterval = setInterval(fetchBenchmarkProgress, 500);
+    }
+    function stopBenchmarkProgressPolling() {
+      if (benchmarkProgressInterval) { clearInterval(benchmarkProgressInterval); benchmarkProgressInterval = null; }
+    }
+    function fetchRuns() {
+      fetch('/api/runs').then(r => r.ok ? r.json() : { runs: [] }).catch(() => ({ runs: [] }))
+        .then(d => {
+          const runs = d.runs || [];
+          historyEl.innerHTML = runs.length === 0
+            ? '<tr><td colspan="6" style="color: var(--muted);">No runs yet.</td></tr>'
+            : runs.map(r => {
+                const metricsCell = r.before_metrics && r.after_metrics
+                  ? escapeHtml(r.before_metrics) + ' → ' + escapeHtml(r.after_metrics)
+                  : (r.metrics || '—');
+                const linksHtml = (r.links || []).map(l => `<a href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`).join(' · ');
+                return `<tr>
+                  <td>${escapeHtml(r.timestamp || '—')}</td>
+                  <td>${escapeHtml(r.description || '—')}</td>
+                  <td>${escapeHtml(r.strategy || '—')}</td>
+                  <td>${escapeHtml(r.changes_summary || '—')}</td>
+                  <td class="metrics">${metricsCell}</td>
+                  <td>${linksHtml || '—'}</td>
+                </tr>`;
+              }).join('');
+        });
+    }
+    function fetchLogs() {
+      fetch('/api/agent/logs').then(r => r.json()).then(d => {
+        const txt = d.logs || '';
+        logOutput.textContent = txt || 'No output yet...';
+        logOutput.scrollTop = logOutput.scrollHeight;
+      }).catch(() => { logOutput.textContent = 'Failed to fetch logs'; });
+    }
+    function startLogPolling() {
+      stopLogPolling();
+      fetchLogs();
+      logInterval = setInterval(fetchLogs, 1000);
+    }
+    function stopLogPolling() {
+      if (logInterval) { clearInterval(logInterval); logInterval = null; }
+    }
+
+    render();
+    setInterval(render, 2000);
+  </script>
+</body>
+</html>

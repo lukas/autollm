@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+results/runs/*/
+!results/runs/.gitkeep
+results/ai_optimizer_state.json
+results/ai_optimizer_output.txt
+results/ai_api_exchange.json
+results/benchmark_live.txt
+results/benchmarks.json
+results/benchmarks.csv
+results/benchmarks.html
+results/summary.html
