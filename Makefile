@@ -4,20 +4,39 @@
 -include ../.env
 -include .env
 
-BENCHMARK ?= full
+# Kubeconfig: copy to autollm/kubeconfig OR set KUBECONFIG_SERVER + KUBECONFIG_TOKEN in .env and run `make kubeconfig`
+KUBECONFIG ?= $(CURDIR)/kubeconfig
+export KUBECONFIG
+
+# Generate kubeconfig from .env (KUBECONFIG_SERVER, KUBECONFIG_TOKEN). kubeconfig is gitignored.
+kubeconfig:
+	@python3 scripts/gen_kubeconfig.py
+
+BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync bench bench-quick benchmark benchmark-run benchmark-run-quick results-summary results-index serve dashboard ai-optimize
+.PHONY: sync bench bench-quick benchmark benchmark-run benchmark-run-quick sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index serve dashboard ai-optimize query kubeconfig ensure-kubeconfig
 
-# Install deps
+ensure-kubeconfig:
+	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
+
+# Fast test (<5s): verify runllm apply runs delete before apply (no kubectl/network)
+test-sweep-setup:
+	@python3 scripts/test_sweep_setup.py
+
+# Query vLLM (requires port-forward). Usage: make query PROMPT="Hello"
+query:
+	$(MAKE) -C runllm query PROMPT="$(PROMPT)"
+
+# Install deps (unset VIRTUAL_ENV to avoid uv warning when parent cuda-play venv is active)
 sync:
-	uv sync --extra guidellm --extra ai_optimizer
+	env -u VIRTUAL_ENV uv sync --extra guidellm --extra ai_optimizer
 
 # Guideline benchmarks (runllm forward in another terminal)
 guidellm-bench: sync
 	@echo "Run 'cd runllm && make forward' in another terminal first"
 	mkdir -p results
-	uv run guidellm benchmark \
+	env -u VIRTUAL_ENV uv run guidellm benchmark \
 		--target "http://localhost:8000" \
 		--backend-args '{"http2":false}' \
 		--profile sweep \
@@ -29,7 +48,7 @@ guidellm-bench: sync
 guidellm-bench-quick: sync
 	@echo "Run 'cd runllm && make forward' first"
 	mkdir -p results
-	uv run guidellm benchmark \
+	env -u VIRTUAL_ENV uv run guidellm benchmark \
 		--target "http://localhost:8000" \
 		--backend-args '{"http2":false}' \
 		--profile synchronous \
@@ -42,8 +61,8 @@ guidellm-bench-quick: sync
 #        make benchmark BENCHMARK=quick
 #        make benchmark BENCHMARK=sweep DESCRIPTION="baseline"
 # Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req)
-benchmark: sync
-	@python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)"
+benchmark: sync ensure-kubeconfig
+	@python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
 
 # Harness: saves to results/runs/YYYYMMDD_HHMMSS/ (requires port-forward)
 benchmark-run: sync
@@ -76,7 +95,33 @@ dashboard:
 	@echo ""
 	python3 scripts/serve_results.py
 
+# Start a new sweep: create results/sweep-[name]/, run baseline, save to baseline/
+# Incomplete baselines (no benchmarks.json) are re-run automatically. Add FORCE=1 to overwrite complete baseline.
+# Usage: make sweep SWEEP=my-sweep [BENCHMARK=quick] [FORCE=1]
+sweep: BENCHMARK=quick
+sweep: sync ensure-kubeconfig
+	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
+
+# Improve a sweep: LLM suggests vLLM changes, deploy, benchmark, save to results/sweep-[name]/[timestamp]/
+# Includes modified runllm snapshot. Requires sweep baseline first.
+# Usage: make improve SWEEP=my-sweep BENCHMARK=quick
+improve: BENCHMARK=quick
+improve: sync ensure-kubeconfig
+	@env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep "$(SWEEP)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,)
+
+# AI experiment (standalone, no sweep): agent suggests changes, deploy, benchmark
+# Saves to results/runs/exp_[ts]. For sweep-based flow, use 'make improve SWEEP=name'
+# Default: quick. Override: make experiment BENCHMARK=sync|sweep|medium|long
+experiment: BENCHMARK=quick
+experiment: sync ensure-kubeconfig
+	@env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,)
+
+# Inspect experiment progress (run in another terminal while 'make experiment' or 'make improve' runs)
+# After 3 min, use 'make experiment-inspect KILL=1' to abort if stuck
+experiment-inspect:
+	@env -u VIRTUAL_ENV uv run python scripts/experiment_inspect.py $(if $(KILL),--kill,)
+
 # AI optimizer (CLI)
 ai-optimize: sync
 	@echo "Requires: runllm forward, ANTHROPIC_API_KEY or OPENAI_API_KEY"
-	VLLM_CONFIG=runllm/vllm-qwen.yaml uv run python scripts/ai_benchmark_optimizer.py
+	VLLM_CONFIG=runllm/vllm-qwen.yaml env -u VIRTUAL_ENV uv run python scripts/ai_benchmark_optimizer.py

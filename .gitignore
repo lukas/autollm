@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .env
+kubeconfig
 results/runs/*/
 !results/runs/.gitkeep
 results/ai_optimizer_state.json
@@ -12,3 +13,7 @@ results/benchmarks.json
 results/benchmarks.csv
 results/benchmarks.html
 results/summary.html
+results.txt
+results/experiment_progress.json
+results/sweep-*/
+runllm-*/

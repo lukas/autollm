@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -31,8 +34,29 @@ BENCHMARK_PRESETS = {
     "quick": ("synchronous", "5", "30", "prompt_tokens=64,output_tokens=64"),
     "sync": ("synchronous", "20", "60", "prompt_tokens=64,output_tokens=64"),
     "sweep": ("sweep", None, "60", "prompt_tokens=256,output_tokens=128"),
-    "full": ("synchronous", "200", "600", "prompt_tokens=256,output_tokens=128"),
+    "medium": ("synchronous", "200", "300", "prompt_tokens=256,output_tokens=128"),
+    "long": ("synchronous", "1000", "600", "prompt_tokens=256,output_tokens=128"),
 }
+
+# Patterns to extract completed request count from guidellm progress output.
+# Must be specific to avoid matching config dump lines (e.g. max_seconds: 300).
+_COMPLETED_PATTERNS = [
+    r"(?:successful|processed)_requests['\"]?\s*[:=]\s*(\d+)",
+    r"\b(\d+)/\d+\s*(?:requests?|completed)",
+    r"(?:^|\s)Comp\s+(\d+)(?:\s|$)",
+    r"processed_requests\D+(\d+)",
+]
+
+
+def _parse_completed_count(line: str) -> int | None:
+    for pat in _COMPLETED_PATTERNS:
+        m = re.search(pat, line, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except (ValueError, IndexError):
+                pass
+    return None
 
 
 def main() -> None:
@@ -55,7 +79,7 @@ def main() -> None:
     parser.add_argument(
         "--benchmark", "-b",
         choices=list(BENCHMARK_PRESETS),
-        default="full",
+        default="medium",
         help="Preset: quick (5 req), sync (20 req), sweep (60s), full (200 req)",
     )
     parser.add_argument(
@@ -81,10 +105,20 @@ def main() -> None:
         action="store_true",
         help="Start vLLM first (make -C runllm start) before benchmark",
     )
+    parser.add_argument(
+        "--run-dir",
+        metavar="PATH",
+        help="Output directory for this run (default: results/runs/YYYYMMDD_HHMMSS)",
+    )
     args = parser.parse_args()
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = RUNS_DIR / ts
+    if args.run_dir:
+        run_dir = Path(args.run_dir).resolve()
+        skip_index = True
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = RUNS_DIR / ts
+        skip_index = False
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Capture vLLM config
@@ -109,7 +143,7 @@ def main() -> None:
         _log(run_dir, "run.log", f"Could not capture pod status: {e}")
 
     # Resolve benchmark config
-    preset = BENCHMARK_PRESETS.get("quick" if args.fast else args.benchmark, BENCHMARK_PRESETS["full"])
+    preset = BENCHMARK_PRESETS.get("quick" if args.fast else args.benchmark, BENCHMARK_PRESETS["medium"])
     cfg = {
         "profile": args.profile or preset[0],
         "max_requests": str(args.max_requests) if args.max_requests is not None else preset[1],
@@ -119,7 +153,7 @@ def main() -> None:
 
     # 3. Write run metadata
     metadata = {
-        "timestamp": ts,
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S") if args.run_dir else ts,
         "description": args.description,
         "benchmark": args.benchmark if not args.fast else "quick",
         "benchmark_config": cfg,
@@ -155,6 +189,7 @@ def main() -> None:
 
     # 5. Run benchmark
     _log(run_dir, "run.log", f"Starting Guideline benchmark: profile={cfg['profile']} {cfg['max_requests'] or '?'} req, {cfg['max_seconds']}s max...")
+    print("[Guideline] Running benchmark now (you will see output after each request completes)...")
     if args.skip_port_forward or args.start_llm:
         result = _run_guideline(run_dir, config=cfg)
     else:
@@ -173,13 +208,15 @@ def main() -> None:
         check=True,
     )
 
-    # 7. Regenerate runs index
-    generate_runs_index()
+    # 7. Regenerate runs index (skip when --run-dir used for sweep)
+    if not skip_index:
+        generate_runs_index()
 
     print(f"Run saved to {run_dir}")
     print(f"  summary:   {run_dir}/summary.html")
     print(f"  config:   {run_dir}/vllm_config.yaml")
-    print(f"  index:    {RUNS_DIR}/index.html")
+    if not skip_index:
+        print(f"  index:    {RUNS_DIR}/index.html")
 
 
 def _log(run_dir: Path, filename: str, msg: str) -> None:
@@ -190,7 +227,8 @@ def _log(run_dir: Path, filename: str, msg: str) -> None:
 
 
 def _run_guideline(run_dir: Path, *, config: dict) -> int:
-    """Run Guideline benchmark via CLI, streaming output to benchmark_live.txt."""
+    """Run Guideline benchmark via CLI, streaming output to benchmark_live.txt.
+    Prints after each request completes; aborts if a single request exceeds 10s."""
     profile = config["profile"]
     max_requests = config["max_requests"]
     max_seconds = config["max_seconds"]
@@ -207,7 +245,7 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
         "--output-dir", str(run_dir),
         "--outputs", "json",
         "--outputs", "csv",
-        "--disable-progress",
+        # No --disable-progress so we get per-request progress to parse
     ]
     if max_requests:
         cmd.extend(["--max-requests", max_requests])
@@ -215,17 +253,74 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
     BENCHMARK_LIVE_FILE.write_text(f"Starting benchmark (profile={profile}, {max_requests or '?'} req, {max_seconds}s max)...\n")
 
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    log_lines = []
-    try:
-        if proc.stdout:
-            for line in proc.stdout:
-                log_lines.append(line)
-                with open(BENCHMARK_LIVE_FILE, "a", encoding="utf-8") as f:
-                    f.write(line)
-                    f.flush()
-    except Exception:
-        pass
-    proc.wait()
+    if proc.pid:
+        _log(run_dir, "run.log", f"Guideline benchmark process started (PID {proc.pid})")
+        print(f"[Guideline] Process started (PID {proc.pid})")
+    log_lines: list[str] = []
+    last_completed: list[int] = [0]  # mutable so thread can update
+    last_completed_ts: list[float] = [0.0]
+    last_output_ts: list[float] = [time.monotonic()]
+    done = threading.Event()
+
+    max_req = int(max_requests) if max_requests else None
+
+    def reader() -> None:
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    log_lines.append(line)
+                    last_output_ts[0] = time.monotonic()
+                    completed = _parse_completed_count(line)
+                    if completed is not None:
+                        # Cap at max_requests: regex can match wrong numbers (e.g. 30 from max_seconds)
+                        if max_req is not None and completed > max_req:
+                            completed = max_req
+                        if completed > last_completed[0]:
+                            last_completed[0] = completed
+                            last_completed_ts[0] = time.monotonic()
+                            print(f"[Guideline] Request {completed} complete")
+                    with open(BENCHMARK_LIVE_FILE, "a", encoding="utf-8") as f:
+                        f.write(line)
+                        f.flush()
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    start_ts = time.monotonic()
+    stalled_reason: str | None = None
+    while not done.is_set() and proc.poll() is None:
+        time.sleep(1)
+        now = time.monotonic()
+        elapsed = now - start_ts
+        # No output at all for 20s -> guideline likely not running
+        if elapsed > 20 and last_output_ts[0] <= start_ts:
+            stalled_reason = "no output after 20s (guideline may not have started)"
+            break
+        # Had at least 1 completion, but none for 10s -> single request stalled
+        # Skip if we've hit max_requests (benchmark may be writing final report)
+        if (
+            last_completed[0] >= 1
+            and (max_req is None or last_completed[0] < max_req)
+            and (now - last_completed_ts[0]) > 10
+        ):
+            stalled_reason = f"no new completion for 10s after request {last_completed[0]}"
+            break
+
+    if stalled_reason:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        _log(run_dir, "run.log", f"Guideline benchmark stopped: {stalled_reason}")
+        print(f"[Guideline] Stopped: {stalled_reason}")
+
+    done.wait(timeout=2)
+    if proc.poll() is None:
+        proc.wait()
 
     run_log = run_dir / "run.log"
     if run_log.exists() and log_lines:
@@ -236,7 +331,7 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
     # Guideline may write benchmark.json (singular); ensure benchmarks.json exists
     if proc.returncode == 0 and (run_dir / "benchmark.json").exists() and not (run_dir / "benchmarks.json").exists():
         shutil.copy(run_dir / "benchmark.json", run_dir / "benchmarks.json")
-    return proc.returncode
+    return proc.returncode if proc.returncode is not None else 1
 
 
 def _run_with_port_forward(run_dir: Path, *, config: dict) -> int:
