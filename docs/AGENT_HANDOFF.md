@@ -1,106 +1,124 @@
-# Agent Handoff: AI Benchmark Optimizer
+# Agent Handoff: autollm Sweep Workflow
 
-**Purpose:** Handoff document for an agent to quickly understand and continue work on the AI-driven vLLM benchmark optimizer.
+**Purpose:** durable context for future agents working on `autollm`. Read this before changing sweep/improve behavior, benchmark flow, or `runllm` integration.
 
 ---
 
-## What Exists
+## Current Primary Workflow
 
-### 1. AI Benchmark Optimizer (`scripts/ai_benchmark_optimizer.py`)
+The main path is the sweep workflow, not the older dashboard optimizer:
 
-Uses Claude Opus or OpenAI GPT-5/Codex to suggest vLLM config changes, applies them, restarts the pod, runs benchmarks, and compares before/after.
-
-- **Claude (default):** `claude-opus-4-6` — requires `ANTHROPIC_API_KEY`
-- **OpenAI:** `gpt-5.4` or `gpt-5-codex` — requires `OPENAI_API_KEY` + `AI_PROVIDER=openai`
-- **gpt-5-codex** uses the Responses API only (not Chat Completions) — script branches on `"codex"` in model name
-
-### 2. Live Dashboard (`results/ai_optimizer.html`)
-
-Web dashboard that shows:
-- Live status during runs: step, strategy being tried, changes summary
-- History of all attempts: timestamp, strategy, before/after metrics, links to run reports
-- Polls `results/ai_optimizer_state.json` every 2 seconds
-
-### 3. State File (`results/ai_optimizer_state.json`)
-
-Written by the optimizer script at each step. Structure:
-```json
-{
-  "current_run": { "status": "...", "step": "...", "strategy": "...", "provider": "...", "model": "..." },
-  "history": [{ "timestamp": "...", "run_path": "runs/YYYYMMDD_HHMMSS", "strategy": "...", "before_metrics": "...", "after_metrics": "..." }]
-}
+```bash
+make sweep SWEEP=qwen-latency GOAL="minimize latency"
+make improve SWEEP=qwen-latency
+make leaderboard SWEEP=qwen-latency
+make sweep-pods SWEEP=qwen-latency
 ```
 
-### 4. Benchmark Harness (`scripts/benchmark_harness.py`)
+- `make sweep` creates `results/sweep-NAME/`, runs a baseline, writes `sweep_metadata.json`, creates `best-runllm`, and writes `leaderboard.txt`.
+- `make improve` runs `scripts/ai_experiment.py`, which copies the current best `runllm`, prompts the LLM, deploys a unique pod, runs a sample query, benchmarks it, and updates the sweep artifacts.
+- `make leaderboard` refreshes `results/sweep-NAME/leaderboard.txt`.
+- `make sweep-pods` lists currently running pods labeled for a sweep.
 
-Runs Guideline benchmarks, saves to `results/runs/YYYYMMDD_HHMMSS/`. The AI optimizer calls this after applying config.
+The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but it is no longer the main tuning workflow.
 
 ---
 
-## Key Files
+## Important Files
 
 | Path | Purpose |
 |------|---------|
-| `scripts/ai_benchmark_optimizer.py` | Main AI optimizer: calls LLM, applies config, restarts pod, runs benchmark |
-| `scripts/benchmark_harness.py` | Benchmark runner; saves runs with timestamped dirs |
-| `results/ai_optimizer.html` | Live dashboard (open via `make results-serve`) |
-| `results/ai_optimizer_state.json` | Live state + history (written by optimizer) |
-| `vllm-qwen.yaml` | vLLM pod config (modified by optimizer, then restored) |
-| `docs/BENCHMARK_HARNESS.md` | Full docs for harness + AI optimizer |
+| `scripts/ai_experiment.py` | Main sweep improve loop, prompt construction, deploy/benchmark, retries, cleanup |
+| `scripts/benchmark_config.py` | Shared benchmark presets and Guideline progress parsing helpers |
+| `scripts/benchmark_harness.py` | One-shot benchmark harness for `results/runs/` |
+| `scripts/run_guideline_experiment.py` | Guideline subprocess wrapper for experiment mode; writes `query_progress.json` |
+| `scripts/start_sweep.py` | Baseline sweep creation |
+| `scripts/sweep_utils.py` | Best-run scoring and objective helpers |
+| `runllm/` | Canonical vLLM deploy/query/test surface used by `autollm` |
+| `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
 
 ---
 
-## How to Run
+## Behavior That Was Intentionally Added
+
+### Leaderboard / Prompting
+
+- `results/sweep-NAME/leaderboard.txt` is written automatically during sweep setup and improve runs.
+- Leaderboards now rank by sweep objective:
+  - `latency` sweeps: lower latency first
+  - `throughput` sweeps: higher throughput first
+  - `ttft` sweeps: lower TTFT first
+- The leaderboard includes:
+  - full strategy text
+  - structured `Changed knobs vs baseline`
+  - full arg summaries extracted from YAML using structured parsing, not fragile regex
+- Prompt guidance pushes the agent toward single-change experiments and allows `NO_CONFIG_CHANGE: ...` on retries when logs suggest a harness/watchdog issue rather than a config issue.
+
+### Benchmark / Retry Flow
+
+- `ai_experiment.py` uses up to 10 internal attempts per improve run.
+- A retry can return `NO_CONFIG_CHANGE`, which currently means “rerun benchmark with the same YAML” rather than “stop immediately”.
+- Benchmark output is more verbose now:
+  - live `guidellm` output is streamed into the terminal
+  - stalled runs print periodic waiting messages with the last harness line
+- The old 180s generic abort no longer kills benchmarks that are still making request progress.
+
+### Pod Management
+
+- Improve runs use unique pod names like `vllm-qwen-<timestamp_suffix>`.
+- Pods are labeled for sweep discovery:
+  - `autollm-managed: "true"`
+  - `autollm-sweep: "<sweep-name>"`
+- Pod cleanup happens on success, failure, and normal signal exit.
+- `make sweep-pods` depends on those labels.
+
+### runllm Surface
+
+- `autollm/runllm` is the only `runllm` copy that should matter here.
+- The top-level sibling `../runllm` was intentionally removed.
+- `runllm/query.py` and `runllm/test_smoke.sh` use `/v1/chat/completions`.
+- `runllm/Makefile` respects exported `KUBECONFIG` and otherwise falls back to `../kubeconfig`.
+
+---
+
+## Known Gotchas
+
+1. **Kubernetes label values must be strings.**
+   `autollm-managed: true` breaks `kubectl apply` with `cannot unmarshal bool into ... labels of type string`. The label injection code in `ai_experiment.py` now quotes values explicitly.
+
+2. **Do not claim a fix works without testing it.**
+   There is a workspace rule enforcing this, and this codebase has several harness-vs-config failure modes that are easy to misdiagnose.
+
+3. **Be careful with submodule vs repo boundaries.**
+   `autollm/runllm` is a git submodule. If you change it, commit inside the submodule first, then commit the updated submodule pointer in `autollm`.
+
+4. **`results/` should not be tracked by git.**
+   `autollm/.gitignore` now ignores `results/` and `results.txt`. Generated sweep and benchmark output should stay local.
+
+5. **Prompt contract changes are high leverage.**
+   Small wording changes in `ai_experiment.py` can materially change agent behavior. Be deliberate.
+
+---
+
+## Validation Shortlist
+
+When changing this area, the cheap checks that have been useful are:
 
 ```bash
-# 1. Start results server (for dashboard)
-make results-serve
-# Open http://localhost:8765/ai_optimizer.html
-
-# 2. In another terminal, run optimizer
-make ai-benchmark-optimize
-
-# Or with OpenAI/Codex:
-AI_PROVIDER=openai AI_MODEL=gpt-5-codex make ai-benchmark-optimize
+python3 -m py_compile scripts/ai_experiment.py scripts/benchmark_config.py scripts/benchmark_harness.py scripts/run_guideline_experiment.py scripts/start_sweep.py scripts/sweep_utils.py scripts/list_sweep_pods.py
+python3 scripts/test_sweep_setup.py
+env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --refresh-leaderboard --sweep qwen-throughput
 ```
 
-**Dependencies:** `uv sync --extra guidellm --extra ai_optimizer` (Makefile does this)
+For `runllm` changes:
+
+```bash
+bash -n runllm/test_smoke.sh
+python3 -m py_compile runllm/query.py
+```
 
 ---
 
-## Flow
+## If You Add Durable Knowledge
 
-1. Read `vllm-qwen.yaml` + latest benchmark from `results/runs/` or `results/benchmarks.json`
-2. Call AI with prompt (config + metrics); ask for `Strategy:` line + modified YAML
-3. Parse YAML from response; extract strategy
-4. Backup config, write new YAML
-5. `kubectl delete pod vllm-qwen` → `kubectl apply -f vllm-qwen.yaml` → `kubectl wait` (5 min)
-6. Run `scripts/benchmark_harness.py` with description `"AI suggestion (provider)"`
-7. Compare metrics; append to `history`; restore original config
-
----
-
-## Environment
-
-- `.env` — may contain `HF_TOKEN`, `MODEL`
-- `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` required
-- `KUBECONFIG` — set in Makefile for k8s access (vLLM runs on cluster)
-
----
-
-## Gotchas / Known Issues
-
-1. **kubectl wait timeout:** Must use `--timeout=300s` (with `s` suffix), not `300`
-2. **gpt-5-codex:** Only supported in Responses API; script uses `client.responses.create()` when `"codex"` in model name
-3. **AI prompt:** Asks for `Strategy: <one-liner>` before the YAML block; parsed with regex
-4. **Config restore:** Original config is always restored at end; AI version saved to `vllm-qwen.yaml.bak`
-
----
-
-## Possible Next Work
-
-- Run optimization in a loop (multiple iterations)
-- Add improvement % to history (parse before/after to compute delta)
-- Support multiple vLLM configs (e.g. `vllm-kimi.yaml`)
-- Add `--dry-run` to show suggested changes without applying
-- Improve strategy extraction when AI doesn't follow format
+If you discover something about the real architecture, contracts, failure modes, or operational pitfalls that future agents are likely to trip over again, add it here briefly. Keep this file focused on stable, high-value context rather than transient run results.

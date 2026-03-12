@@ -568,9 +568,10 @@ def _rewrite_pod_name(yaml_path: Path, new_name: str, sweep: str | None = None) 
     labels = {"autollm-managed": "true"}
     if sweep:
         labels["autollm-sweep"] = _k8s_label_value(sweep)
-    label_lines = "\n".join(f"    {k}: {v}" for k, v in labels.items())
+    quoted_labels = {k: json.dumps(v) for k, v in labels.items()}
+    label_lines = "\n".join(f"    {k}: {v}" for k, v in quoted_labels.items())
     if re.search(r"metadata:\s*\n(?:\s+.+\n)*?\s+labels:\s*\n", text):
-        for key, value in labels.items():
+        for key, value in quoted_labels.items():
             pattern = rf"(metadata:\s*\n(?:\s+.+\n)*?\s+labels:\s*\n)"
             if re.search(rf"^\s+{re.escape(key)}:\s*", text, re.MULTILINE):
                 text = re.sub(rf"(^\s+{re.escape(key)}:\s*).*$", rf"\1{value}", text, flags=re.MULTILINE)
