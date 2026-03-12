@@ -44,15 +44,16 @@ This deploys vLLM with your current `runllm/vllm-qwen.yaml`, runs the benchmark,
 ### Step 2: Run AI-driven improvements
 
 ```bash
-make improve SWEEP=qwen-latency                        # agent suggests + deploys + benchmarks
-make improve SWEEP=qwen-latency ALLOW_MODEL_CHANGE=1   # also allow quantized model variants
+make improve SWEEP=qwen-latency                        # single improvement run
+make improve SWEEP=qwen-latency RUNS=10                # run 10 iterations back-to-back
+make improve SWEEP=qwen-latency RUNS=5 ALLOW_MODEL_CHANGE=1  # 5 runs, allow quantized models
 ```
 
 Each run:
 1. Shows the agent the current best config + leaderboard
 2. Agent proposes a change (args, env vars, speculative decoding, compilation config, etc.)
 3. Deploys the new config, runs a sample query, benchmarks
-4. If it crashes, retries up to 10 times with the agent fixing the config
+4. If it crashes or stalls, retries up to 10 times with the agent fixing the config or explicitly diagnosing a non-config issue
 5. If all 10 fail, writes a retro for future agents
 
 Run `make improve` repeatedly to iterate. The agent always builds on the best config so far.
@@ -83,6 +84,7 @@ Run `make improve` repeatedly to iterate. The agent always builds on the best co
 results/sweep-qwen-latency/
   sweep_metadata.json      # benchmark preset, created_at
   baseline/                # baseline run
+  leaderboard.txt          # ranked runs + failed strategies
   best-runllm -> .../runllm  # symlink to best config's runllm
   results.txt              # experiment log
   agent.log                # full agent conversation history (all runs)
@@ -103,6 +105,8 @@ results/sweep-qwen-latency/
 | `make benchmark` | One-shot benchmark (deploy + bench, saves to results/runs/) |
 | `make benchmark BENCHMARK=quick` | Quick one-shot benchmark |
 | `make experiment` | Standalone AI experiment (no sweep) |
+| `make leaderboard SWEEP=name` | Refresh `results/sweep-name/leaderboard.txt` |
+| `make sweep-pods SWEEP=name` | List running labeled pods for a sweep |
 | `make dashboard` | Web dashboard at http://localhost:8765/ |
 | `make query PROMPT="Hello"` | Send a query to running vLLM |
 
@@ -110,7 +114,7 @@ results/sweep-qwen-latency/
 
 | Variable | Description |
 |----------|-------------|
-| `kubeconfig` | Cluster access — copy to `autollm/kubeconfig` or generate with `make kubeconfig` |
+| `KUBECONFIG` | Cluster access — copy to `autollm/kubeconfig`, export it, or generate with `make kubeconfig` |
 | `ANTHROPIC_API_KEY` | Required for AI agent (default provider) |
 | `OPENAI_API_KEY` | For OpenAI provider |
 | `AI_PROVIDER` | `anthropic` (default) or `openai` |

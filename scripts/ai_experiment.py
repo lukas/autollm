@@ -23,6 +23,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
+from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
+from sweep_utils import metric_mean, sweep_objective, sweep_ranking_label
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Track active pods for cleanup on exit/Ctrl+C
@@ -66,11 +71,6 @@ QUERY_STALE_SEC = int(os.environ.get("EXPERIMENT_QUERY_STALE_SEC", "30"))
 
 # Timeout for sample query before benchmark (must complete or we abort)
 SAMPLE_QUERY_TIMEOUT = int(os.environ.get("EXPERIMENT_SAMPLE_QUERY_TIMEOUT", "30"))
-
-# Benchmark presets: quick (fastest), sync, sweep, medium, long
-BENCHMARK_PRESETS = ("quick", "sync", "sweep", "medium", "long")
-BENCHMARK_MAX_REQUESTS = {"quick": 5, "sync": 20, "sweep": 0, "medium": 200, "long": 1000}
-
 
 def _metric(m: dict, k: str, sub: str = "successful") -> float | None:
     o = m.get(k, {})
@@ -149,29 +149,121 @@ def _get_retros(runs_base: Path | None) -> str:
 
 
 def _extract_vllm_args(config_text: str) -> str:
-    """Extract just the vLLM args and image from a YAML config (compact one-line format)."""
-    image = ""
-    args = []
-    im = re.search(r"image:\s*(.+)", config_text)
-    if im:
-        image = im.group(1).strip().strip('"').strip("'")
-    for m in re.finditer(r'^\s*-\s*"?(--[a-z][a-z0-9-]*)"?\s*$', config_text, re.MULTILINE):
-        args.append(m.group(1).strip('"'))
-    for m in re.finditer(r'^\s*-\s*"?([^-][^"]*)"?\s*$', config_text, re.MULTILINE):
-        v = m.group(1).strip().strip('"').strip("'")
-        if v and not v.startswith("name:") and not v.startswith("key:") and v not in ("vllm", "serve"):
-            if args and not args[-1].startswith("--"):
+    """Extract just the image and arg list from a vLLM pod YAML."""
+    try:
+        data = yaml.safe_load(config_text) or {}
+    except Exception:
+        return ""
+    containers = (((data.get("spec") or {}).get("containers")) or [])
+    if not containers:
+        return ""
+    container = containers[0] or {}
+    image = str(container.get("image", "")).strip()
+    args_list = []
+    args = container.get("args") or []
+    idx = 0
+    while idx < len(args):
+        item = str(args[idx]).strip()
+        if item.startswith("--"):
+            if idx + 1 < len(args) and not str(args[idx + 1]).strip().startswith("--"):
+                args_list.append(f"{item} {str(args[idx + 1]).strip()}")
+                idx += 2
                 continue
-            if args:
-                args[-1] = f"{args[-1]} {v}"
-    return f"image={image}  args: {', '.join(args)}" if args else f"image={image}"
+            args_list.append(item)
+        idx += 1
+    return f"image={image}  args: {', '.join(args_list)}" if args_list else f"image={image}"
+
+
+def _extract_config_state(config_text: str) -> dict[str, str | bool]:
+    """Extract image, args, and env vars from the pod YAML for diffing."""
+    state: dict[str, str | bool] = {}
+    try:
+        data = yaml.safe_load(config_text) or {}
+    except Exception:
+        return state
+    containers = (((data.get("spec") or {}).get("containers")) or [])
+    if not containers:
+        return state
+    container = containers[0] or {}
+    image = container.get("image")
+    if image:
+        state["image"] = str(image).strip()
+
+    args = container.get("args") or []
+    idx = 0
+    while idx < len(args):
+        key = str(args[idx]).strip()
+        if key.startswith("--"):
+            state[f"arg:{key}"] = True
+            if idx + 1 < len(args) and not str(args[idx + 1]).strip().startswith("--"):
+                state[f"arg:{key}"] = str(args[idx + 1]).strip()
+                idx += 2
+                continue
+        idx += 1
+
+    for env_var in container.get("env") or []:
+        name = str(env_var.get("name", "")).strip()
+        if not name:
+            continue
+        if "value" in env_var:
+            state[f"env:{name}"] = str(env_var["value"]).strip()
+        elif "valueFrom" in env_var:
+            state[f"env:{name}"] = "(valueFrom)"
+        else:
+            state[f"env:{name}"] = "(set)"
+    return state
+
+
+def _format_state_value(value: str | bool | None) -> str:
+    if value is True:
+        return "enabled"
+    if value in (None, ""):
+        return "absent"
+    return str(value)
+
+
+def _summarize_config_changes(config_text: str, reference_text: str | None) -> list[str]:
+    """Summarize config changes relative to a reference config."""
+    if not config_text or not reference_text:
+        return []
+    current = _extract_config_state(config_text)
+    reference = _extract_config_state(reference_text)
+    changes = []
+    for key in sorted(set(current) | set(reference)):
+        before = reference.get(key)
+        after = current.get(key)
+        if before == after:
+            continue
+        if key == "image":
+            label = "image"
+        elif key.startswith("arg:"):
+            label = key[4:]
+        elif key.startswith("env:"):
+            label = f"env {key[4:]}"
+        else:
+            label = key
+        changes.append(f"{label}: {_format_state_value(before)} -> {_format_state_value(after)}")
+    return changes
+
+
+def _extract_no_config_change_reason(text: str) -> str | None:
+    m = re.search(r"NO_CONFIG_CHANGE:\s*(.+)", text, re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
 
 def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
-    """Compact leaderboard: successful runs ranked by latency, plus condensed failure lessons."""
+    """Compact leaderboard ranked according to the sweep objective."""
     if not runs_base.exists():
         return "No experiments."
     dirs = [d for d in runs_base.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    sweep_name = runs_base.name.replace("sweep-", "")
+    objective = sweep_objective(sweep_name)
+    reference_config_text = None
+    for cfg in ("baseline/vllm_config.yaml", "baseline/runllm/vllm-qwen.yaml"):
+        fp = runs_base / cfg
+        if fp.exists():
+            reference_config_text = fp.read_text()
+            break
 
     successes = []
     failures = []
@@ -182,7 +274,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                 meta = json.loads((d / "run_metadata.json").read_text())
             except Exception:
                 pass
-        desc = meta.get("description", "")[:150]
+        desc = meta.get("description", "")
         if (d / "benchmarks.json").exists():
             try:
                 data = json.loads((d / "benchmarks.json").read_text())
@@ -196,42 +288,86 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                         if fp.exists():
                             config_text = fp.read_text()
                             break
-                    lat = _metric(m, "request_latency")
+                    lat = metric_mean(m, "request_latency")
+                    tok = metric_mean(m, "tokens_per_second")
+                    ttft = metric_mean(m, "time_to_first_token_ms")
                     successes.append({"name": d.name, "metrics": metrics, "desc": desc,
                                       "config_summary": _extract_vllm_args(config_text) if config_text else "",
-                                      "latency": lat or 999, "path": str(d.relative_to(project_root))})
+                                      "changes": _summarize_config_changes(config_text, reference_config_text),
+                                      "latency": lat or 999,
+                                      "throughput": tok or 0,
+                                      "ttft": ttft or 999999,
+                                      "path": str(d.relative_to(project_root))})
                     continue
             except Exception:
                 pass
         # Failed or no metrics
         result = ""
+        config_text = ""
+        for cfg in ("vllm_config.yaml", "runllm/vllm-qwen.yaml"):
+            fp = d / cfg
+            if fp.exists():
+                config_text = fp.read_text()
+                break
         if (d / "run_metadata.json").exists():
             try:
                 rm = json.loads((d / "run_metadata.json").read_text())
-                result = rm.get("result", "")[:100]
+                result = rm.get("result", "")
             except Exception:
                 pass
         if desc or result:
-            failures.append({"name": d.name, "desc": desc[:100], "result": result})
+            failures.append({
+                "name": d.name,
+                "desc": desc,
+                "result": result,
+                "changes": _summarize_config_changes(config_text, reference_config_text),
+            })
 
-    successes.sort(key=lambda x: x["latency"])
+    if objective == "throughput":
+        successes.sort(key=lambda x: (-x["throughput"], x["latency"]))
+    elif objective == "ttft":
+        successes.sort(key=lambda x: x["ttft"])
+    else:
+        successes.sort(key=lambda x: x["latency"])
 
     lines = []
     if successes:
-        lines.append("LEADERBOARD (successful runs, ranked by latency):")
-        lines.append(f"{'Run':<20} {'Metrics':<55} {'Key args'}")
-        lines.append("-" * 120)
+        lines.append(f"LEADERBOARD (successful runs, ranked by {sweep_ranking_label(sweep_name)}):")
+        lines.append("-" * 100)
         for s in successes[:10]:
-            lines.append(f"{s['name']:<20} {s['metrics']:<55} {s['config_summary'][:80]}")
+            lines.append(f"{s['name']}  {s['metrics']}")
+            if s["desc"]:
+                lines.append(f"  Strategy: {s['desc']}")
+            if s["changes"]:
+                lines.append("  Changed knobs vs baseline:")
+                for change in s["changes"]:
+                    lines.append(f"    - {change}")
+            lines.append(f"  Args: {s['config_summary']}")
+            lines.append("")
         if len(successes) > 10:
             lines.append(f"... and {len(successes) - 10} more successful runs")
 
     if failures:
-        lines.append(f"\nFailed runs ({len(failures)} total, showing last 5):")
-        for f in failures[-5:]:
-            lines.append(f"  {f['name']}: {f['desc'][:80]}")
+        failures_to_show = failures[-50:]
+        lines.append(f"\nFailed runs ({len(failures)} total, showing last {len(failures_to_show)} — DO NOT repeat these strategies):")
+        for f in failures_to_show:
+            lines.append(f"  {f['name']}: {f['desc']}")
+            if f["changes"]:
+                lines.append("    Changed knobs vs baseline:")
+                for change in f["changes"]:
+                    lines.append(f"      - {change}")
+            if f["result"]:
+                lines.append(f"    Error: {f['result']}")
 
     return "\n".join(lines) if lines else "No experiments yet."
+
+
+def _write_leaderboard_to_sweep(sweep_dir: Path) -> None:
+    """Write the current leaderboard to sweep_dir/leaderboard.txt for easy viewing."""
+    if not sweep_dir or not sweep_dir.exists():
+        return
+    leaderboard = _get_experiment_leaderboard(sweep_dir, PROJECT_ROOT)
+    (sweep_dir / "leaderboard.txt").write_text(leaderboard)
 
 
 def _get_best_config_yaml(runs_base: Path) -> str | None:
@@ -369,12 +505,15 @@ In 2-4 sentences, summarize: what you're changing and why it should help. Output
         return ""
 
 
-def _check_abort(start: float, phase: str) -> str | None:
-    """Return abort message if we should abort (past inspect deadline), else None."""
+def _check_abort(start: float, phase: str, last_progress: float | None = None) -> str | None:
+    """Return abort message if we should abort, unless recent progress was made."""
     if INSPECT_AFTER_SEC <= 0:
         return None
-    if _elapsed_since(start) >= INSPECT_AFTER_SEC:
-        return f"Aborted after {INSPECT_AFTER_SEC}s: stuck in phase '{phase}'"
+    if _elapsed_since(start) < INSPECT_AFTER_SEC:
+        return None
+    if last_progress is not None and (time.time() - last_progress) < INSPECT_AFTER_SEC:
+        return None
+    return f"Aborted after {INSPECT_AFTER_SEC}s: stuck in phase '{phase}'"
 
 
 # Patterns indicating infrastructure/Kubernetes setup errors (NOT fixable by changing vLLM YAML)
@@ -415,10 +554,35 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _rewrite_pod_name(yaml_path: Path, new_name: str) -> None:
-    """Rewrite metadata.name in a Pod YAML to a unique name for parallel runs."""
+def _k8s_label_value(value: str) -> str:
+    """Sanitize a value for Kubernetes labels."""
+    value = re.sub(r"[^a-z0-9_.-]+", "-", value.strip().lower())
+    value = value.strip("-.")
+    return value[:63] or "default"
+
+
+def _rewrite_pod_name(yaml_path: Path, new_name: str, sweep: str | None = None) -> None:
+    """Rewrite metadata.name and add labels for sweep discovery."""
     text = yaml_path.read_text()
     text = re.sub(r'(metadata:\s*\n\s*name:\s*)(\S+)', rf'\g<1>{new_name}', text)
+    labels = {"autollm-managed": "true"}
+    if sweep:
+        labels["autollm-sweep"] = _k8s_label_value(sweep)
+    label_lines = "\n".join(f"    {k}: {v}" for k, v in labels.items())
+    if re.search(r"metadata:\s*\n(?:\s+.+\n)*?\s+labels:\s*\n", text):
+        for key, value in labels.items():
+            pattern = rf"(metadata:\s*\n(?:\s+.+\n)*?\s+labels:\s*\n)"
+            if re.search(rf"^\s+{re.escape(key)}:\s*", text, re.MULTILINE):
+                text = re.sub(rf"(^\s+{re.escape(key)}:\s*).*$", rf"\1{value}", text, flags=re.MULTILINE)
+            else:
+                text = re.sub(pattern, rf"\1    {key}: {value}\n", text, count=1)
+    else:
+        text = re.sub(
+            r"(metadata:\s*\n\s*name:\s*\S+\n)",
+            rf"\1  labels:\n{label_lines}\n",
+            text,
+            count=1,
+        )
     yaml_path.write_text(text)
 
 
@@ -447,7 +611,9 @@ def _fetch_and_check_logs(run_dir: Path, env: dict, logs_file: Path, pod_name: s
     return None
 
 
-def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, ts: str) -> tuple[bool, str]:
+def _deploy_and_benchmark(
+    experiment_dir: Path, benchmark: str, run_dir: Path, ts: str, sweep: str | None = None
+) -> tuple[bool, str]:
     """Deploy from experiment_dir, run benchmark, stream logs to run_dir, track queries, abort if stuck.
     Uses a unique pod name and local port so multiple runs can execute in parallel."""
     start = time.time()
@@ -463,7 +629,7 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
     short_id = ts.replace("_", "")[-8:]  # e.g. "12112142" from "20260312_112142"
     pod_name = f"vllm-qwen-{short_id}"
     local_port = _find_free_port()
-    _rewrite_pod_name(vllm_yaml, pod_name)
+    _rewrite_pod_name(vllm_yaml, pod_name, sweep=sweep)
     _log_run(run_dir, f"Pod: {pod_name}, local port: {local_port}")
 
     # Register for cleanup on Ctrl+C / crash
@@ -634,9 +800,11 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
     harness_out = run_dir / "harness_output.txt"
     last_queries = -1
     last_updated = time.time()
+    last_wait_report = 0.0
     query_progress_file = run_dir / "query_progress.json"
     max_requests = BENCHMARK_MAX_REQUESTS.get(benchmark, 0)
     bench_start = time.time()
+    last_harness_line = ""
 
     def _count_from_kubectl_logs() -> int:
         """Count actual chat completion requests (not health checks or model list)."""
@@ -674,6 +842,10 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
                     line = stdout_lines.pop(0)
                     out.write(line)
                     out.flush()
+                    stripped = line.strip()
+                    if stripped:
+                        last_harness_line = stripped
+                        print(f"  [guidellm] {stripped}", flush=True)
 
                 queries = last_queries
                 if query_progress_file.exists():
@@ -689,6 +861,13 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
                 if queries > last_queries:
                     last_queries = queries
                     last_updated = now
+                    last_wait_report = now
+                    _write_progress("benchmark", {
+                        "timeout_sec": timeout_sec,
+                        "run_dir": str(run_dir),
+                        "queries_completed": last_queries,
+                        "last_progress": datetime.now().isoformat(),
+                    })
                     # Progress bar
                     elapsed = now - bench_start
                     if max_requests > 0 and last_queries > 0:
@@ -701,6 +880,15 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
                         print(f"\r  [{bar}] {last_queries}/{max_requests} requests ({pct*100:.0f}%) | {rate:.1f} req/s | ETA {eta:.0f}s", end="", flush=True)
                     else:
                         print(f"\r  {last_queries} requests | {elapsed:.0f}s elapsed", end="", flush=True)
+                elif (now - last_updated) >= min(10, QUERY_STALE_SEC) and (now - last_wait_report) >= 10:
+                    last_wait_report = now
+                    wait_for = int(now - last_updated)
+                    last_line = last_harness_line[:200] if last_harness_line else "(no harness output yet)"
+                    print(
+                        f"\n  Waiting for benchmark progress: {queries} completed requests, no update for {wait_for}s",
+                        flush=True,
+                    )
+                    print(f"  Last guidellm output: {last_line}", flush=True)
                 elif (now - last_updated) >= QUERY_STALE_SEC:
                     if (run_dir / "benchmarks.json").exists():
                         _log_run(run_dir, "Benchmark output found despite stale query count")
@@ -709,6 +897,8 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
                         break
                     if last_queries > 0:
                         print()
+                    if last_harness_line:
+                        print(f"  Last guidellm output before abort: {last_harness_line[:200]}", flush=True)
                     return _cleanup(
                         f"Query count unchanged at {queries} for {QUERY_STALE_SEC}s (no progress)"
                     )
@@ -717,7 +907,7 @@ def _deploy_and_benchmark(experiment_dir: Path, benchmark: str, run_dir: Path, t
                     if last_queries > 0:
                         print()
                     return _cleanup(f"Benchmark timed out after {timeout_sec}s")
-                if m := _check_abort(start, "benchmark"):
+                if m := _check_abort(start, "benchmark", last_progress=last_updated):
                     return _cleanup(m)
 
                 time.sleep(min(poll_interval, 2))
@@ -775,6 +965,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="AI experiment: LLM suggests vLLM changes, deploy and benchmark")
     parser.add_argument("--sweep", "-s", help="Sweep name (use runs from results/sweep-NAME/)")
     parser.add_argument("--allow-model-change", action="store_true", help="Allow agent to try quantized model variants")
+    parser.add_argument("--refresh-leaderboard", action="store_true", help="Just write leaderboard.txt to sweep dir and exit")
     args = parser.parse_args()
     allow_model_change = args.allow_model_change
 
@@ -790,6 +981,14 @@ def main() -> int:
         sweep_dir = None
         runs_dir = RUNS_DIR
         results_txt = RESULTS_DIR / "results.txt"
+
+    if args.refresh_leaderboard:
+        if not sweep_dir:
+            print("--refresh-leaderboard requires --sweep")
+            return 1
+        _write_leaderboard_to_sweep(sweep_dir)
+        print(f"Wrote {sweep_dir / 'leaderboard.txt'}")
+        return 0
 
     provider = os.environ.get("AI_PROVIDER", "anthropic").lower()
     model = os.environ.get("AI_MODEL", "")
@@ -834,6 +1033,8 @@ def main() -> int:
     vllm_content = (base_runllm / "vllm-qwen.yaml").read_text()
     runs_for_context = sweep_dir or RUNS_DIR
     leaderboard = _get_experiment_leaderboard(runs_for_context, PROJECT_ROOT)
+    if sweep_dir:
+        _write_leaderboard_to_sweep(sweep_dir)
     workload = _get_workload_description(runs_for_context)
     retros_section = _get_retros(runs_for_context)
     retro_bullets = ""
@@ -892,9 +1093,16 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 - Do NOT change `restartPolicy` from `Always`
 - Image MUST be `vllm/vllm-openai:nightly` (do not change the image tag)
 - Do NOT change the container entrypoint/command. Use the default entrypoint with `args:` containing `"--model"`, `"ModelName"`, and flags. Do NOT use `command: ["vllm"]` with `args: ["serve", ...]`, do NOT use `python3 -m vllm.entrypoints.openai.api_server`. The default entrypoint in the image already handles serving.
-- Do NOT use `--disable-log-requests` (not recognized). Use `--disable-log-stats` if you want to reduce logging.
+- Do NOT use `--disable-log-requests` or `--num-scheduler-steps` (not recognized in nightly). Use `--disable-log-stats` for logging.
 {"- Do NOT change the --model (model changes not enabled for this sweep)" if not allow_model_change else ""}
 {model_change_section}
+## Observed quirks in this image / harness
+
+- Base your diagnosis on the leaderboard, workload, and provided logs. Do not invent root causes that are not supported by evidence.
+- If a retry shows many successful `POST /v1/chat/completions` lines in the logs, treat that as evidence the server is making benchmark progress. That is more likely a harness/watchdog issue than a serving/config failure.
+- `VLLM_ATTENTION_BACKEND` has produced `Unknown vLLM environment variable` warnings in this image. Do NOT introduce it if it is absent. If it is already present in the current best config, only change it as its own dedicated experiment.
+- `--performance-mode` has previously failed in this image. Do NOT introduce it unless it already appears in a successful leaderboard run.
+
 ## vLLM serve args reference (from vLLM docs, performance-relevant subset)
 
 **Model & precision:**
@@ -956,12 +1164,26 @@ env:
 - `--attention-backend` — Override attention backend via CLI (alternative to env var)
 - `--load-format` — auto|safetensors|tensorizer (default: auto). "tensorizer" for fast CoreWeave loading.
 - `--disable-log-stats` — Disable periodic stats logging (minor perf gain)
-- NOTE: `--disable-log-requests` does NOT exist in this image. Do not use it.
+- NOTE: `--disable-log-requests` and `--num-scheduler-steps` do NOT exist in this image.
 
 ## Your task
 
-1. Describe what you're changing and why (2-4 sentences). Must be different from the baseline.
-2. Return the complete vllm-qwen.yaml in a ```yaml block```.
+**IMPORTANT:** Review the leaderboard above. Do NOT repeat a strategy that already failed or that produced worse results than the current best. Try something genuinely different.
+
+Use a search mindset: each run should help the sweep learn what works, not just make a large grab-bag of edits.
+- Default to exactly one meaningful change relative to the current best config.
+- Only change multiple knobs together when you have a specific hypothesis that they interact and should be tested as a bundle.
+- Prefer isolated experiments that make it easy to attribute wins or losses to a single variable.
+- If you do bundle changes, explain clearly why those changes need to be tested together.
+- Give a small change manifest before the YAML so the exact knob change is explicit.
+
+1. Start with this exact structure:
+   - `Experiment type: single-change` or `Experiment type: bundle`
+   - `Evidence:` with 1-3 bullets grounded in the leaderboard/workload/logs
+   - `Changed knobs:` with one bullet per changed knob in the form `knob: old -> new`
+   - `Why:` with 1-2 short bullets
+2. Describe a config that is different from the baseline AND from previous attempts shown in the leaderboard.
+3. Return the complete vllm-qwen.yaml in a ```yaml block```.
 {"3. If you changed the model, also return the Makefile in a ```makefile block``` with updated VLLM_MODEL." if allow_model_change else ""}
 
 **To request a file** from a previous run: respond with `REQUEST_FILE: results/sweep-NAME/TIMESTAMP/FILE` (e.g. deploy.log, kubectl_logs.txt). You'll get the contents and can then provide your YAML."""
@@ -1003,7 +1225,7 @@ env:
             kubectl_logs = failure_context.get("kubectl_logs", "")[-6000:]
             vllm_cur = (experiment_dir / "vllm-qwen.yaml").read_text()
             makefile_cur = (experiment_dir / "Makefile").read_text()
-            prompt = f"""Attempt {attempt} FAILED. Fix the config and return the corrected ```yaml block```.
+            prompt = f"""Attempt {attempt} FAILED. Diagnose whether this is actually a config problem before changing anything.
 
 **Failure:** {result_msg}
 
@@ -1023,11 +1245,25 @@ env:
 ```
 
 **Fix rules:**
-- Remove the bad arg or adjust its value.
+- Base your diagnosis on the provided logs and benchmark behavior, not generic vLLM heuristics.
+- If the evidence suggests this is a harness/watchdog issue rather than a serving/config issue (for example, many successful `POST /v1/chat/completions` lines), you may respond with `NO_CONFIG_CHANGE: <reason>` and do not return YAML.
+- Otherwise, keep the fix minimal and targeted.
+- Change exactly one knob unless the YAML is invalid or multiple settings are inseparable.
+- Preserve all other args/env/image/resources lines byte-for-byte.
+- First consider reverting the most recent knob change before inventing a new hypothesis.
 - Keep Pod kind, name=vllm-qwen. Image must stay vllm/vllm-openai:nightly.
 - Do NOT change the container entrypoint. No `command:` field. Use `args:` with `--model` as a flag.
 - Do NOT use `--disable-log-requests` (does not exist). Use `--disable-log-stats` instead.
-- If --kv-cache-dtype fp8 fails, set --dtype bfloat16."""
+- If --kv-cache-dtype fp8 fails, set --dtype bfloat16.
+- Do NOT introduce `VLLM_ATTENTION_BACKEND` if it is absent. Do NOT introduce `--performance-mode`.
+
+If you are changing config, start with this exact structure before the YAML:
+- `Experiment type: single-change` or `Experiment type: bundle`
+- `Evidence:` with 1-3 bullets grounded in the logs
+- `Changed knobs:` with one bullet per changed knob in the form `knob: old -> new`
+- `Why:` with 1-2 short bullets
+
+If you return YAML, it must be the complete corrected config in a ```yaml block```."""
             current_prompt = prompt
             print(f"Retry {attempt + 1}/{max_attempts}: asking agent to fix crash...")
         else:
@@ -1041,7 +1277,7 @@ env:
         file_content = ""
         for round_num in range(max_file_rounds + 1):
             if round_num > 0:
-                call_prompt = f"{call_prompt}\n\n**File you requested ({req_path}):**\n```\n{file_content}\n```\n\nNow provide your YAML suggestion (modified vllm-qwen.yaml and optionally Makefile)."
+                call_prompt = f"{call_prompt}\n\n**File you requested ({req_path}):**\n```\n{file_content}\n```\n\nNow provide your YAML suggestion (modified vllm-qwen.yaml and optionally Makefile), or `NO_CONFIG_CHANGE: <reason>` if the evidence shows the config should stay the same."
             print(f"Calling {provider} ({model})..." + (f" [round {round_num + 1}, after file read]" if round_num > 0 else "") + (f" (attempt {attempt + 1}/{max_attempts})" if attempt > 0 else ""))
             try:
                 response = call_fn(call_prompt)
@@ -1088,10 +1324,15 @@ env:
                     file_content = f"(read error: {e})"
             print(f"Read {req_path} ({len(file_content)} chars)")
 
+        no_config_change_reason = _extract_no_config_change_reason(response)
         yaml_content = _extract_yaml(response)
+        if no_config_change_reason and not yaml_content:
+            yaml_content = (experiment_dir / "vllm-qwen.yaml").read_text()
         if not yaml_content:
             # Retry once: agent may have returned prose instead of YAML block
-            retry_prompt = f"""Your previous response did not include the vllm-qwen.yaml in a ```yaml block. You MUST return the complete Kubernetes Pod YAML in a code block.
+            retry_prompt = f"""Your previous response did not include a valid result. You must either:
+1. return `NO_CONFIG_CHANGE: <reason>` if the logs show the config should stay the same, or
+2. return the complete Kubernetes Pod YAML in a ```yaml block```.
 
 **Failure we're fixing:** {(failure_context or {}).get("result", "unknown")[:300]}
 
@@ -1100,12 +1341,15 @@ env:
 {(experiment_dir / "vllm-qwen.yaml").read_text()[:2000]}
 ```
 
-Return the fixed vllm-qwen.yaml in a ```yaml block. If you didn't change it, return it unchanged."""
+Return either `NO_CONFIG_CHANGE: <reason>` or the fixed vllm-qwen.yaml in a ```yaml block```. If you didn't change it, return it unchanged."""
             print("Could not extract YAML—asking agent to retry with explicit format...")
             try:
                 retry_response = call_fn(retry_prompt)
                 conversation_turns.append((retry_prompt, retry_response))
+                no_config_change_reason = _extract_no_config_change_reason(retry_response)
                 yaml_content = _extract_yaml(retry_response)
+                if no_config_change_reason and not yaml_content:
+                    yaml_content = (experiment_dir / "vllm-qwen.yaml").read_text()
             except Exception as e:
                 print(f"Retry failed: {e}")
             if not yaml_content:
@@ -1129,8 +1373,11 @@ Return the fixed vllm-qwen.yaml in a ```yaml block. If you didn't change it, ret
                     yaml_content = yaml_content.replace(proposed_model, baseline_model)
 
         # Ask agent for a concise summary (for terminal/metadata); fallback to parsed description
-        summary = _ask_agent_summary(response, call_fn)
-        description = summary if summary else _extract_description(response)
+        if no_config_change_reason:
+            description = f"No config change: {no_config_change_reason}"
+        else:
+            summary = _ask_agent_summary(response, call_fn)
+            description = summary if summary else _extract_description(response)
         last_description = description
 
         makefile_content_new = _extract_makefile(response) or (makefile_content if attempt == 0 else (experiment_dir / "Makefile").read_text())
@@ -1160,7 +1407,7 @@ Return the fixed vllm-qwen.yaml in a ```yaml block. If you didn't change it, ret
         print()
         print("Deploying and running benchmark...")
 
-        success, result = _deploy_and_benchmark(experiment_dir, benchmark, run_dir, ts)
+        success, result = _deploy_and_benchmark(experiment_dir, benchmark, run_dir, ts, sweep=sweep or None)
         _append_result(experiment_dir, description, result, success=success, run_dir=run_dir, results_path=results_txt)
 
         if success:
@@ -1168,6 +1415,7 @@ Return the fixed vllm-qwen.yaml in a ```yaml block. If you didn't change it, ret
             if sweep_dir:
                 from sweep_utils import update_best_runllm
                 update_best_runllm(sweep_dir, RUNLLM)
+                _write_leaderboard_to_sweep(sweep_dir)
             print(f"Results: {result}")
             return 0
 
@@ -1223,6 +1471,15 @@ Return the retrospective in a ```markdown block```."""
         (run_dir / "RETRO.md").write_text(retro_content)
         print(f"Saved RETRO.md to {run_dir}")
     _append_result(experiment_dir, last_description, f"Failed after 10 attempts. Retro saved. Last error: {failure_context.get('result', '')}", success=False, run_dir=run_dir, results_path=results_txt)
+    if sweep_dir:
+        if (run_dir / "run_metadata.json").exists():
+            try:
+                rm = json.loads((run_dir / "run_metadata.json").read_text())
+                rm["result"] = failure_context.get("result", "")[:500]
+                (run_dir / "run_metadata.json").write_text(json.dumps(rm, indent=2))
+            except Exception:
+                pass
+        _write_leaderboard_to_sweep(sweep_dir)
     print(f"Results: Failed after 10 attempts. See {run_dir}/RETRO.md")
     return 1
 

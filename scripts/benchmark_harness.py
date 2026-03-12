@@ -21,6 +21,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from benchmark_config import BENCHMARK_PRESETS, parse_completed_count
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
 RUNLLM_DIR = PROJECT_ROOT / "runllm"
@@ -28,35 +30,6 @@ RUNLLM_DIR = PROJECT_ROOT / "runllm"
 _DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "vllm-qwen.yaml"
 VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
 BENCHMARK_LIVE_FILE = PROJECT_ROOT / "results" / "benchmark_live.txt"
-
-
-BENCHMARK_PRESETS = {
-    "quick": ("synchronous", "5", "30", "prompt_tokens=64,output_tokens=64"),
-    "sync": ("synchronous", "20", "60", "prompt_tokens=64,output_tokens=64"),
-    "sweep": ("sweep", None, "60", "prompt_tokens=256,output_tokens=128"),
-    "medium": ("synchronous", "200", "300", "prompt_tokens=256,output_tokens=128"),
-    "long": ("synchronous", "1000", "600", "prompt_tokens=256,output_tokens=128"),
-}
-
-# Patterns to extract completed request count from guidellm progress output.
-# Must be specific to avoid matching config dump lines (e.g. max_seconds: 300).
-_COMPLETED_PATTERNS = [
-    r"(?:successful|processed)_requests['\"]?\s*[:=]\s*(\d+)",
-    r"\b(\d+)/\d+\s*(?:requests?|completed)",
-    r"(?:^|\s)Comp\s+(\d+)(?:\s|$)",
-    r"processed_requests\D+(\d+)",
-]
-
-
-def _parse_completed_count(line: str) -> int | None:
-    for pat in _COMPLETED_PATTERNS:
-        m = re.search(pat, line, re.IGNORECASE)
-        if m:
-            try:
-                return int(m.group(1))
-            except (ValueError, IndexError):
-                pass
-    return None
 
 
 def main() -> None:
@@ -80,7 +53,7 @@ def main() -> None:
         "--benchmark", "-b",
         choices=list(BENCHMARK_PRESETS),
         default="medium",
-        help="Preset: quick (5 req), sync (20 req), sweep (60s), full (200 req)",
+        help="Preset: quick, sync, sweep, medium, or long",
     )
     parser.add_argument(
         "--profile",
@@ -145,10 +118,10 @@ def main() -> None:
     # Resolve benchmark config
     preset = BENCHMARK_PRESETS.get("quick" if args.fast else args.benchmark, BENCHMARK_PRESETS["medium"])
     cfg = {
-        "profile": args.profile or preset[0],
-        "max_requests": str(args.max_requests) if args.max_requests is not None else preset[1],
-        "max_seconds": str(args.max_seconds) if args.max_seconds is not None else preset[2],
-        "data": args.data or preset[3],
+        "profile": args.profile or str(preset["profile"]),
+        "max_requests": str(args.max_requests) if args.max_requests is not None else preset["max_requests"],
+        "max_seconds": str(args.max_seconds) if args.max_seconds is not None else str(preset["max_seconds"]),
+        "data": args.data or str(preset["data"]),
     }
 
     # 3. Write run metadata
@@ -270,7 +243,7 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
                 for line in proc.stdout:
                     log_lines.append(line)
                     last_output_ts[0] = time.monotonic()
-                    completed = _parse_completed_count(line)
+                    completed = parse_completed_count(line)
                     if completed is not None:
                         # Cap at max_requests: regex can match wrong numbers (e.g. 30 from max_seconds)
                         if max_req is not None and completed > max_req:

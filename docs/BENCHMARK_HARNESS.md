@@ -4,12 +4,12 @@ The test harness runs Guideline benchmarks against your vLLM setup, saves every 
 
 ## Quick Start
 
-1. Ensure the `vllm-qwen` pod is running (`kubectl get pod vllm-qwen`)
+1. Ensure cluster access is configured (`make kubeconfig` or export `KUBECONFIG`)
 2. Run a benchmark:
    ```bash
-   make benchmark-run
+   make benchmark
    ```
-3. View results: `make results-serve` then open http://localhost:8765/runs/index.html
+3. View results: `make serve` then open http://localhost:8765/
 
 ## Workflow: Modify vLLM → Benchmark → Compare
 
@@ -36,11 +36,11 @@ kubectl wait --for=condition=Ready pod/vllm-qwen --timeout=300s
 ### 2. Run the benchmark
 
 ```bash
-# Full run (starts port-forward, runs benchmark, stops port-forward)
-make benchmark-run DESCRIPTION="Qwen 3B baseline"
+# Full run (deploys with runllm/, runs benchmark, saves results/runs/YYYYMMDD_HHMMSS/)
+make benchmark DESCRIPTION="Qwen 3B baseline"
 
-# Or, if port-forward is already running in another terminal:
-make benchmark-run-quick DESCRIPTION="Qwen 3B baseline"
+# Quick preset:
+make benchmark BENCHMARK=quick DESCRIPTION="Qwen 3B quick check"
 ```
 
 ### 3. View results
@@ -55,8 +55,8 @@ Each run is saved to `results/runs/YYYYMMDD_HHMMSS/`:
 
 Serve and browse:
 ```bash
-make results-serve
-# Open http://localhost:8765/runs/index.html
+make serve
+# Open http://localhost:8765/
 ```
 
 The index lists all runs with metrics and links. Use it to compare configurations.
@@ -65,11 +65,11 @@ The index lists all runs with metrics and links. Use it to compare configuration
 
 | Command | Description |
 |---------|-------------|
-| `make benchmark-run` | Run benchmark (starts port-forward automatically) |
-| `make benchmark-run DESCRIPTION="label"` | Run with a description for the index |
-| `make benchmark-run-quick` | Same, but assumes port-forward already running |
-| `make benchmark-import` | Copy current `results/` into a new run (preserve pre-harness history) |
-| `make results-serve` | Serve results at http://localhost:8765/ |
+| `make benchmark` | Deploy + run benchmark and save a timestamped run |
+| `make benchmark BENCHMARK=quick` | Quick preset |
+| `make benchmark-run` | Run harness only (assumes port-forward exists) |
+| `make benchmark-run-quick` | Run harness only with `--skip-port-forward` |
+| `make serve` | Serve results at http://localhost:8765/ |
 | `make results-index` | Rebuild the runs index (e.g., after manual copy) |
 
 ## Run Directory Contents
@@ -87,30 +87,20 @@ The index lists all runs with metrics and links. Use it to compare configuration
 
 ## AI-Driven Optimization
 
-Use Claude Opus or OpenAI to suggest vLLM config changes, run the benchmark, and compare:
+Use the sweep workflow to let the agent iterate on vLLM config changes:
 
 ```bash
-# Claude Opus (default) - requires ANTHROPIC_API_KEY
-make ai-benchmark-optimize
-
-# OpenAI (GPT-5.4) - requires OPENAI_API_KEY
-AI_PROVIDER=openai make ai-benchmark-optimize
-
-# Use Claude Sonnet instead of Opus (cheaper)
-AI_MODEL=claude-sonnet-4-20250514 make ai-benchmark-optimize
+make sweep SWEEP=qwen-latency GOAL="minimize latency"
+make improve SWEEP=qwen-latency
+make leaderboard SWEEP=qwen-latency
 ```
 
-The AI receives your current `vllm-qwen.yaml` and latest benchmark metrics, proposes a modification (e.g., `--max-model-len`, `--gpu-memory-utilization`, different model), and the script applies it, restarts the pod, runs the benchmark, and prints a before/after comparison. Original config is restored at the end; the AI version is backed up to `vllm-qwen.yaml.bak`.
-
-Dependencies: `uv sync --extra ai_optimizer` (anthropic, openai) — the Makefile target runs this automatically.
-
-**Live dashboard:** Start `make results-serve` in one terminal, then run `make ai-benchmark-optimize` in another. Open http://localhost:8765/ai_optimizer.html to see live updates on the agent's strategy, current step, and history of all attempts with before/after metrics.
+Each improve run copies the current best `runllm/`, proposes one experiment, deploys it, runs a sample query, benchmarks it, and writes sweep artifacts under `results/sweep-NAME/`.
 
 **Agent handoff:** See [AGENT_HANDOFF.md](AGENT_HANDOFF.md) for a concise summary so another agent can pick up this work quickly.
 
 ## Tips
 
 - **Label runs:** Always use `DESCRIPTION=` so you can tell runs apart in the index
-- **Port-forward:** Use `benchmark-run-quick` when iterating; keep `make vllm-qwen-forward` running in a separate terminal
-- **Import old results:** If you have benchmarks in `results/` from before the harness, run `make benchmark-import DESCRIPTION="pre-harness baseline"` to save them
+- **Port-forward:** Use `benchmark-run` or `benchmark-run-quick` when iterating against an already-running pod
 - **Compare configs:** Open `vllm_config.yaml` from different runs to diff vLLM settings

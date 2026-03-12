@@ -10,6 +10,41 @@ from pathlib import Path
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
 
+def sweep_objective(sweep_name: str) -> str:
+    """Infer the primary optimization objective from the sweep name."""
+    name_lower = sweep_name.lower()
+    if "latency" in name_lower:
+        return "latency"
+    if "throughput" in name_lower:
+        return "throughput"
+    if "ttft" in name_lower:
+        return "ttft"
+    return "composite"
+
+
+def sweep_ranking_label(sweep_name: str) -> str:
+    objective = sweep_objective(sweep_name)
+    if objective == "latency":
+        return "latency (lower is better)"
+    if objective == "throughput":
+        return "throughput (higher is better)"
+    if objective == "ttft":
+        return "TTFT (lower is better)"
+    return "overall score"
+
+
+def metric_mean(metrics: dict, key: str, sub: str = "successful") -> float | None:
+    """Extract metrics.<key>.<sub>.mean from a Guideline metrics dict."""
+    obj = metrics.get(key, {})
+    if not isinstance(obj, dict):
+        return None
+    selected = obj.get(sub, obj)
+    if not isinstance(selected, dict):
+        return None
+    value = selected.get("mean")
+    return float(value) if value is not None else None
+
+
 def _score_run(run_dir: Path, sweep_name: str) -> float | None:
     """Score a run for 'best' (higher is better). Returns None if unscoreable."""
     bench_file = run_dir / "benchmarks.json"
@@ -22,32 +57,23 @@ def _score_run(run_dir: Path, sweep_name: str) -> float | None:
             return None
         b = benchmarks[0]
         m = b.get("metrics", {})
-        # Extract from nested structure: metrics.<metric>.<successful>.<mean>
-        def _mean(k: str, sub: str = "successful") -> float | None:
-            o = m.get(k, {})
-            if not isinstance(o, dict):
-                return None
-            s = o.get(sub, o)
-            if not isinstance(s, dict):
-                return None
-            v = s.get("mean")
-            return float(v) if v is not None else None
+        latency = metric_mean(m, "request_latency")  # seconds
+        ttft = metric_mean(m, "time_to_first_token_ms")  # ms
+        throughput = metric_mean(m, "tokens_per_second")
 
-        latency = _mean("request_latency")  # seconds
-        ttft = _mean("time_to_first_token_ms")  # ms
-        throughput = _mean("tokens_per_second")
-
-        # Sweep name hints objective: latency -> lower is better, throughput -> higher
-        name_lower = sweep_name.lower()
-        if "latency" in name_lower:
+        objective = sweep_objective(sweep_name)
+        if objective == "latency":
             # Score = -latency (lower latency = higher score)
             if latency is not None:
                 return -latency
             if ttft is not None:
                 return -ttft / 1000
-        if "throughput" in name_lower:
+        if objective == "throughput":
             if throughput is not None:
                 return throughput
+        if objective == "ttft":
+            if ttft is not None:
+                return -ttft / 1000
 
         # Default: composite — favor higher throughput, lower latency
         score = 0.0

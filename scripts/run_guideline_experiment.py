@@ -11,40 +11,12 @@ import os
 import re
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
+from benchmark_config import BENCHMARK_PRESETS, parse_completed_count
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-BENCHMARK_PRESETS = {
-    "quick": ("synchronous", "5", "30", "prompt_tokens=64,output_tokens=64"),
-    "sync": ("synchronous", "20", "60", "prompt_tokens=64,output_tokens=64"),
-    "sweep": ("sweep", None, "60", "prompt_tokens=256,output_tokens=128"),
-    "medium": ("synchronous", "200", "300", "prompt_tokens=256,output_tokens=128"),
-    "long": ("synchronous", "1000", "600", "prompt_tokens=256,output_tokens=128"),
-}
-
-# Patterns to extract completed request count from guidellm progress output.
-# Must be specific to avoid matching config dump lines (e.g. max_seconds: 300).
-COMPLETED_PATTERNS = [
-    r"(?:successful|processed)_requests['\"]?\s*[:=]\s*(\d+)",
-    r"\b(\d+)/\d+\s*(?:requests?|completed)",
-    r"(?:^|\s)Comp\s+(\d+)(?:\s|$)",
-    r"processed_requests\D+(\d+)",
-]
-
-
-
-def _parse_completed_count(line: str) -> int | None:
-    for pat in COMPLETED_PATTERNS:
-        m = re.search(pat, line, re.IGNORECASE)
-        if m:
-            try:
-                return int(m.group(1))
-            except (ValueError, IndexError):
-                pass
-    return None
 
 
 def main() -> int:
@@ -55,10 +27,10 @@ def main() -> int:
 
     preset = BENCHMARK_PRESETS.get(benchmark, BENCHMARK_PRESETS["quick"])
     cfg = {
-        "profile": preset[0],
-        "max_requests": preset[1],
-        "max_seconds": preset[2],
-        "data": preset[3],
+        "profile": preset["profile"],
+        "max_requests": preset["max_requests"],
+        "max_seconds": preset["max_seconds"],
+        "data": preset["data"],
     }
 
     cmd = [
@@ -103,7 +75,9 @@ def main() -> int:
                 for line in proc.stdout:
                     logf.write(line)
                     logf.flush()
-                    n = _parse_completed_count(line)
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    n = parse_completed_count(line)
                     if n is not None and n > max_completed:
                         max_completed = n
                         write_progress(max_completed)

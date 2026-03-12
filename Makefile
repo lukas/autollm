@@ -15,7 +15,7 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync bench bench-quick benchmark benchmark-run benchmark-run-quick sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index serve dashboard ai-optimize query kubeconfig ensure-kubeconfig
+.PHONY: sync bench bench-quick benchmark benchmark-run benchmark-run-quick sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index serve dashboard ai-optimize query kubeconfig ensure-kubeconfig leaderboard sweep-pods
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
@@ -102,12 +102,32 @@ sweep: BENCHMARK=quick
 sweep: sync ensure-kubeconfig
 	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
 
+# Refresh leaderboard in sweep dir (also written automatically during improve runs)
+# Usage: make leaderboard SWEEP=my-sweep
+leaderboard:
+	@test -n "$(SWEEP)" || (echo "Usage: make leaderboard SWEEP=name"; exit 1)
+	env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --refresh-leaderboard --sweep "$(SWEEP)"
+
+# List running Kubernetes pods associated with a sweep
+# Usage: make sweep-pods SWEEP=my-sweep
+sweep-pods: ensure-kubeconfig
+	@test -n "$(SWEEP)" || (echo "Usage: make sweep-pods SWEEP=name"; exit 1)
+	env -u VIRTUAL_ENV uv run python scripts/list_sweep_pods.py --sweep "$(SWEEP)"
+
 # Improve a sweep: LLM suggests vLLM changes, deploy, benchmark, save to results/sweep-[name]/[timestamp]/
 # Includes modified runllm snapshot. Requires sweep baseline first.
-# Usage: make improve SWEEP=my-sweep BENCHMARK=quick
+# Usage: make improve SWEEP=my-sweep
+#        make improve SWEEP=my-sweep RUNS=5        # run 5 improvement iterations
+#        make improve SWEEP=my-sweep RUNS=5 ALLOW_MODEL_CHANGE=1
+RUNS ?= 1
 improve: BENCHMARK=quick
 improve: sync ensure-kubeconfig
-	@env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep "$(SWEEP)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,)
+	@for i in $$(seq 1 $(RUNS)); do \
+		echo ""; echo "══════════════════════════════════════════"; \
+		echo "  Improvement run $$i/$(RUNS)"; \
+		echo "══════════════════════════════════════════"; \
+		env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep "$(SWEEP)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,) || true; \
+	done
 
 # AI experiment (standalone, no sweep): agent suggests changes, deploy, benchmark
 # Saves to results/runs/exp_[ts]. For sweep-based flow, use 'make improve SWEEP=name'

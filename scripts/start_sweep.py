@@ -15,9 +15,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from benchmark_config import BENCHMARK_PRESETS
 
-BENCHMARK_PRESETS = ("quick", "sync", "sweep", "medium", "long")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
@@ -27,7 +27,7 @@ def main() -> int:
         "--benchmark", "-b",
         choices=list(BENCHMARK_PRESETS),
         default="quick",
-        help="Benchmark preset: quick (5 req), sync, sweep, full",
+        help="Benchmark preset: quick, sync, sweep, medium, or long",
     )
     parser.add_argument(
         "--data",
@@ -98,6 +98,11 @@ def main() -> int:
     from scripts.sweep_utils import update_best_runllm
     runllm = PROJECT_ROOT / "runllm"
     update_best_runllm(sweep_dir, runllm)
+    subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "scripts" / "ai_experiment.py"), "--refresh-leaderboard", "--sweep", name],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+    )
     print(f"Baseline saved to {baseline_dir}")
     print(f"Run 'make improve SWEEP={name}' to try LLM-suggested improvements")
     return 0
