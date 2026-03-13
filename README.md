@@ -31,15 +31,14 @@ make improve SWEEP=qwen-latency
 
 ```bash
 make sweep SWEEP=qwen-latency GOAL="minimize latency"
-make sweep SWEEP=qwen-throughput GOAL="maximize throughput (tok/s) under concurrent load"
+make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
 make sweep SWEEP=qwen-ttft GOAL="minimize time to first token (TTFT)"
 make sweep SWEEP=qwen-latency GOAL="minimize latency" BENCHMARK=medium  # 200 req, ~5 min
-make sweep SWEEP=qwen-latency GOAL="minimize latency" MAX_REQUESTS=500 # custom count
 ```
 
-The `GOAL` tells the AI agent what metric to optimize. It's saved in `sweep_metadata.json` and included in every agent prompt for this sweep.
+The `GOAL` tells the AI agent what metric to optimize. `MODEL_DIR` selects which model config from `runllm/` to use (default: `qwen2.5-1.5b`). Both are saved in `sweep_metadata.json` and included in every agent prompt for this sweep.
 
-This deploys vLLM with your current `runllm/vllm-qwen.yaml`, runs the benchmark, and saves results to `results/sweep-qwen-latency/baseline/`.
+This deploys vLLM with the chosen model's `vllm-config.yaml`, runs the benchmark, and saves results to the sweep's `baseline/` directory.
 
 ### Step 2: Run AI-driven improvements
 
@@ -67,7 +66,7 @@ The agent has access to these tools during each run:
 | `search_web` | Web search via Exa API (falls back to DuckDuckGo) |
 | `fetch_url` | Fetch and extract content from a URL |
 | `read_file` | Read project files (results/, runllm/, docs/, scripts/) |
-| `write_file` | Write `vllm-qwen.yaml` or `Makefile` to the isolated per-run experiment directory only |
+| `write_file` | Write `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory only |
 | `list_files` | List files in a project directory |
 | `run_shell` | Run a shell command (read-only, no destructive ops) |
 | `run_benchmark` | Deploy the written config and run the benchmark |

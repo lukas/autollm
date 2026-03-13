@@ -6,7 +6,7 @@ Each run is saved to results/runs/YYYYMMDD_HHMMSS/. Requires vLLM port-forward.
 
 Usage:
   python scripts/benchmark_harness.py [--description "My change"]
-  VLLM_CONFIG=runllm/vllm-qwen.yaml make benchmark-run
+  VLLM_CONFIG=runllm/qwen2.5-1.5b/vllm-config.yaml make benchmark-run
 """
 from __future__ import annotations
 
@@ -25,11 +25,28 @@ from benchmark_config import BENCHMARK_PRESETS, parse_completed_count
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
-RUNLLM_DIR = PROJECT_ROOT / "runllm"
-# Default: runllm/vllm-qwen.yaml (runllm is submodule inside autollm)
-_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "vllm-qwen.yaml"
+RUNLLM_ROOT = PROJECT_ROOT / "runllm"
+_DEFAULT_VLLM = RUNLLM_ROOT / "qwen2.5-1.5b" / "vllm-config.yaml"
 VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
+RUNLLM_DIR = VLLM_YAML.parent  # model subdir containing Makefile
 BENCHMARK_LIVE_FILE = PROJECT_ROOT / "results" / "benchmark_live.txt"
+
+
+def _pod_name_from_yaml(yaml_path: Path) -> str:
+    """Extract metadata.name from a K8s Pod YAML."""
+    if yaml_path.exists():
+        try:
+            import yaml
+            doc = yaml.safe_load(yaml_path.read_text())
+            name = doc.get("metadata", {}).get("name", "")
+            if name:
+                return name
+        except Exception:
+            pass
+    return "vllm"
+
+
+VLLM_POD = os.environ.get("VLLM_POD") or _pod_name_from_yaml(VLLM_YAML)
 
 
 def main() -> None:
@@ -104,7 +121,7 @@ def main() -> None:
     # 2. Capture pod status (best-effort)
     try:
         result = subprocess.run(
-            ["kubectl", "describe", "pod", "vllm-qwen"],
+            ["kubectl", "describe", "pod", VLLM_POD],
             capture_output=True,
             text=True,
             timeout=10,
@@ -138,9 +155,9 @@ def main() -> None:
 
     # 4. Optionally start LLM
     if args.start_llm:
-        _log(run_dir, "run.log", "Starting vLLM (runllm)...")
+        _log(run_dir, "run.log", f"Starting vLLM (runllm) pod={VLLM_POD} dir={RUNLLM_DIR}...")
         proc = subprocess.Popen(
-            ["make", "start"],
+            ["make", "start", f"VLLM_POD={VLLM_POD}"],
             cwd=str(RUNLLM_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -313,13 +330,13 @@ def _run_with_port_forward(run_dir: Path, *, config: dict) -> int:
     import urllib.request
 
     subprocess.run(
-        ["pkill", "-f", "kubectl port-forward vllm-qwen"],
+        ["pkill", "-f", f"kubectl port-forward {VLLM_POD}"],
         capture_output=True,
     )
     time.sleep(3)
 
     pf = subprocess.Popen(
-        ["kubectl", "port-forward", "vllm-qwen", "8000:8000"],
+        ["kubectl", "port-forward", VLLM_POD, "8000:8000"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -333,7 +350,7 @@ def _run_with_port_forward(run_dir: Path, *, config: dict) -> int:
             except Exception:
                 time.sleep(4)
         else:
-            _log(run_dir, "run.log", "Timeout: vllm-qwen not reachable. Run: cd runllm && make forward")
+            _log(run_dir, "run.log", f"Timeout: {VLLM_POD} not reachable. Run: cd runllm && make forward")
             return 1
 
         return _run_guideline(run_dir, config=config)

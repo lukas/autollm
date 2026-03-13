@@ -71,7 +71,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "write_file",
         "description": (
             "Write a file to the run-specific experiment directory (results/sweep-NAME/TIMESTAMP/runllm/). "
-            "Only 'vllm-qwen.yaml' and 'Makefile' are allowed. This NEVER writes to the project root "
+            "Only 'vllm-config.yaml' and 'Makefile' are allowed. This NEVER writes to the project root "
             "or the shared runllm/ — only to the isolated per-run copy."
         ),
         "parameters": {
@@ -79,7 +79,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Filename to write: 'vllm-qwen.yaml' or 'Makefile'",
+                    "description": "Filename to write: 'vllm-config.yaml' or 'Makefile'",
                 },
                 "content": {"type": "string", "description": "Full file content to write"},
             },
@@ -122,7 +122,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "run_benchmark",
         "description": (
             "Deploy the current experiment config and run the benchmark suite. "
-            "You MUST call write_file('vllm-qwen.yaml', ...) first. "
+            "You MUST call write_file('vllm-config.yaml', ...) first. "
             "Long-running (~2 min). Returns benchmark metrics or error details."
         ),
         "parameters": {
@@ -167,7 +167,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "properties": {
                 "resource": {
                     "type": "string",
-                    "description": "Resource type or name, e.g. 'pods', 'nodes', 'pod/vllm-qwen'",
+                    "description": "Resource type or name, e.g. 'pods', 'nodes', 'pod/vllm'",
                 },
                 "output": {
                     "type": "string",
@@ -184,7 +184,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "pod_name": {"type": "string", "description": "Pod name, e.g. 'vllm-qwen'"},
+                "pod_name": {"type": "string", "description": "Pod name from vllm-config.yaml metadata.name"},
                 "tail": {"type": "integer", "description": "Lines from end (default 200)"},
                 "container": {"type": "string", "description": "Container name (optional)"},
             },
@@ -219,6 +219,59 @@ class ToolContext:
     _benchmark_count: int = 0
 
     tool_log: list[dict[str, Any]] = field(default_factory=list)
+    log_path: Path | None = None
+
+
+def _flush_log_entry(ctx: ToolContext, entry: dict[str, Any]) -> None:
+    """Append a single conversation entry to the live agent log file."""
+    if not ctx.log_path:
+        return
+    role = entry.get("role", "?")
+    lines = [f"\n{'='*60}\n{role.upper()}\n{'='*60}\n"]
+
+    if role == "assistant":
+        text = entry.get("content", "")
+        if isinstance(text, list):
+            for block in text:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        lines.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        lines.append(f"\n--- tool_use: {block.get('name')} ---")
+                        lines.append(json.dumps(block.get("input", {}), indent=2, default=str))
+        elif isinstance(text, str):
+            lines.append(text)
+        tool_calls = entry.get("tool_calls")
+        if tool_calls and isinstance(tool_calls, list):
+            for tc in tool_calls:
+                lines.append(f"\n--- tool_call: {tc.get('name', '?')} ---")
+                lines.append(str(tc.get("arguments", "")))
+    elif role in ("tool_results", "tool_result"):
+        tool_name = entry.get("tool", "")
+        if tool_name:
+            lines.append(f"[{tool_name}]")
+        tool_content = entry.get("tool_content", entry.get("content", ""))
+        if isinstance(tool_content, list):
+            for item in tool_content:
+                if isinstance(item, dict):
+                    tid = item.get("tool_use_id", "")
+                    tc = item.get("tool_content", "")
+                    if tid:
+                        lines.append(f"\n--- result ({tid}) ---")
+                    lines.append(str(tc))
+                else:
+                    lines.append(str(item))
+        else:
+            lines.append(json.dumps(tool_content, indent=2, default=str) if not isinstance(tool_content, str) else tool_content)
+    else:
+        lines.append(str(entry.get("content", "")))
+
+    try:
+        with open(ctx.log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+            f.write("\n")
+    except Exception:
+        pass
 
 
 @dataclass
@@ -256,7 +309,7 @@ def _html_to_text(raw: str) -> str:
 
 
 ALLOWED_READ_PREFIXES = ("results/", "runllm/", "docs/", "scripts/")
-ALLOWED_WRITE_FILES = {"vllm-qwen.yaml", "Makefile"}
+ALLOWED_WRITE_FILES = {"vllm-config.yaml", "Makefile"}
 SHELL_BLOCKLIST = re.compile(
     r"\b(rm\s+-rf|rm\s+-r|mkfs|dd\s+if|reboot|shutdown|kill\s+-9|pkill|chmod\s+777)\b", re.I
 )
@@ -426,7 +479,7 @@ def _tool_write_file(path: str, content: str, ctx: ToolContext) -> str:
     target = ctx.experiment_dir / basename
     try:
         target.write_text(content)
-        if basename == "vllm-qwen.yaml":
+        if basename == "vllm-config.yaml":
             ctx.config_written = True
             ctx.config_content = content
             import shutil
@@ -481,7 +534,7 @@ def _tool_run_shell(command: str, ctx: ToolContext) -> str:
 
 def _tool_run_benchmark(description: str, ctx: ToolContext) -> str:
     if not ctx.config_written:
-        return "Error: write vllm-qwen.yaml first (call write_file)."
+        return "Error: write vllm-config.yaml first (call write_file)."
     if ctx._benchmark_count >= ctx.max_benchmarks:
         return f"Error: max {ctx.max_benchmarks} benchmarks per agent loop reached."
     if ctx.deploy_and_benchmark is None:
@@ -667,7 +720,9 @@ def _run_anthropic_loop(
 
         assistant_content = resp.content
         messages.append({"role": "assistant", "content": assistant_content})
-        conversation.append({"role": "assistant", "content": _serialize_anthropic_content(assistant_content)})
+        asst_entry = {"role": "assistant", "content": _serialize_anthropic_content(assistant_content)}
+        conversation.append(asst_entry)
+        _flush_log_entry(ctx, asst_entry)
 
         text_parts = [b.text for b in assistant_content if hasattr(b, "text")]
         tool_uses = [b for b in assistant_content if hasattr(b, "name")]
@@ -694,9 +749,11 @@ def _run_anthropic_loop(
             })
 
         messages.append({"role": "user", "content": tool_results})
-        conversation.append({"role": "tool_results", "content": [
-            {"tool_use_id": tr["tool_use_id"], "length": len(tr["content"])} for tr in tool_results
-        ]})
+        tool_entry = {"role": "tool_results", "content": [
+            {"tool_use_id": tr["tool_use_id"], "tool_content": tr["content"]} for tr in tool_results
+        ]}
+        conversation.append(tool_entry)
+        _flush_log_entry(ctx, tool_entry)
 
     return AgentResult(error="Max tool-calling turns reached", conversation=conversation, tool_log=ctx.tool_log)
 
@@ -706,9 +763,9 @@ def _serialize_anthropic_content(content: list) -> list[dict]:
     out = []
     for block in content:
         if hasattr(block, "text"):
-            out.append({"type": "text", "text": block.text[:2000]})
+            out.append({"type": "text", "text": block.text})
         elif hasattr(block, "name"):
-            out.append({"type": "tool_use", "name": block.name, "input_keys": list((block.input or {}).keys())})
+            out.append({"type": "tool_use", "name": block.name, "input": block.input or {}})
     return out
 
 
@@ -734,7 +791,12 @@ def _run_openai_loop(
         assistant_msg = choice.message
 
         oai_messages.append(_openai_message_to_dict(assistant_msg))
-        conversation.append({"role": "assistant", "content": assistant_msg.content or "", "tool_calls": bool(assistant_msg.tool_calls)})
+        tc_summary = None
+        if assistant_msg.tool_calls:
+            tc_summary = [{"name": tc.function.name, "arguments": tc.function.arguments} for tc in assistant_msg.tool_calls]
+        asst_entry = {"role": "assistant", "content": assistant_msg.content or "", "tool_calls": tc_summary}
+        conversation.append(asst_entry)
+        _flush_log_entry(ctx, asst_entry)
 
         if choice.finish_reason != "tool_calls" or not assistant_msg.tool_calls:
             return AgentResult(
@@ -760,7 +822,9 @@ def _run_openai_loop(
                 "tool_call_id": tc.id,
                 "content": result_str,
             })
-            conversation.append({"role": "tool_result", "tool": tc.function.name, "length": len(result_str)})
+            tool_entry = {"role": "tool_result", "tool": tc.function.name, "tool_content": result_str}
+            conversation.append(tool_entry)
+            _flush_log_entry(ctx, tool_entry)
 
     return AgentResult(error="Max tool-calling turns reached", conversation=conversation, tool_log=ctx.tool_log)
 
@@ -800,6 +864,13 @@ def run_agent(
     Returns an AgentResult with the final state.
     """
     messages = [{"role": "user", "content": user_prompt}]
+
+    if ctx.log_path:
+        ctx.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(ctx.log_path, "w", encoding="utf-8") as f:
+            f.write("# Agent Tool-Calling Log\n")
+        _flush_log_entry(ctx, {"role": "system", "content": system_prompt})
+        _flush_log_entry(ctx, {"role": "user", "content": user_prompt})
 
     if provider == "anthropic":
         result = _run_anthropic_loop(system_prompt, messages, model, ctx, max_turns)

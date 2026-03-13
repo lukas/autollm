@@ -11,23 +11,27 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RUNLLM = PROJECT_ROOT / "runllm"
+RUNLLM = PROJECT_ROOT / "runllm" / "qwen2.5-1.5b"
 
 
 def main() -> int:
     makefile = RUNLLM / "Makefile"
     if not makefile.exists():
-        print("runllm/Makefile not found")
+        print(f"{RUNLLM}/Makefile not found")
         return 1
 
     # 1. Check Makefile has apply: delete-pod
     text = makefile.read_text()
     if not re.search(r"apply:\s*delete-pod", text):
-        print("FAIL: runllm Makefile apply target must depend on delete-pod")
+        print("FAIL: Makefile apply target must depend on delete-pod")
         return 1
 
     if "delete-pod:" not in text:
-        print("FAIL: runllm Makefile missing delete-pod target")
+        print("FAIL: Makefile missing delete-pod target")
+        return 1
+
+    if "vllm-config.yaml" not in text:
+        print("FAIL: Makefile should default to vllm-config.yaml")
         return 1
 
     # 2. Dry-run apply - verify delete runs before kubectl apply

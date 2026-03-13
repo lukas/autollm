@@ -60,6 +60,7 @@ def _handle_signal(signum, frame):
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 RUNLLM = PROJECT_ROOT / "runllm"
+DEFAULT_MODEL_DIR = "qwen2.5-1.5b"
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
 RESULTS_DIR = PROJECT_ROOT / "results"
 PROGRESS_FILE = PROJECT_ROOT / "results" / "experiment_progress.json"
@@ -77,28 +78,35 @@ AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "50"))
 
 TOOL_SYSTEM_PROMPT = """\
 You are a vLLM optimizer agent running on Kubernetes (H200 GPU, CoreWeave).
-You have tools to explore files, search the web, read logs, interact with Kubernetes, and run benchmarks.
+Your job: pick ONE simple change that is most likely to improve performance, then test it.
 
 ## Workflow
-1. Review the provided context (current config, leaderboard, workload, goal).
-2. Use tools as needed: read_file, list_files, read_logs, search_web, fetch_url, kubectl_get, kubectl_logs, run_shell.
-3. Decide on ONE isolated config change (prefer single-variable experiments).
-4. Write the config: write_file('vllm-qwen.yaml', <complete pod YAML>).
-5. Optionally: write_file('Makefile', ...) if you changed the model.
+1. Read the leaderboard and lessons learned (provided in the prompt). These tell you what has been tried and what worked.
+2. Pick the single simplest change most likely to produce a measurable improvement. Do NOT bundle multiple changes.
+3. If you need more detail on a past run, use read_file to read its RETRO.md or read_logs to check its benchmark/deploy logs.
+4. Use search_web or fetch_url only if you need to look up a specific vLLM flag or behavior.
+5. Write the config: write_file('vllm-config.yaml', <complete pod YAML>).
 6. Optionally: run_benchmark(<description>) to deploy and benchmark your config.
 
 ## File safety
 - write_file ONLY writes to the isolated per-run experiment directory (results/sweep-NAME/TIMESTAMP/runllm/).
 - It NEVER modifies the shared project runllm/ or any other directory.
-- You can only write 'vllm-qwen.yaml' and 'Makefile' — nothing else.
+- You can only write 'vllm-config.yaml' and 'Makefile' — nothing else.
 - read_file can read from results/, runllm/, docs/, scripts/ for reference.
 
+## Rules — DO NOT violate
+- Do NOT change the model unless the prompt explicitly says ALLOW_MODEL_CHANGE=1. Switching to a smaller/different model is cheating, not optimizing.
+- Do NOT game the benchmark. Improvements must reflect genuine serving performance. Examples of things that are NOT allowed:
+  - Reducing max-model-len below what the workload actually needs
+  - Disabling features that would be required in production (like error handling)
+  - Any config that makes the benchmark report better numbers without actually serving faster
+- The goal is real-world inference speed improvement, not benchmark manipulation.
+
 ## Output format
-Before writing the config, state your strategy:
-- Experiment type: single-change | bundle
-- Evidence: 1-3 bullets grounded in the leaderboard/workload/logs
-- Changed knobs: one bullet per knob, format: `knob: old -> new`
-- Why: 1-2 short bullets
+Before writing the config, state your strategy in 3-5 lines:
+- What: the one knob you're changing, `knob: old -> new`
+- Why: 1-2 sentences grounded in evidence from the leaderboard/retros/docs
+- Expected effect: what metric should improve and by roughly how much
 
 If you determine no config change is needed, say NO_CONFIG_CHANGE: <reason> in your final message.
 """
@@ -213,8 +221,8 @@ def _read_results_txt(results_path: Path | None = None) -> str:
     return path.read_text()[-8000:]  # last ~8k chars
 
 
-def _get_retros(runs_base: Path | None) -> str:
-    """Collect RETRO.md from run directories for context to future agents."""
+def _collect_all_retros(runs_base: Path | None) -> str:
+    """Collect all RETRO.md contents from run directories, newest first."""
     if not runs_base or not runs_base.exists():
         return ""
     retros = []
@@ -226,10 +234,41 @@ def _get_retros(runs_base: Path | None) -> str:
             try:
                 content = retro_file.read_text().strip()
                 if content:
-                    retros.append(f"\n--- Retro from {d.name} ({d.relative_to(runs_base)}) ---\n{content[:4000]}")
+                    retros.append(f"\n--- Retro from {d.name} ---\n{content}")
             except Exception:
                 pass
-    return "\n".join(retros[:5]) if retros else ""  # max 5 retros to avoid prompt bloat
+    return "\n".join(retros) if retros else ""
+
+
+def _generate_full_retro(sweep_dir: Path, call_fn) -> str:
+    """Synthesize all run retros into a single FULL_RETRO.txt for the sweep.
+
+    Called before each improve run so the agent has a concise summary of
+    everything learned so far.
+    """
+    raw_retros = _collect_all_retros(sweep_dir)
+    if not raw_retros:
+        return ""
+
+    prompt = f"""Below are retrospectives from individual vLLM optimization runs in this sweep.
+Synthesize them into a single concise document that a future AI agent will read before designing its next experiment.
+
+Rules:
+- Deduplicate: if multiple retros say the same thing, state it once.
+- Organize by theme (e.g. "attention backends", "memory settings", "compilation", "decode vs prefill").
+- For each insight, include the specific knob values and metrics that support it.
+- Flag anything that crashed or produced errors, and how to avoid it.
+- End with a short "What to try next" section: 2-3 concrete, untested ideas ranked by expected impact.
+- Be terse. No filler. Target 20-40 lines.
+
+Raw retros:
+{raw_retros}"""
+
+    try:
+        result = call_fn(prompt)
+        return result.strip()
+    except Exception as e:
+        return f"(Failed to generate synthesis: {e})\n\n{raw_retros[:3000]}"
 
 
 def _extract_vllm_args(config_text: str) -> str:
@@ -343,7 +382,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
     sweep_name = runs_base.name.replace("sweep-", "")
     objective = sweep_objective(sweep_name)
     reference_config_text = None
-    for cfg in ("baseline/vllm_config.yaml", "baseline/runllm/vllm-qwen.yaml"):
+    for cfg in ("baseline/vllm_config.yaml", "baseline/runllm/vllm-config.yaml", "baseline/runllm/vllm-qwen.yaml"):
         fp = runs_base / cfg
         if fp.exists():
             reference_config_text = fp.read_text()
@@ -370,7 +409,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                         "desc": desc,
                         "result": f"insufficient benchmark traffic: only {n_completed} requests completed",
                         "changes": _summarize_config_changes(
-                            next((fp.read_text() for cfg in ("vllm_config.yaml", "runllm/vllm-qwen.yaml")
+                            next((fp.read_text() for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml")
                                   if (fp := d / cfg).exists()), ""),
                             reference_config_text,
                         ),
@@ -381,7 +420,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                 metrics = _fmt_summary(m)
                 if metrics and metrics != "—":
                     config_text = ""
-                    for cfg in ("vllm_config.yaml", "runllm/vllm-qwen.yaml"):
+                    for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
                         fp = d / cfg
                         if fp.exists():
                             config_text = fp.read_text()
@@ -403,7 +442,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
         # Failed or no metrics
         result = ""
         config_text = ""
-        for cfg in ("vllm_config.yaml", "runllm/vllm-qwen.yaml"):
+        for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
             fp = d / cfg
             if fp.exists():
                 config_text = fp.read_text()
@@ -433,35 +472,20 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
     if successes:
         lines.append(f"LEADERBOARD (successful runs, ranked by {sweep_ranking_label(sweep_name)}):")
         lines.append("-" * 100)
-        for s in successes[:10]:
+        for s in successes:
             header = s["name"]
             if s.get("short_name"):
                 header += f"  [{s['short_name']}]"
             lines.append(f"{header}  {s['metrics']}")
-            for dl in s.get("detail_lines", []):
-                lines.append(dl)
-            if s["desc"]:
-                lines.append(f"  Strategy: {s['desc']}")
-            if s["changes"]:
-                lines.append("  Changed knobs vs baseline:")
-                for change in s["changes"]:
-                    lines.append(f"    - {change}")
-            lines.append(f"  Args: {s['config_summary']}")
             lines.append("")
-        if len(successes) > 10:
-            lines.append(f"... and {len(successes) - 10} more successful runs")
 
     if failures:
-        failures_to_show = failures[-50:]
-        lines.append(f"\nFailed runs ({len(failures)} total, showing last {len(failures_to_show)} — DO NOT repeat these strategies):")
-        for f in failures_to_show:
-            lines.append(f"  {f['name']}: {f['desc']}")
-            if f["changes"]:
-                lines.append("    Changed knobs vs baseline:")
-                for change in f["changes"]:
-                    lines.append(f"      - {change}")
-            if f["result"]:
-                lines.append(f"    Error: {f['result']}")
+        lines.append(f"\nFailed runs ({len(failures)} total — DO NOT repeat these strategies):")
+        for f in failures[-20:]:
+            err_brief = f['result'][:120] if f['result'] else "no details"
+            lines.append(f"  {f['name']}: {f['desc'][:100]}  — {err_brief}")
+
+    lines.append(f"\nTo get details on any run, use: read_file('results/{runs_base.name}/<run>/RETRO.md') or read_logs('<run>', 'benchmark')")
 
     return "\n".join(lines) if lines else "No experiments yet."
 
@@ -494,7 +518,7 @@ def _get_best_config_yaml(runs_base: Path) -> str | None:
             except Exception:
                 pass
     if best_dir:
-        for cfg in ("vllm_config.yaml", "runllm/vllm-qwen.yaml"):
+        for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
             fp = best_dir / cfg
             if fp.exists():
                 return fp.read_text()[:2000]
@@ -723,7 +747,7 @@ def _rewrite_pod_name(yaml_path: Path, new_name: str, sweep: str | None = None) 
     yaml_path.write_text(text)
 
 
-def _fetch_and_check_logs(run_dir: Path, env: dict, logs_file: Path, pod_name: str = "vllm-qwen") -> str | None:
+def _fetch_and_check_logs(run_dir: Path, env: dict, logs_file: Path, pod_name: str = "vllm") -> str | None:
     """Fetch kubectl logs, append to logs_file, return error msg if fatal pattern found."""
     try:
         r = subprocess.run(
@@ -799,7 +823,7 @@ def _deploy_and_benchmark(
     """Deploy from experiment_dir, run benchmark, stream logs to run_dir, track queries, abort if stuck.
     Uses a unique pod name and local port so multiple runs can execute in parallel."""
     start = time.time()
-    vllm_yaml = experiment_dir / "vllm-qwen.yaml"
+    vllm_yaml = experiment_dir / "vllm-config.yaml"
     env = os.environ.copy()
     env["VLLM_CONFIG"] = str(vllm_yaml)
     env["KUBECONFIG"] = os.environ.get("KUBECONFIG", "")
@@ -809,7 +833,13 @@ def _deploy_and_benchmark(
 
     # Unique pod name and port for parallel runs
     short_id = ts.replace("_", "")[-8:]  # e.g. "12112142" from "20260312_112142"
-    pod_name = f"vllm-qwen-{short_id}"
+    base_pod = "vllm"
+    try:
+        _doc = yaml.safe_load(vllm_yaml.read_text())
+        base_pod = _doc.get("metadata", {}).get("name", "vllm") or "vllm"
+    except Exception:
+        pass
+    pod_name = f"{base_pod}-{short_id}"
     local_port = _find_free_port()
     _rewrite_pod_name(vllm_yaml, pod_name, sweep=sweep)
     _log_run(run_dir, f"Pod: {pod_name}, local port: {local_port}")
@@ -1206,6 +1236,7 @@ Skip sections that have nothing useful to say. Aim for 3-10 lines — terse but 
             project_root=PROJECT_ROOT, experiment_dir=experiment_dir,
             run_dir=run_dir, sweep_dir=sweep_dir, sweep=sweep or None,
             benchmark=benchmark, ts=ts, env=os.environ.copy(),
+            log_path=run_dir / "retro_agent.log",
         )
         retro_result = run_agent(
             "You write terse, high-signal retrospectives for vLLM optimization runs. A future AI agent will read this to plan better experiments. No filler. Use tools to get exact numbers.",
@@ -1270,38 +1301,62 @@ def main() -> int:
     if not RUNLLM.exists():
         print("runllm submodule not found"); return 1
 
+    # Determine which model subdir to use
+    model_dir = DEFAULT_MODEL_DIR
+    if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
+        try:
+            _sm = json.loads((sweep_dir / "sweep_metadata.json").read_text())
+            model_dir = _sm.get("model_dir", DEFAULT_MODEL_DIR)
+        except Exception:
+            pass
+    runllm_model = RUNLLM / model_dir
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = (sweep_dir / ts) if sweep_dir else (RUNS_DIR / f"exp_{ts}")
     run_dir.mkdir(parents=True, exist_ok=True)
-    # Agent changes go only in run_dir/runllm. Base = best-runllm (sweep) or RUNLLM.
+    # Agent changes go only in run_dir/runllm. Base = best-runllm (sweep) or model subdir.
     experiment_dir = run_dir / "runllm"
     if experiment_dir.exists():
         shutil.rmtree(experiment_dir)
-    base_runllm = RUNLLM
+    base_runllm = runllm_model
     if sweep_dir:
         best_link = sweep_dir / "best-runllm"
         try:
             if best_link.exists():
                 resolved = best_link.resolve() if best_link.is_symlink() else best_link
-                if resolved.exists() and (resolved / "vllm-qwen.yaml").exists():
+                if resolved.exists() and ((resolved / "vllm-config.yaml").exists() or (resolved / "vllm-qwen.yaml").exists()):
                     base_runllm = resolved
         except OSError:
             pass
-        if base_runllm == RUNLLM and (sweep_dir / "baseline" / "runllm").exists():
+        if base_runllm == runllm_model and (sweep_dir / "baseline" / "runllm").exists():
             base_runllm = sweep_dir / "baseline" / "runllm"
     shutil.copytree(base_runllm, experiment_dir, ignore=shutil.ignore_patterns(".git"))
 
     makefile_content = (base_runllm / "Makefile").read_text()
-    vllm_content = (base_runllm / "vllm-qwen.yaml").read_text()
+    _vllm_cfg = base_runllm / "vllm-config.yaml"
+    if not _vllm_cfg.exists():
+        _vllm_cfg = base_runllm / "vllm-qwen.yaml"  # legacy runs
+    vllm_content = _vllm_cfg.read_text()
+    # Ensure experiment_dir always uses the new name
+    (experiment_dir / "vllm-config.yaml").write_text(vllm_content)
     runs_for_context = sweep_dir or RUNS_DIR
     leaderboard = _get_experiment_leaderboard(runs_for_context, PROJECT_ROOT)
     if sweep_dir:
         _write_leaderboard_to_sweep(sweep_dir)
     workload = _get_workload_description(runs_for_context)
-    retros_section = _get_retros(runs_for_context)
-    retro_bullets = ""
-    if retros_section:
-        retro_bullets = f"\n**Lessons from failed runs (avoid these):**\n{retros_section[:2000]}\n"
+
+    # Generate FULL_RETRO.txt — LLM-synthesized summary of all run retros
+    full_retro_section = ""
+    if sweep_dir:
+        print("Synthesizing retros from all runs into FULL_RETRO.txt...")
+        full_retro = _generate_full_retro(sweep_dir, call_fn)
+        if full_retro:
+            (sweep_dir / "FULL_RETRO.txt").write_text(full_retro)
+            full_retro_section = f"\n## Lessons learned from all previous runs\n\n{full_retro}\n"
+    elif runs_for_context and runs_for_context.exists():
+        raw = _collect_all_retros(runs_for_context)
+        if raw:
+            full_retro_section = f"\n## Lessons from previous runs\n\n{raw[:3000]}\n"
 
     # Read optional meta-feedback (human/external-model suggestions)
     meta_feedback_section = ""
@@ -1367,11 +1422,11 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Experiment leaderboard
 
 {leaderboard}
-{retro_bullets}{meta_feedback_section}
+{full_retro_section}{meta_feedback_section}
 ## Hard constraints (DO NOT violate)
 
-- YAML must be `apiVersion: v1, kind: Pod` with `metadata.name: vllm-qwen`
-- Do NOT use Deployments, ReplicaSets, or change the pod name
+- YAML must be `apiVersion: v1, kind: Pod` — do NOT change `metadata.name`
+- Do NOT use Deployments, ReplicaSets
 - Do NOT add startup/readiness/liveness probes (the harness handles health checks)
 - Do NOT set `--host` or `--port` (defaults work)
 - Do NOT change `restartPolicy` from `Always`
@@ -1453,28 +1508,18 @@ env:
 {tuning_guide_section}
 ## Your task
 
-**IMPORTANT:** Review the leaderboard above. Do NOT repeat a strategy that already failed or that produced worse results than the current best. Try something genuinely different.
-Pay attention to the Detail and Server lines in the leaderboard — preemption counts, GPU cache usage, and p50/p95 latency spreads reveal whether the bottleneck is memory pressure, scheduling, or compute.
+Review the leaderboard and lessons learned above. Pick ONE specific, simple change that:
+1. Has NOT been tried before (check the leaderboard)
+2. Has evidence suggesting it will help (from retros, docs, or web search)
+3. Changes exactly one knob so the result is easy to interpret
 
-Use a search mindset: each run should help the sweep learn what works, not just make a large grab-bag of edits.
-- Default to exactly one meaningful change relative to the current best config.
-- Only change multiple knobs together when you have a specific hypothesis that they interact and should be tested as a bundle.
-- Prefer isolated experiments that make it easy to attribute wins or losses to a single variable.
-- If you do bundle changes, explain clearly why those changes need to be tested together.
-- Give a small change manifest before the YAML so the exact knob change is explicit.
+If you need more context on a past run, use `read_file('results/{sweep_dir.name if sweep_dir else ""}/<run_name>/RETRO.md')` or `read_logs('<run_name>', 'benchmark')`.
 
-1. Start with this exact structure:
-   - `Experiment type: single-change` or `Experiment type: bundle`
-   - `Evidence:` with 1-3 bullets grounded in the leaderboard/workload/logs
-   - `Changed knobs:` with one bullet per changed knob in the form `knob: old -> new`
-   - `Why:` with 1-2 short bullets
-2. Describe a config that is different from the baseline AND from previous attempts shown in the leaderboard.
-3. Write the complete vllm-qwen.yaml using write_file('vllm-qwen.yaml', <full YAML>).
-{"4. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
-5. Optionally call run_benchmark(<description>) to deploy and test your config.
-
-**Tools available:** You have read_file, list_files, read_logs, search_web, fetch_url, kubectl_get, kubectl_logs, run_shell, write_file, run_benchmark.
-Use them to investigate previous runs, look up vLLM docs, or inspect the cluster before proposing changes."""
+Then:
+1. State your change: `knob: old_value -> new_value` and why (2-3 sentences max)
+2. Write the complete vllm-config.yaml using write_file('vllm-config.yaml', <full YAML>)
+{"3. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
+3. Optionally call run_benchmark(<description>) to deploy and test your config."""
 
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
         try:
@@ -1505,7 +1550,7 @@ Use them to investigate previous runs, look up vLLM docs, or inspect the cluster
                 print("  3. kubectl get pods  (should reach the cluster)")
                 return 1
 
-            vllm_cur = (experiment_dir / "vllm-qwen.yaml").read_text()
+            vllm_cur = (experiment_dir / "vllm-config.yaml").read_text()
             user_prompt = f"""Attempt {attempt} FAILED: {result_msg}
 
 The run directory is '{run_dir.name}'. Use tools to investigate:
@@ -1513,7 +1558,7 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 - read_logs('{run_dir.name}', 'kubectl') for kubectl logs
 - kubectl_get('pods') to check pod status
 
-**Failed vllm-qwen.yaml:**
+**Failed vllm-config.yaml:**
 ```yaml
 {vllm_cur[:2500]}
 ```
@@ -1522,11 +1567,11 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 - Diagnose using the tools, not assumptions. Check logs before changing config.
 - If the evidence shows a harness/watchdog issue (not a config problem), say NO_CONFIG_CHANGE: <reason>.
 - Otherwise fix minimally: one knob change, revert the last change first.
-- Keep Pod kind, name=vllm-qwen. Image: vllm/vllm-openai:nightly.
+- Keep Pod kind. Image: vllm/vllm-openai:nightly.
 - No `command:` field. Use `args:` with `--model` as a flag.
 - No `--disable-log-requests` (doesn't exist). No `VLLM_ATTENTION_BACKEND` if absent.
 
-When ready, call write_file('vllm-qwen.yaml', <complete fixed YAML>)."""
+When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             print(f"Retry {attempt + 1}/{max_attempts}: agent investigating failure with tools...")
         else:
             user_prompt = prompt
@@ -1547,6 +1592,7 @@ When ready, call write_file('vllm-qwen.yaml', <complete fixed YAML>)."""
             ts=ts,
             env=tool_env,
             deploy_and_benchmark=_deploy_and_benchmark,
+            log_path=run_dir / "agent.log",
         )
 
         try:
@@ -1574,7 +1620,7 @@ When ready, call write_file('vllm-qwen.yaml', <complete fixed YAML>)."""
             no_config_change_reason = _extract_no_config_change_reason(agent_result.text)
             yaml_content = _extract_yaml(agent_result.text)
             if no_config_change_reason and not yaml_content:
-                yaml_content = (experiment_dir / "vllm-qwen.yaml").read_text()
+                yaml_content = (experiment_dir / "vllm-config.yaml").read_text()
                 description = f"No config change: {no_config_change_reason}"
             elif yaml_content:
                 description = agent_result.description or _extract_description(agent_result.text)
@@ -1599,8 +1645,8 @@ When ready, call write_file('vllm-qwen.yaml', <complete fixed YAML>)."""
         last_description = description
 
         if not agent_result.config_written:
-            (experiment_dir / "vllm-qwen.yaml").write_text(yaml_content)
-            shutil.copy(experiment_dir / "vllm-qwen.yaml", run_dir / "vllm_config.yaml")
+            (experiment_dir / "vllm-config.yaml").write_text(yaml_content)
+            shutil.copy(experiment_dir / "vllm-config.yaml", run_dir / "vllm_config.yaml")
             makefile_new = _extract_makefile(agent_result.text) or (experiment_dir / "Makefile").read_text()
             (experiment_dir / "Makefile").write_text(makefile_new)
 
@@ -1649,7 +1695,7 @@ When ready, call write_file('vllm-qwen.yaml', <complete fixed YAML>)."""
         if success:
             if sweep_dir:
                 from sweep_utils import update_best_runllm
-                update_best_runllm(sweep_dir, RUNLLM)
+                update_best_runllm(sweep_dir, runllm_model)
                 _write_leaderboard_to_sweep(sweep_dir)
             print(f"Results: {result}")
             return 0
@@ -1690,45 +1736,34 @@ def _write_conversation(run_dir: Path, turns: list[tuple[str, str]], sweep_dir: 
 
 
 def _write_agent_result_log(run_dir: Path, agent_result: AgentResult, sweep_dir: Path | None = None) -> None:
-    """Save tool-calling agent conversation and tool log to run_dir."""
-    lines = ["# Agent Tool-Calling Log\n"]
-    for entry in agent_result.conversation:
-        role = entry.get("role", "?")
-        lines.append(f"\n{'='*60}\n{role.upper()}\n{'='*60}\n")
-        if role == "assistant":
-            text = entry.get("content", "")
-            if isinstance(text, list):
-                for block in text:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            lines.append(block.get("text", "")[:4000])
-                        elif block.get("type") == "tool_use":
-                            lines.append(f"[tool_use: {block.get('name')}({block.get('input_keys', [])})]")
-            elif isinstance(text, str):
-                lines.append(text[:4000])
-            if entry.get("tool_calls"):
-                lines.append("[has tool_calls]")
-        elif role in ("tool_results", "tool_result"):
-            content = entry.get("content", entry)
-            lines.append(json.dumps(content, indent=2, default=str)[:2000])
-        else:
-            lines.append(str(entry.get("content", ""))[:4000])
+    """Append tool summary to the live agent.log and copy to sweep log."""
+    log_file = run_dir / "agent.log"
 
+    summary_lines = []
     if agent_result.tool_log:
-        lines.append(f"\n{'='*60}\nTOOL CALL SUMMARY\n{'='*60}\n")
+        summary_lines.append(f"\n{'='*60}\nTOOL CALL SUMMARY\n{'='*60}\n")
         for tl in agent_result.tool_log:
-            lines.append(f"  {tl['tool']}() -> {tl['result_length']} chars ({tl['elapsed_s']}s)")
-
-    content = "\n".join(lines)
-    (run_dir / "agent.log").write_text(content, encoding="utf-8")
-    if agent_result.tool_log:
+            summary_lines.append(f"  {tl['tool']}({json.dumps(tl.get('arguments', {}), default=str)}) -> {tl['result_length']} chars ({tl['elapsed_s']}s)")
         (run_dir / "tool_log.json").write_text(json.dumps(agent_result.tool_log, indent=2))
+
+    if summary_lines:
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("\n".join(summary_lines))
+                f.write("\n")
+        except Exception:
+            pass
+
     if sweep_dir:
         sweep_log = sweep_dir / "agent.log"
         header = f"\n\n{'#'*70}\n# Run {run_dir.name} ({datetime.now().isoformat()}) [tool-calling]\n{'#'*70}\n"
-        with open(sweep_log, "a", encoding="utf-8") as f:
-            f.write(header)
-            f.write(content)
+        try:
+            run_log_content = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+            with open(sweep_log, "a", encoding="utf-8") as f:
+                f.write(header)
+                f.write(run_log_content)
+        except Exception:
+            pass
 
 
 def _append_result(experiment_dir: Path, description: str, result: str, success: bool = True, run_dir: Path | None = None, results_path: Path | None = None) -> None:

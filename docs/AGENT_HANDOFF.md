@@ -9,7 +9,8 @@
 The main path is the sweep workflow, not the older dashboard optimizer:
 
 ```bash
-make sweep SWEEP=qwen-latency GOAL="minimize latency"
+make sweep SWEEP=qwen-latency MODEL_DIR=qwen2.5-1.5b GOAL="minimize latency"
+make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
 make improve SWEEP=qwen-latency
 make leaderboard SWEEP=qwen-latency
 make sweep-pods SWEEP=qwen-latency
@@ -35,7 +36,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `scripts/run_guideline_experiment.py` | Guideline subprocess wrapper for experiment mode; writes `query_progress.json` |
 | `scripts/start_sweep.py` | Baseline sweep creation |
 | `scripts/sweep_utils.py` | Best-run scoring and objective helpers |
-| `runllm/` | Canonical vLLM deploy/query/test surface used by `autollm` |
+| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`). Each has `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
 
 ---
@@ -60,7 +61,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - The agent now uses a full tool stack defined in `scripts/agent_tools.py` (10 tools: `search_web`, `fetch_url`, `read_file`, `write_file`, `list_files`, `run_shell`, `run_benchmark`, `read_logs`, `kubectl_get`, `kubectl_logs`).
 - `run_agent()` in `agent_tools.py` implements the agentic loop for both Anthropic Messages API and OpenAI Chat Completions API.
 - Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
-- `write_file` is sandboxed: only writes `vllm-qwen.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
+- `write_file` is sandboxed: only writes `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
 - Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
 
 ### Run Retros
@@ -81,7 +82,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 
 ### Pod Management
 
-- Improve runs use unique pod names like `vllm-qwen-<timestamp_suffix>`.
+- Improve runs use unique pod names like `<base-pod-name>-<timestamp_suffix>` (base name is read from the YAML `metadata.name`).
 - Pods are labeled for sweep discovery:
   - `autollm-managed: "true"`
   - `autollm-sweep: "<sweep-name>"`
@@ -90,10 +91,12 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 
 ### runllm Surface
 
-- `autollm/runllm` is the only `runllm` copy that should matter here.
+- `autollm/runllm/` contains per-model subdirectories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`).
+- Each model dir is self-contained with `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
 - The top-level sibling `../runllm` was intentionally removed.
-- `runllm/query.py` and `runllm/test_smoke.sh` use `/v1/chat/completions`.
-- `runllm/Makefile` respects exported `KUBECONFIG` and otherwise falls back to `../kubeconfig`.
+- `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
+- Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig`.
+- Sweeps store `model_dir` in `sweep_metadata.json` so `make improve` uses the right model config.
 
 ---
 
@@ -129,8 +132,8 @@ env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --refresh-leaderboard 
 For `runllm` changes:
 
 ```bash
-bash -n runllm/test_smoke.sh
-python3 -m py_compile runllm/query.py
+bash -n runllm/qwen2.5-1.5b/test_smoke.sh
+python3 -m py_compile runllm/qwen2.5-1.5b/query.py
 ```
 
 ---

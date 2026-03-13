@@ -4,12 +4,14 @@ Start a new sweep: create results/sweep-[name]/, run baseline benchmark, save to
 
 Usage:
   python scripts/start_sweep.py --sweep my-sweep --benchmark quick
+  python scripts/start_sweep.py --sweep qwen3-235b --model-dir qwen3-235b --benchmark medium
   make sweep SWEEP=my-sweep BENCHMARK=quick
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -18,11 +20,28 @@ from pathlib import Path
 from benchmark_config import BENCHMARK_PRESETS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RUNLLM_ROOT = PROJECT_ROOT / "runllm"
+DEFAULT_MODEL_DIR = "qwen2.5-1.5b"
+
+
+def _list_model_dirs() -> list[str]:
+    """List available model subdirs under runllm/."""
+    if not RUNLLM_ROOT.exists():
+        return []
+    return sorted(
+        d.name for d in RUNLLM_ROOT.iterdir()
+        if d.is_dir() and (d / "vllm-config.yaml").exists()
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start a new sweep and run baseline")
     parser.add_argument("--sweep", "-s", required=True, help="Sweep name (e.g. qwen-1b-latency)")
+    parser.add_argument(
+        "--model-dir", "-m",
+        default=DEFAULT_MODEL_DIR,
+        help=f"Model subdirectory under runllm/ (available: {', '.join(_list_model_dirs()) or '?'})",
+    )
     parser.add_argument(
         "--benchmark", "-b",
         choices=list(BENCHMARK_PRESETS),
@@ -48,6 +67,13 @@ def main() -> int:
         print("Sweep name required. Usage: make sweep SWEEP=my-sweep")
         return 1
 
+    model_dir = args.model_dir
+    model_path = RUNLLM_ROOT / model_dir
+    if not (model_path / "vllm-config.yaml").exists():
+        avail = _list_model_dirs()
+        print(f"Model dir '{model_dir}' not found (no vllm-config.yaml). Available: {', '.join(avail)}")
+        return 1
+
     sweep_dir = PROJECT_ROOT / "results" / f"sweep-{name}"
     baseline_dir = sweep_dir / "baseline"
     baseline_complete = baseline_dir.exists() and (baseline_dir / "benchmarks.json").exists()
@@ -60,6 +86,7 @@ def main() -> int:
 
     sweep_metadata = {
         "name": name,
+        "model_dir": model_dir,
         "created_at": datetime.now().isoformat(),
         "benchmark": args.benchmark,
         "data": args.data,
@@ -70,9 +97,13 @@ def main() -> int:
     (sweep_dir / "sweep_metadata.json").write_text(json.dumps(sweep_metadata, indent=2))
 
     print(f"Sweep dir: {sweep_dir}")
+    print(f"Model: {model_dir} ({model_path / 'vllm-config.yaml'})")
     print(f"Running baseline ({args.benchmark})...")
 
+    vllm_config = str(model_path / "vllm-config.yaml")
     harness = PROJECT_ROOT / "scripts" / "benchmark_harness.py"
+    env = os.environ.copy()
+    env["VLLM_CONFIG"] = vllm_config
     cmd = [
         sys.executable,
         str(harness),
@@ -88,16 +119,14 @@ def main() -> int:
     if args.max_seconds:
         cmd.extend(["--max-seconds", str(args.max_seconds)])
 
-    r = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+    r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
     if r.returncode != 0:
         print("Baseline run failed")
         return r.returncode
 
-    # Ensure baseline has runllm/ and create best-runllm -> baseline/runllm
     sys.path.insert(0, str(PROJECT_ROOT))
     from scripts.sweep_utils import update_best_runllm
-    runllm = PROJECT_ROOT / "runllm"
-    update_best_runllm(sweep_dir, runllm)
+    update_best_runllm(sweep_dir, model_path)
     subprocess.run(
         [sys.executable, str(PROJECT_ROOT / "scripts" / "ai_experiment.py"), "--refresh-leaderboard", "--sweep", name],
         cwd=str(PROJECT_ROOT),

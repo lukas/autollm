@@ -2,11 +2,11 @@
 """
 AI-driven vLLM optimization: run baseline, get AI suggestion, apply, benchmark, compare.
 
-Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY. Uses VLLM_CONFIG (default: runllm/vllm-qwen.yaml).
+Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY. Uses VLLM_CONFIG (default: runllm/qwen2.5-1.5b/vllm-config.yaml).
 
 Usage:
   ANTHROPIC_API_KEY=xxx make ai-benchmark-optimize
-  VLLM_CONFIG=runllm/vllm-qwen.yaml make ai-optimize
+  VLLM_CONFIG=runllm/qwen2.5-1.5b/vllm-config.yaml make ai-optimize
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "vllm-qwen.yaml"
+_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "qwen2.5-1.5b" / "vllm-config.yaml"
 VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
 RESULTS_DIR = PROJECT_ROOT / "results"
 RUNS_DIR = RESULTS_DIR / "runs"
@@ -204,7 +204,7 @@ def main() -> None:
         print("AI_PROVIDER must be 'anthropic' or 'openai'"); sys.exit(1)
 
     if not VLLM_YAML.exists():
-        print(f"VLLM config not found: {VLLM_YAML}. Set VLLM_CONFIG or ensure runllm/vllm-qwen.yaml exists.")
+        print(f"VLLM config not found: {VLLM_YAML}. Set VLLM_CONFIG or ensure runllm/<model>/vllm-config.yaml exists.")
         sys.exit(1)
 
     config = VLLM_YAML.read_text()
@@ -300,15 +300,22 @@ Preserve apiVersion, kind, metadata, spec structure."""
     VLLM_YAML.write_text(yaml_content)
     print(f"Applied. Backup at {backup}")
 
+    import yaml as _yaml
+    try:
+        _doc = _yaml.safe_load(yaml_content)
+        _pod_name = _doc.get("metadata", {}).get("name", "vllm")
+    except Exception:
+        _pod_name = "vllm"
+
     # Restart pod
     state["current_run"].update({"status": "restarting_pod", "step": "Restarting vLLM pod..."})
     _write_state(state)
     if not args.skip_pod_restart:
         print("Restarting vLLM pod...")
         for cmd, err_msg in [
-            (["kubectl", "delete", "pod", "vllm-qwen", "--ignore-not-found=true"], "kubectl delete failed"),
+            (["kubectl", "delete", "pod", _pod_name, "--ignore-not-found=true"], "kubectl delete failed"),
             (["kubectl", "apply", "-f", str(VLLM_YAML)], "kubectl apply failed"),
-            (["kubectl", "wait", "--for=condition=Ready", "pod/vllm-qwen", "--timeout=300s"], "Pod did not become Ready"),
+            (["kubectl", "wait", "--for=condition=Ready", f"pod/{_pod_name}", "--timeout=300s"], "Pod did not become Ready"),
         ]:
             rr = subprocess.run(cmd, capture_output=True, text=True)
             if rr.returncode != 0:

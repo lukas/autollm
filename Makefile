@@ -1,5 +1,5 @@
 # autollm - Benchmark harness, AI optimizer, dashboard
-# Requires: runllm submodule (runllm/) for vLLM config, vllm-qwen pod + port-forward
+# Requires: runllm submodule (runllm/<model>/) for vLLM config
 
 -include ../.env
 -include .env
@@ -8,6 +8,9 @@
 KUBECONFIG ?= $(CURDIR)/kubeconfig
 export KUBECONFIG
 export EXA_API_KEY
+
+# Default model directory under runllm/
+MODEL_DIR ?= qwen2.5-1.5b
 
 # Generate kubeconfig from .env (KUBECONFIG_SERVER, KUBECONFIG_TOKEN). kubeconfig is gitignored.
 kubeconfig:
@@ -27,7 +30,7 @@ test-sweep-setup:
 
 # Query vLLM (requires port-forward). Usage: make query PROMPT="Hello"
 query:
-	$(MAKE) -C runllm query PROMPT="$(PROMPT)"
+	$(MAKE) -C runllm/$(MODEL_DIR) query PROMPT="$(PROMPT)"
 
 # Install deps (unset VIRTUAL_ENV to avoid uv warning when parent cuda-play venv is active)
 sync:
@@ -35,7 +38,7 @@ sync:
 
 # Guideline benchmarks (runllm forward in another terminal)
 guidellm-bench: sync
-	@echo "Run 'cd runllm && make forward' in another terminal first"
+	@echo "Run 'cd runllm/$(MODEL_DIR) && make forward' in another terminal first"
 	mkdir -p results
 	env -u VIRTUAL_ENV uv run guidellm benchmark \
 		--target "http://localhost:8000" \
@@ -47,7 +50,7 @@ guidellm-bench: sync
 		--output-path results
 
 guidellm-bench-quick: sync
-	@echo "Run 'cd runllm && make forward' first"
+	@echo "Run 'cd runllm/$(MODEL_DIR) && make forward' first"
 	mkdir -p results
 	env -u VIRTUAL_ENV uv run guidellm benchmark \
 		--target "http://localhost:8000" \
@@ -63,15 +66,15 @@ guidellm-bench-quick: sync
 #        make benchmark BENCHMARK=sweep DESCRIPTION="baseline"
 # Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req)
 benchmark: sync ensure-kubeconfig
-	@python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
+	@VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
 
 # Harness: saves to results/runs/YYYYMMDD_HHMMSS/ (requires port-forward)
 benchmark-run: sync
-	@echo "Requires: cd runllm && make forward"
-	VLLM_CONFIG=runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
+	@echo "Requires: cd runllm/$(MODEL_DIR) && make forward"
+	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
 
 benchmark-run-quick: sync
-	VLLM_CONFIG=runllm/vllm-qwen.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
+	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
 
 # Results
 results-summary:
@@ -80,9 +83,9 @@ results-summary:
 results-index:
 	python3 scripts/benchmark_harness.py --index-only
 
-# Dashboard (Streamlit)
+# Dashboard (Streamlit) — sync all extras to avoid uv uninstalling streamlit static assets
 dashboard:
-	env -u VIRTUAL_ENV uv sync --extra dashboard
+	env -u VIRTUAL_ENV uv sync --extra dashboard --extra guidellm --extra ai_optimizer
 	@echo ""
 	@echo "Starting dashboard..."
 	@echo ""
@@ -91,9 +94,10 @@ dashboard:
 # Start a new sweep: create results/sweep-[name]/, run baseline, save to baseline/
 # Incomplete baselines (no benchmarks.json) are re-run automatically. Add FORCE=1 to overwrite complete baseline.
 # Usage: make sweep SWEEP=my-sweep [BENCHMARK=quick] [FORCE=1]
+#        make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
 sweep: BENCHMARK=quick
 sweep: sync ensure-kubeconfig
-	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
+	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
 
 # Refresh leaderboard in sweep dir (also written automatically during improve runs)
 # Usage: make leaderboard SWEEP=my-sweep
@@ -141,4 +145,4 @@ backfill-names: sync
 # AI optimizer (CLI)
 ai-optimize: sync
 	@echo "Requires: runllm forward, ANTHROPIC_API_KEY or OPENAI_API_KEY"
-	VLLM_CONFIG=runllm/vllm-qwen.yaml env -u VIRTUAL_ENV uv run python scripts/ai_benchmark_optimizer.py
+	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml env -u VIRTUAL_ENV uv run python scripts/ai_benchmark_optimizer.py

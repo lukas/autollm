@@ -473,6 +473,8 @@ def render_run_detail(run_dir: Path):
     with tab_config:
         config_path = run_dir / "vllm_config.yaml"
         if not config_path.exists():
+            config_path = run_dir / "runllm" / "vllm-config.yaml"
+        if not config_path.exists():
             config_path = run_dir / "runllm" / "vllm-qwen.yaml"
         if config_path.exists():
             st.code(_read_file(config_path), language="yaml")
