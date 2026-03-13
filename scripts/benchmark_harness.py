@@ -285,18 +285,28 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
         time.sleep(1)
         now = time.monotonic()
         elapsed = now - start_ts
-        # No output at all for 20s -> guideline likely not running
-        if elapsed > 20 and last_output_ts[0] <= start_ts:
-            stalled_reason = "no output after 20s (guideline may not have started)"
+        # Timeouts scale with model size — large models (4+ GPUs) need more time
+        try:
+            import yaml as _y
+            _gpu_count = int(_y.safe_load(VLLM_YAML.read_text())
+                            .get("spec", {}).get("containers", [{}])[0]
+                            .get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 1))
+        except Exception:
+            _gpu_count = 1
+        _no_output_timeout = 120 if _gpu_count >= 4 else 20
+        _stall_timeout = 120 if _gpu_count >= 4 else 10
+
+        if elapsed > _no_output_timeout and last_output_ts[0] <= start_ts:
+            stalled_reason = f"no output after {_no_output_timeout}s (guideline may not have started)"
             break
-        # Had at least 1 completion, but none for 10s -> single request stalled
+        # Had at least 1 completion, but none for stall timeout -> single request stalled
         # Skip if we've hit max_requests (benchmark may be writing final report)
         if (
             last_completed[0] >= 1
             and (max_req is None or last_completed[0] < max_req)
-            and (now - last_completed_ts[0]) > 10
+            and (now - last_completed_ts[0]) > _stall_timeout
         ):
-            stalled_reason = f"no new completion for 10s after request {last_completed[0]}"
+            stalled_reason = f"no new completion for {_stall_timeout}s after request {last_completed[0]}"
             break
 
     if stalled_reason:
