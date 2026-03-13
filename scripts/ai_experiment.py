@@ -1072,6 +1072,17 @@ def main() -> int:
     if retros_section:
         retro_bullets = f"\n**Lessons from failed runs (avoid these):**\n{retros_section[:2000]}\n"
 
+    # Read optional meta-feedback (human/external-model suggestions)
+    meta_feedback_section = ""
+    meta_feedback_file = (sweep_dir or runs_for_context) / "meta-feedback.txt"
+    if meta_feedback_file.exists():
+        try:
+            fb = meta_feedback_file.read_text().strip()
+            if fb:
+                meta_feedback_section = f"\n## Meta-feedback (suggestions from an external reviewer — consider these for your next experiment)\n\n{fb}\n"
+        except Exception:
+            pass
+
     # Read optimization goal from sweep metadata
     goal = "Minimize latency and maximize throughput (tok/s)."
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
@@ -1114,7 +1125,7 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Experiment leaderboard
 
 {leaderboard}
-{retro_bullets}
+{retro_bullets}{meta_feedback_section}
 ## Hard constraints (DO NOT violate)
 
 - YAML must be `apiVersion: v1, kind: Pod` with `metadata.name: vllm-qwen`
