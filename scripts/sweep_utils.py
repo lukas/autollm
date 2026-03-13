@@ -7,7 +7,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from benchmark_config import BENCHMARK_MAX_REQUESTS
+
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+
+MIN_REQUEST_FRACTION = 0.5
 
 
 def sweep_objective(sweep_name: str) -> str:
@@ -45,6 +49,42 @@ def metric_mean(metrics: dict, key: str, sub: str = "successful") -> float | Non
     return float(value) if value is not None else None
 
 
+def completed_request_count(bench_data: dict) -> int:
+    """Extract the number of completed requests from a parsed benchmarks.json."""
+    benchmarks = bench_data.get("benchmarks") or []
+    if not benchmarks:
+        return 0
+    m = benchmarks[0].get("metrics", {})
+    rl = m.get("request_latency", {})
+    if isinstance(rl, dict):
+        sub = rl.get("successful", rl)
+        if isinstance(sub, dict) and "count" in sub:
+            return int(sub["count"])
+    return 0
+
+
+def expected_request_count(run_dir: Path) -> int:
+    """Read the benchmark preset from run_metadata.json and return expected requests."""
+    meta_file = run_dir / "run_metadata.json"
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+            preset = meta.get("benchmark", "")
+            return BENCHMARK_MAX_REQUESTS.get(preset, 0)
+        except Exception:
+            pass
+    return 0
+
+
+def is_valid_run(run_dir: Path, bench_data: dict) -> bool:
+    """A run is valid only if it completed enough requests relative to its preset."""
+    completed = completed_request_count(bench_data)
+    expected = expected_request_count(run_dir)
+    if expected > 0:
+        return completed >= expected * MIN_REQUEST_FRACTION
+    return completed >= 10
+
+
 def _score_run(run_dir: Path, sweep_name: str) -> float | None:
     """Score a run for 'best' (higher is better). Returns None if unscoreable."""
     bench_file = run_dir / "benchmarks.json"
@@ -52,6 +92,8 @@ def _score_run(run_dir: Path, sweep_name: str) -> float | None:
         return None
     try:
         data = json.loads(bench_file.read_text())
+        if not is_valid_run(run_dir, data):
+            return None
         benchmarks = data.get("benchmarks") or []
         if not benchmarks:
             return None

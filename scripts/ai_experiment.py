@@ -26,7 +26,7 @@ from pathlib import Path
 import yaml
 
 from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
-from sweep_utils import metric_mean, sweep_objective, sweep_ranking_label
+from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -278,6 +278,19 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
         if (d / "benchmarks.json").exists():
             try:
                 data = json.loads((d / "benchmarks.json").read_text())
+                if not is_valid_run(d, data):
+                    n_completed = completed_request_count(data)
+                    failures.append({
+                        "name": d.name,
+                        "desc": desc,
+                        "result": f"insufficient benchmark traffic: only {n_completed} requests completed",
+                        "changes": _summarize_config_changes(
+                            next((fp.read_text() for cfg in ("vllm_config.yaml", "runllm/vllm-qwen.yaml")
+                                  if (fp := d / cfg).exists()), ""),
+                            reference_config_text,
+                        ),
+                    })
+                    continue
                 b = data.get("benchmarks", [{}])[0]
                 m = b.get("metrics", {})
                 metrics = _fmt_summary(m)
