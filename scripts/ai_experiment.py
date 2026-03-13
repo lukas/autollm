@@ -28,8 +28,13 @@ import yaml
 from agent_tools import AgentResult, ToolContext, run_agent
 from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
 from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
+from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+_DEFAULT_KUBECONFIG = PROJECT_ROOT / "kubeconfig"
+if not os.environ.get("KUBECONFIG") and _DEFAULT_KUBECONFIG.exists():
+    os.environ["KUBECONFIG"] = str(_DEFAULT_KUBECONFIG)
 
 # Track active pods for cleanup on exit/Ctrl+C
 _active_pods: list[str] = []
@@ -77,36 +82,35 @@ SAMPLE_QUERY_TIMEOUT = int(os.environ.get("EXPERIMENT_SAMPLE_QUERY_TIMEOUT", "30
 AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "50"))
 
 TOOL_SYSTEM_PROMPT = """\
-You are a vLLM optimizer agent running on Kubernetes (H200 GPU, CoreWeave).
-Your job: pick ONE simple change that is most likely to improve performance, then test it.
+You are a vLLM optimizer agent on Kubernetes (H200 GPU, CoreWeave).
+Pick ONE simple change most likely to improve performance, then test it.
 
 ## Workflow
-1. Read the leaderboard and lessons learned (provided in the prompt). These tell you what has been tried and what worked.
-2. Pick the single simplest change most likely to produce a measurable improvement. Do NOT bundle multiple changes.
-3. If you need more detail on a past run, use read_file to read its RETRO.md or read_logs to check its benchmark/deploy logs.
-4. Use search_web or fetch_url only if you need to look up a specific vLLM flag or behavior.
-5. Write the config: write_file('vllm-config.yaml', <complete pod YAML>).
-6. Optionally: run_benchmark(<description>) to deploy and benchmark your config.
+1. Read the leaderboard and lessons learned (in the prompt).
+2. Pick one untried change. Do NOT bundle multiple changes.
+3. Use read_file/read_logs to inspect past runs if needed; search_web/fetch_url for vLLM docs.
+4. Write the config: write_file('vllm-config.yaml', <complete pod YAML>).
+5. Optionally: run_benchmark(<description>) to deploy and test.
+
+## Run policy
+- One run = one experiment. After you benchmark a config, stop. Do NOT pivot to a second experiment in the same run.
+- If the benchmark exposes a crash, invalid arg, startup bug, or harness/runtime issue, you may debug that SAME config idea.
+- Do NOT turn a retry into a fresh optimization pass. Let the next run/agent try the next experiment.
 
 ## File safety
-- write_file ONLY writes to the isolated per-run experiment directory (results/sweep-NAME/TIMESTAMP/runllm/).
-- It NEVER modifies the shared project runllm/ or any other directory.
-- You can only write 'vllm-config.yaml' and 'Makefile' — nothing else.
-- read_file can read from results/, runllm/, docs/, scripts/ for reference.
+- write_file writes ONLY to the isolated per-run directory. You can only write 'vllm-config.yaml' and 'Makefile'.
+- read_file can read from results/, runllm/, docs/, scripts/.
 
 ## Rules — DO NOT violate
-- Do NOT change the model unless the prompt explicitly says ALLOW_MODEL_CHANGE=1. Switching to a smaller/different model is cheating, not optimizing.
-- Do NOT game the benchmark. Improvements must reflect genuine serving performance. Examples of things that are NOT allowed:
-  - Reducing max-model-len below what the workload actually needs
-  - Disabling features that would be required in production (like error handling)
-  - Any config that makes the benchmark report better numbers without actually serving faster
-- The goal is real-world inference speed improvement, not benchmark manipulation.
+- Do NOT change the model unless ALLOW_MODEL_CHANGE=1. Switching models is cheating, not optimizing.
+- Do NOT game the benchmark (e.g. reducing max-model-len below workload needs, disabling production features). Goal is real-world speed improvement.
+- Do NOT disable logging/stats flags (`--disable-log-stats`, `--disable-log-requests`). Logs and Prometheus metrics are essential for diagnosing performance — disabling them is a trivial micro-optimization that removes the data you need to find real improvements.
 
 ## Output format
-Before writing the config, state your strategy in 3-5 lines:
-- What: the one knob you're changing, `knob: old -> new`
-- Why: 1-2 sentences grounded in evidence from the leaderboard/retros/docs
-- Expected effect: what metric should improve and by roughly how much
+Before writing config, state your strategy in 3-5 lines:
+- What: `knob: old -> new`
+- Why: 1-2 sentences grounded in evidence
+- Expected effect: which metric improves and by roughly how much
 
 If you determine no config change is needed, say NO_CONFIG_CHANGE: <reason> in your final message.
 """
@@ -184,6 +188,25 @@ def _fmt_detail_lines(m: dict, run_dir: Path) -> list[str]:
                 lines.append("  Server: " + " | ".join(server_parts))
         except Exception:
             pass
+    vllm_profile = run_dir / "vllm_metrics_profile.json"
+    if vllm_profile.exists():
+        try:
+            profile = json.loads(vllm_profile.read_text())
+            profile_summary = profile.get("summary", {})
+            profile_parts = []
+            gpu_cache_peak = profile_summary.get("gpu_cache_peak")
+            if gpu_cache_peak is not None:
+                profile_parts.append(f"GPU-cache-peak={gpu_cache_peak:.1%}")
+            waiting_peak = profile_summary.get("waiting_peak")
+            if waiting_peak is not None:
+                profile_parts.append(f"Queue-peak={waiting_peak:.0f}")
+            gpu_util_peak = profile_summary.get("gpu_utilization_peak")
+            if gpu_util_peak is not None:
+                profile_parts.append(f"GPU-util-peak={gpu_util_peak:.0f}%")
+            if profile_parts:
+                lines.append("  Profile: " + " | ".join(profile_parts))
+        except Exception:
+            pass
     return lines
 
 
@@ -238,6 +261,24 @@ def _collect_all_retros(runs_base: Path | None) -> str:
             except Exception:
                 pass
     return "\n".join(retros) if retros else ""
+
+
+def _get_latest_retro(runs_base: Path | None) -> tuple[str, str]:
+    """Return (run_name, RETRO.md content) for the newest run that has one."""
+    if not runs_base or not runs_base.exists():
+        return "", ""
+    for d in sorted(runs_base.iterdir(), key=lambda x: x.name, reverse=True):
+        if not d.is_dir():
+            continue
+        retro_file = d / "RETRO.md"
+        if retro_file.exists():
+            try:
+                content = retro_file.read_text().strip()
+                if content:
+                    return d.name, content
+            except Exception:
+                pass
+    return "", ""
 
 
 def _generate_full_retro(sweep_dir: Path, call_fn) -> str:
@@ -496,6 +537,74 @@ def _write_leaderboard_to_sweep(sweep_dir: Path) -> None:
         return
     leaderboard = _get_experiment_leaderboard(sweep_dir, PROJECT_ROOT)
     (sweep_dir / "leaderboard.txt").write_text(leaderboard)
+
+
+def _summarize_profile_json(profile: dict) -> str:
+    summary = profile.get("summary", {}) if isinstance(profile, dict) else {}
+    parts = []
+    gpu_cache_peak = summary.get("gpu_cache_peak")
+    if gpu_cache_peak is not None:
+        parts.append(f"gpu_cache_peak={gpu_cache_peak:.1%}")
+    waiting_peak = summary.get("waiting_peak")
+    if waiting_peak is not None:
+        parts.append(f"queue_peak={waiting_peak:.0f}")
+    running_peak = summary.get("running_peak")
+    if running_peak is not None:
+        parts.append(f"running_peak={running_peak:.0f}")
+    gen_peak = summary.get("generation_throughput_peak")
+    if gen_peak is not None:
+        parts.append(f"gen_tps_peak={gen_peak:.0f}")
+    gpu_util_peak = summary.get("gpu_utilization_peak")
+    if gpu_util_peak is not None:
+        parts.append(f"gpu_util_peak={gpu_util_peak:.0f}%")
+    preempt_delta = summary.get("preemptions_delta")
+    if preempt_delta:
+        parts.append(f"preemptions_delta={preempt_delta:.0f}")
+    hints = profile.get("diagnosis_hints", [])
+    if hints:
+        parts.append("hints=" + ",".join(hints[:3]))
+    return " | ".join(parts)
+
+
+def _get_profile_context(runs_base: Path, project_root: Path) -> str:
+    """Compact summaries from recent profile artifacts for prompt context."""
+    if not runs_base.exists():
+        return ""
+    lines = []
+    profiled_runs = sorted(
+        [
+            d for d in runs_base.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and (d / "vllm_metrics_profile.json").exists()
+        ],
+        key=lambda d: d.name,
+        reverse=True,
+    )[:5]
+    for d in profiled_runs:
+        try:
+            profile = json.loads((d / "vllm_metrics_profile.json").read_text())
+            summary = _summarize_profile_json(profile)
+            if not summary:
+                continue
+            rel = d.relative_to(project_root)
+            lines.append(f"- {d.name}: {summary}. Details: read_file('{rel}/vllm_metrics_profile.json')")
+        except Exception:
+            continue
+    if not lines:
+        return ""
+    return "## Hardware/profile signals from recent runs\n\n" + "\n".join(lines) + "\n"
+
+
+def _describe_hardware(vllm_yaml_text: str) -> str:
+    try:
+        doc = yaml.safe_load(vllm_yaml_text) or {}
+        container = ((doc.get("spec") or {}).get("containers") or [{}])[0]
+        limits = (container.get("resources") or {}).get("limits") or {}
+        gpu_count = limits.get("nvidia.com/gpu")
+        if gpu_count:
+            return f"{gpu_count}x NVIDIA H200 GPU"
+    except Exception:
+        pass
+    return "NVIDIA H200 GPU"
 
 
 def _get_best_config_yaml(runs_base: Path) -> str | None:
@@ -772,51 +881,6 @@ def _fetch_and_check_logs(run_dir: Path, env: dict, logs_file: Path, pod_name: s
     return None
 
 
-def _scrape_vllm_metrics(pod_name: str, run_dir: Path, env: dict) -> None:
-    """Scrape vLLM's Prometheus /metrics endpoint and save raw + summary."""
-    try:
-        r = subprocess.run(
-            ["kubectl", "exec", pod_name, "--", "curl", "-sf", "--max-time", "5", "http://localhost:8000/metrics"],
-            capture_output=True, text=True, timeout=15, env=env,
-        )
-        if r.returncode != 0 or not r.stdout:
-            return
-        raw = r.stdout
-        (run_dir / "vllm_metrics.txt").write_text(raw)
-
-        summary: dict[str, float] = {}
-        for line in raw.splitlines():
-            if line.startswith("#"):
-                continue
-            for key in (
-                "vllm:num_preemptions_total",
-                "vllm:gpu_cache_usage_perc",
-                "vllm:cpu_cache_usage_perc",
-                "vllm:num_requests_waiting",
-                "vllm:num_requests_running",
-                "vllm:avg_prompt_throughput_toks_per_s",
-                "vllm:avg_generation_throughput_toks_per_s",
-                "vllm:time_to_first_token_seconds_sum",
-                "vllm:time_to_first_token_seconds_count",
-                "vllm:e2e_request_latency_seconds_sum",
-                "vllm:e2e_request_latency_seconds_count",
-            ):
-                prom_name = key.replace(":", ":")
-                if line.startswith(prom_name + " ") or line.startswith(prom_name + "{"):
-                    parts = line.rsplit(" ", 1)
-                    if len(parts) == 2:
-                        try:
-                            summary[key] = float(parts[1])
-                        except ValueError:
-                            pass
-        if summary:
-            (run_dir / "vllm_metrics_summary.json").write_text(
-                json.dumps(summary, indent=2) + "\n"
-            )
-    except Exception:
-        pass
-
-
 def _deploy_and_benchmark(
     experiment_dir: Path, benchmark: str, run_dir: Path, ts: str, sweep: str | None = None
 ) -> tuple[bool, str]:
@@ -830,6 +894,7 @@ def _deploy_and_benchmark(
     pf = None
     bench_proc = None
     logs_proc = None
+    profiler: VLLMProfiler | None = None
 
     # Unique pod name and port for parallel runs
     short_id = ts.replace("_", "")[-8:]  # e.g. "12112142" from "20260312_112142"
@@ -860,6 +925,17 @@ def _deploy_and_benchmark(
                 f.write("STDERR: " + r.stderr[:1000] + "\n")
 
     def _cleanup(msg: str | None = None) -> tuple[bool, str] | None:
+        nonlocal profiler
+        if profiler is not None:
+            try:
+                profiler.stop()
+            except Exception:
+                pass
+            try:
+                write_vllm_snapshot(pod_name, run_dir, env)
+            except Exception:
+                pass
+            profiler = None
         for proc in (logs_proc, bench_proc, pf):
             if proc and proc.poll() is None:
                 proc.terminate()
@@ -935,7 +1011,7 @@ def _deploy_and_benchmark(
     _write_progress("health_check", {})
     _log_run(run_dir, "Waiting for vLLM health...")
     health_start = time.time()
-    for i in range(90):
+    for i in range(900):
         if m := _check_abort(start, "health_check"):
             return _cleanup(m)
         if i % 5 == 4:
@@ -948,16 +1024,18 @@ def _deploy_and_benchmark(
         if r.returncode == 0:
             _log_run(run_dir, f"vLLM ready ({time.time() - health_start:.0f}s)")
             break
-        time.sleep(1)
+        time.sleep(2)
     else:
-        return _cleanup("vLLM did not become ready (health check timeout)")
+        return _cleanup("vLLM did not become ready (health check timeout after 30 min)")
 
     _write_progress("sample_query", {})
     _log_run(run_dir, "Running sample query...")
     model = "Qwen/Qwen2.5-1.5B-Instruct"
     try:
         text = vllm_yaml.read_text()
-        m = re.search(r'--model["\']?\s*\n\s*-\s*["\']?([^"\'"\n\r]+)', text)
+        m = re.search(r'--served-model-name\s+([^\s\\]+)', text)
+        if not m:
+            m = re.search(r'--model["\']?\s*\n\s*-\s*["\']?([^"\'"\n\r]+)', text)
         if m:
             model = m.group(1).strip().rstrip("'\"")
     except Exception:
@@ -987,6 +1065,15 @@ def _deploy_and_benchmark(
         _cleanup()
         return False, "Sample query returned invalid JSON"
     _log_run(run_dir, "Sample query OK (model responded)")
+    profiler = VLLMProfiler(
+        pod_name=pod_name,
+        run_dir=run_dir,
+        env=env,
+        yaml_path=vllm_yaml,
+        interval_sec=float(os.environ.get("VLLM_PROFILE_INTERVAL_SEC", "5")),
+        log_fn=lambda msg: _log_run(run_dir, msg),
+    )
+    profiler.start()
 
     _write_progress("port_forward", {})
     pf = subprocess.Popen(
@@ -1160,8 +1247,12 @@ def _deploy_and_benchmark(
     _write_progress("done", {})
     _log_run(run_dir, "Benchmark complete")
 
+    if profiler is not None:
+        profiler.stop()
+        profiler = None
+
     # Scrape vLLM Prometheus metrics while pod is still alive
-    _scrape_vllm_metrics(pod_name, run_dir, env)
+    write_vllm_snapshot(pod_name, run_dir, env)
 
     benchmarks_json = run_dir / "benchmarks.json"
     if not benchmarks_json.exists() and (run_dir / "benchmark.json").exists():
@@ -1201,6 +1292,11 @@ def _write_run_retro(
 ) -> None:
     """Write a short RETRO.md for every run — success or failure."""
     outcome = "succeeded" if success else "failed"
+    try:
+        profile_rel = run_dir.relative_to(PROJECT_ROOT)
+        profile_hint = f"read_file('{profile_rel}/vllm_metrics_profile.json')"
+    except Exception:
+        profile_hint = "read the local vllm_metrics_profile.json"
     retro_prompt = f"""Write a RETRO.md for this vLLM optimization run that {outcome}.
 
 **Strategy:** {description[:500]}
@@ -1210,10 +1306,16 @@ def _write_run_retro(
 
 Use read_logs('{run_dir.name}', 'benchmark') to check the benchmark data if available.
 Use read_logs('{run_dir.name}', 'deploy') or read_logs('{run_dir.name}', 'kubectl') for deploy/runtime details.
+If profiling data exists, use {profile_hint} to inspect hardware/cache/queue signals.
 
 Write a RETRO.md (in a ```markdown block```). Be as brief as possible — no filler, no boilerplate.
 The audience is a future AI agent that will read this before designing the next experiment.
 Include ANYTHING that helps that agent avoid pitfalls or design a better run:
+
+- Treat the final outcome of this run as authoritative. If the overall run succeeded, the
+  **Result** section must lead with the final successful benchmark metrics, even if earlier
+  attempts in the same run directory failed. Mention earlier failed attempts under
+  **Crashes / errors**, not as the main result.
 
 - **Change:** what knob(s) were changed, from what to what (exact values)
 - **Result:** key metrics (throughput, latency, TTFT) or the specific error. Numbers only, skip prose.
@@ -1224,6 +1326,9 @@ Include ANYTHING that helps that agent avoid pitfalls or design a better run:
 - **Research findings:** if web search, docs, or log analysis revealed useful vLLM knowledge
   during the research phase (e.g. version-specific behavior, undocumented defaults,
   interactions between flags), capture it here even if it wasn't directly tested.
+- **Hardware/profile evidence:** when available, include the important profile facts
+  (queue peak, GPU KV cache peak, GPU utilization peak, preemption delta, diagnosis hints)
+  if they help explain the outcome or suggest the next knob to try.
 - **Pitfall or insight:** anything non-obvious that a future agent should know
   (e.g. "gpu-memory-utilization above 0.95 causes OOM on H200 with this model",
    "enabling chunked-prefill hurt throughput at low concurrency",
@@ -1247,8 +1352,15 @@ Skip sections that have nothing useful to say. Aim for 3-10 lines — terse but 
         retro_content = f"# Retrospective\n\nFailed to generate: {e}"
     retro_md = _extract_code_block(retro_content, "markdown") or retro_content
     if retro_md:
-        (run_dir / "RETRO.md").write_text(retro_md)
-        print(f"Saved RETRO.md to {run_dir}")
+        retro_path = run_dir / "RETRO.md"
+        existing = retro_path.read_text() if retro_path.exists() else ""
+        if existing.strip():
+            combined = existing.rstrip() + "\n\n---\n\n" + retro_md.lstrip()
+            retro_path.write_text(combined)
+            print(f"Appended RETRO.md in {run_dir}")
+        else:
+            retro_path.write_text(retro_md)
+            print(f"Saved RETRO.md to {run_dir}")
 
     short_name = _generate_short_name(description, result, call_fn)
     _save_short_name(run_dir, short_name)
@@ -1344,6 +1456,17 @@ def main() -> int:
     if sweep_dir:
         _write_leaderboard_to_sweep(sweep_dir)
     workload = _get_workload_description(runs_for_context)
+    profile_context = _get_profile_context(runs_for_context, PROJECT_ROOT)
+
+    # Include the most recent run retro alongside the synthesized summary.
+    latest_retro_section = ""
+    if sweep_dir:
+        latest_run_name, latest_retro = _get_latest_retro(sweep_dir)
+        if latest_retro:
+            latest_retro_section = (
+                f"\n## Most recent run retro ({latest_run_name})\n\n"
+                f"{latest_retro[:4000]}\n"
+            )
 
     # Generate FULL_RETRO.txt — LLM-synthesized summary of all run retros
     full_retro_section = ""
@@ -1406,10 +1529,11 @@ You MAY change the `--model` to a quantized variant of the same model family. Th
 When changing the model, also update the Makefile's `VLLM_MODEL` variable to match, and return the Makefile in a ```makefile block```.
 Do NOT change to a completely different model family—stay within Qwen2.5.
 """
+    hardware_desc = _describe_hardware(vllm_content)
 
     prompt = f"""You are optimizing vLLM inference on Kubernetes (H200 GPU, CoreWeave).
 
-**Hardware:** 1x NVIDIA H200 GPU, node pool: lukas-4h200-pool
+**Hardware:** {hardware_desc}
 **Benchmark workload:** {workload}
 **Goal:** {goal}
 
@@ -1422,104 +1546,52 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Experiment leaderboard
 
 {leaderboard}
-{full_retro_section}{meta_feedback_section}
+{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}
 ## Hard constraints (DO NOT violate)
 
-- YAML must be `apiVersion: v1, kind: Pod` — do NOT change `metadata.name`
-- Do NOT use Deployments, ReplicaSets
-- Do NOT add startup/readiness/liveness probes (the harness handles health checks)
-- Do NOT set `--host` or `--port` (defaults work)
-- Do NOT change `restartPolicy` from `Always`
-- Image MUST be `vllm/vllm-openai:nightly` (do not change the image tag)
-- Do NOT change the container entrypoint/command. Use the default entrypoint with `args:` containing `"--model"`, `"ModelName"`, and flags. Do NOT use `command: ["vllm"]` with `args: ["serve", ...]`, do NOT use `python3 -m vllm.entrypoints.openai.api_server`. The default entrypoint in the image already handles serving.
-- Do NOT use `--disable-log-requests` or `--num-scheduler-steps` (not recognized in nightly). Use `--disable-log-stats` for logging.
+- Keep `apiVersion: v1, kind: Pod`. Do NOT change `metadata.name`, `restartPolicy`, or image (`vllm/vllm-openai:nightly`).
+- Do NOT use Deployments/ReplicaSets, probes, `--host`, or `--port`.
+- PRESERVE the entire `command:`/`args:` init script, `volumeMounts:`, and `volumes:` EXACTLY as-is. The init script installs tensorizer, patches vllm bugs, then runs `exec vllm serve`. You may ONLY modify the `vllm serve` flags on the continued command lines after `exec vllm serve`.
+- Do NOT change `--load-format`, `--model-loader-extra-config`, `--served-model-name`, or the model path (required for tensorizer PVC loading).
+- `--disable-log-requests` and `--num-scheduler-steps` do NOT exist in this image.
+- Do NOT use `--disable-log-stats`. Logs and metrics are needed for diagnosis — disabling them is not a valid optimization.
 {"- Do NOT change the --model (model changes not enabled for this sweep)" if not allow_model_change else ""}
 {model_change_section}
-## Observed quirks in this image / harness
+## Observed quirks
 
-- Base your diagnosis on the leaderboard, workload, and provided logs. Do not invent root causes that are not supported by evidence.
-- If a retry shows many successful `POST /v1/chat/completions` lines in the logs, treat that as evidence the server is making benchmark progress. That is more likely a harness/watchdog issue than a serving/config failure.
-- `VLLM_ATTENTION_BACKEND` has produced `Unknown vLLM environment variable` warnings in this image. Do NOT introduce it if it is absent. If it is already present in the current best config, only change it as its own dedicated experiment.
-- `--performance-mode` has previously failed in this image. Do NOT introduce it unless it already appears in a successful leaderboard run.
+- Diagnose from evidence (leaderboard, logs), not assumptions. Many successful `POST /v1/chat/completions` in logs = benchmark progress, likely a harness/watchdog issue not a config failure.
+- `VLLM_ATTENTION_BACKEND` env var warns "Unknown vLLM environment variable". Do NOT introduce it if absent; only change it as a dedicated experiment if already present.
+- `--performance-mode` has failed before. Do NOT introduce unless already in a successful leaderboard run.
+- `draft_model` speculative decoding is broken on this vLLM nightly with our tensorized main model. Do NOT propose draft-model speculation, even with `draft_load_config.load_format=auto`.
+- If you try speculative decoding, use ngram only and use dot-notation CLI args (`--speculative-config.method ngram`, etc.), not JSON blob syntax.
 
-## vLLM serve args reference (from vLLM docs, performance-relevant subset)
+## vLLM serve flags reference (performance-relevant subset)
 
-**Model & precision:**
-- `--model` — HuggingFace model name/path
-- `--dtype` — auto|half|bfloat16|float16 (default: auto). "half" recommended for AWQ quantization.
-- `--quantization, -q` — awq, gptq, fp8, or None (inferred from model config if not set)
-- `--max-model-len` — Model context length. Use -1 or "auto" for auto-detection.
-- `--enforce-eager` — Disables CUDA graphs, uses eager-mode PyTorch. Can reduce TTFT but may hurt throughput.
+**Model & precision:** `--dtype` (auto|half|bfloat16), `--quantization` (awq|gptq|fp8|None), `--max-model-len` (context length, -1=auto), `--enforce-eager` (disable CUDA graphs; can reduce TTFT, may hurt throughput)
 
-**GPU & memory:**
-- `--tensor-parallel-size, -tp` — Number of TP groups (default: 1)
-- `--gpu-memory-utilization` — Fraction of GPU memory for model (0-1, default: 0.9)
-- `--kv-cache-dtype` — auto|fp8|fp8_e4m3|bfloat16 (default: auto). fp8 reduces KV cache memory ~50%.
-- `--block-size` — KV cache block size in tokens (default: auto)
+**GPU & memory:** `--tensor-parallel-size` (-tp), `--gpu-memory-utilization` (0-1, default 0.9), `--kv-cache-dtype` (auto|fp8|fp8_e4m3|bfloat16 — fp8 halves KV cache memory), `--block-size` (KV cache block size)
 
-**Scheduling & batching:**
-- `--max-num-batched-tokens` — Max tokens per iteration (controls prefill chunk size)
-- `--max-num-seqs` — Max sequences per iteration (controls concurrent request capacity)
-- `--enable-chunked-prefill` — Allow chunking long prefills across iterations
-- `--max-num-partial-prefills` — Max concurrent partial prefills (default: 1)
-- `--async-scheduling` — Async scheduling to avoid GPU idle gaps
+**Scheduling & batching:** `--max-num-batched-tokens`, `--max-num-seqs`, `--enable-chunked-prefill`, `--max-num-partial-prefills` (default 1), `--async-scheduling`
 
-**Caching:**
-- `--enable-prefix-caching` — Cache common prefix KV blocks across requests
+**Caching:** `--enable-prefix-caching` (cache common prefix KV blocks)
 
-**Speculative decoding (high-impact for latency):**
-- `--speculative-config` — JSON config. Example: `--speculative-config '{{"model": "Qwen/Qwen2.5-0.5B-Instruct", "num_speculative_tokens": 5}}'`
-- Uses a smaller draft model to predict tokens verified by the main model. Can significantly reduce TTFT and per-request latency.
-- The draft model must be compatible (same tokenizer family). For Qwen2.5-1.5B, use Qwen2.5-0.5B as draft.
-- In YAML args, pass as: `- "--speculative-config"` followed by `- '{{"model": "Qwen/Qwen2.5-0.5B-Instruct", "num_speculative_tokens": 5}}'`
+**Speculative decoding:** prefer ngram only on this image, using dot-notation CLI args such as `--speculative-config.method ngram`, `--speculative-config.num_speculative_tokens 5`, `--speculative-config.prompt_lookup_max 5`. Do NOT use draft-model speculative decoding here.
 
-**Compilation & CUDA graphs (high-impact for latency):**
-- `--compilation-config, -cc` — torch.compile and CUDA graph settings. Pass as JSON string.
-  - `mode`: 0=no compile, 1=inductor, 2=inductor+reduce-overhead, 3=max-autotune (slowest startup, best perf)
-  - Example: `--compilation-config '{{"mode": 3}}'`
-  - In YAML: `- "--compilation-config"` followed by `- '{{"mode": 3}}'`
-- `--performance-mode` — balanced|interactivity|throughput (default: balanced)
-  - "interactivity": optimizes for low per-request latency (fine-grained CUDA graphs)
-  - "throughput": optimizes for aggregate tok/s (larger CUDA graphs, more batching)
+**Compilation & CUDA graphs:** `--compilation-config '{{"mode": N}}'` (0=none, 1=inductor, 2=reduce-overhead, 3=max-autotune). `--performance-mode` balanced|interactivity|throughput.
 
-**Environment variables (set in pod env):**
-You can add env vars to `spec.containers[0].env` to tune vLLM behavior:
-- `VLLM_ATTENTION_BACKEND` — Override attention backend (e.g. "FLASH_ATTN", "FLASHINFER")
-- `VLLM_USE_TRITON_FLASH_ATTN` — "1" to force Triton flash attention
-- `CUDA_VISIBLE_DEVICES` — GPU selection (default: all)
-- `VLLM_WORKER_MULTIPROC_METHOD` — "spawn" or "fork" for worker processes
-- `VLLM_LOGGING_LEVEL` — "WARNING" to reduce log overhead
-Example in YAML:
-```
-env:
-  - name: VLLM_ATTENTION_BACKEND
-    value: "FLASHINFER"
-  - name: VLLM_LOGGING_LEVEL
-    value: "WARNING"
-```
+**Env vars** (add to `spec.containers[0].env`): `VLLM_ATTENTION_BACKEND` (FLASH_ATTN|FLASHINFER), `VLLM_USE_TRITON_FLASH_ATTN`, `VLLM_WORKER_MULTIPROC_METHOD` (spawn|fork), `VLLM_LOGGING_LEVEL` (WARNING to reduce overhead).
 
-**Other tuning:**
-- `--optimization-level` — 0-3 (default: 2). Higher = better perf, slower startup.
-- `--attention-backend` — Override attention backend via CLI (alternative to env var)
-- `--load-format` — auto|safetensors|tensorizer (default: auto). "tensorizer" for fast CoreWeave loading.
-- `--disable-log-stats` — Disable periodic stats logging (minor perf gain)
-- NOTE: `--disable-log-requests` and `--num-scheduler-steps` do NOT exist in this image.
+**Other:** `--optimization-level` (0-3, default 2), `--attention-backend` (CLI alternative to env var), `--disable-log-stats`.
 
 {tuning_guide_section}
 ## Your task
 
-Review the leaderboard and lessons learned above. Pick ONE specific, simple change that:
-1. Has NOT been tried before (check the leaderboard)
-2. Has evidence suggesting it will help (from retros, docs, or web search)
-3. Changes exactly one knob so the result is easy to interpret
-
-If you need more context on a past run, use `read_file('results/{sweep_dir.name if sweep_dir else ""}/<run_name>/RETRO.md')` or `read_logs('<run_name>', 'benchmark')`.
-
-Then:
-1. State your change: `knob: old_value -> new_value` and why (2-3 sentences max)
-2. Write the complete vllm-config.yaml using write_file('vllm-config.yaml', <full YAML>)
+Pick ONE untried change (check leaderboard) backed by evidence. Change exactly one knob.
+This run should test exactly one experiment hypothesis. If that hypothesis benchmarks successfully, stop even if it regresses.
+1. State: `knob: old -> new` and why (2-3 sentences)
+2. write_file('vllm-config.yaml', <complete YAML>)
 {"3. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
-3. Optionally call run_benchmark(<description>) to deploy and test your config."""
+3. Optionally run_benchmark(<description>) to deploy and test."""
 
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
         try:
@@ -1534,7 +1606,8 @@ Then:
     if benchmark not in BENCHMARK_PRESETS:
         benchmark = "quick"
 
-    max_attempts = 10
+    # Keep retries for debugging benchmark crashes/bugs only; next runs should try new experiments.
+    max_attempts = 3
     failure_context: dict | None = None
     last_description = ""
 
@@ -1565,11 +1638,13 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 
 **Fix rules:**
 - Diagnose using the tools, not assumptions. Check logs before changing config.
+- This is NOT a fresh optimization pass. Do NOT pick a new experiment or a different tuning idea.
+- Only repair the same experiment so it can be measured once, or conclude it should stop here.
 - If the evidence shows a harness/watchdog issue (not a config problem), say NO_CONFIG_CHANGE: <reason>.
-- Otherwise fix minimally: one knob change, revert the last change first.
+- Otherwise fix minimally: repair the failed experiment only, reverting the last change first if needed.
 - Keep Pod kind. Image: vllm/vllm-openai:nightly.
-- No `command:` field. Use `args:` with `--model` as a flag.
-- No `--disable-log-requests` (doesn't exist). No `VLLM_ATTENTION_BACKEND` if absent.
+- PRESERVE the `command:` / `args:` init script, PVC volumeMounts/volumes, and tensorizer flags exactly as-is. Only modify vllm serve flags.
+- No `--disable-log-requests` (doesn't exist). No `--disable-log-stats` (logs/metrics needed for diagnosis). No `VLLM_ATTENTION_BACKEND` if absent.
 
 When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             print(f"Retry {attempt + 1}/{max_attempts}: agent investigating failure with tools...")
@@ -1620,6 +1695,18 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             no_config_change_reason = _extract_no_config_change_reason(agent_result.text)
             yaml_content = _extract_yaml(agent_result.text)
             if no_config_change_reason and not yaml_content:
+                if attempt > 0:
+                    stop_msg = f"Stopping retries: {no_config_change_reason}"
+                    print(stop_msg)
+                    _append_result(
+                        experiment_dir,
+                        stop_msg,
+                        (failure_context or {}).get("result", ""),
+                        success=False,
+                        run_dir=run_dir,
+                        results_path=results_txt,
+                    )
+                    return 1
                 yaml_content = (experiment_dir / "vllm-config.yaml").read_text()
                 description = f"No config change: {no_config_change_reason}"
             elif yaml_content:

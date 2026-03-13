@@ -121,6 +121,9 @@ def load_runs(sweep_dir: Path) -> list[dict]:
             "completed": None,
             "preemptions": None,
             "gpu_cache": None,
+            "gpu_cache_peak": None,
+            "queue_peak": None,
+            "gpu_util_peak": None,
             "score": None,
         }
 
@@ -170,6 +173,23 @@ def load_runs(sweep_dir: Path) -> list[dict]:
                 gc = vs.get("vllm:gpu_cache_usage_perc")
                 if gc is not None:
                     run["gpu_cache"] = round(gc * 100, 1)
+            except Exception:
+                pass
+
+        vmp = d / "vllm_metrics_profile.json"
+        if vmp.exists():
+            try:
+                profile = json.loads(vmp.read_text())
+                summary = profile.get("summary", {})
+                gcp = summary.get("gpu_cache_peak")
+                if gcp is not None:
+                    run["gpu_cache_peak"] = round(gcp * 100, 1)
+                qp = summary.get("waiting_peak")
+                if qp is not None:
+                    run["queue_peak"] = round(qp, 1)
+                gup = summary.get("gpu_utilization_peak")
+                if gup is not None:
+                    run["gpu_util_peak"] = round(gup, 1)
             except Exception:
                 pass
 
@@ -500,6 +520,47 @@ def render_run_detail(run_dir: Path):
 
     with tab_server:
         vms = run_dir / "vllm_metrics_summary.json"
+        vmp = run_dir / "vllm_metrics_profile.json"
+        if vmp.exists():
+            try:
+                profile = json.loads(vmp.read_text())
+                summary = profile.get("summary", {})
+                rows = []
+                labels = {
+                    "gpu_cache_mean": "gpu_cache_mean",
+                    "gpu_cache_peak": "gpu_cache_peak",
+                    "waiting_mean": "waiting_mean",
+                    "waiting_peak": "waiting_peak",
+                    "running_peak": "running_peak",
+                    "generation_throughput_mean": "generation_tps_mean",
+                    "generation_throughput_peak": "generation_tps_peak",
+                    "gpu_utilization_mean": "gpu_util_mean_pct",
+                    "gpu_utilization_peak": "gpu_util_peak_pct",
+                    "gpu_memory_utilization_peak": "gpu_mem_util_peak_pct",
+                    "gpu_memory_used_mb_peak": "gpu_mem_used_peak_mb",
+                    "gpu_power_draw_w_peak": "gpu_power_peak_w",
+                    "preemptions_delta": "preemptions_delta",
+                }
+                for key, label in labels.items():
+                    value = summary.get(key)
+                    if value is None:
+                        continue
+                    if "cache" in key:
+                        rendered = f"{value:.1%}"
+                    elif "util" in key and "mb" not in key:
+                        rendered = f"{value:.1f}%"
+                    elif isinstance(value, float) and value == int(value):
+                        rendered = str(int(value))
+                    else:
+                        rendered = f"{value:.2f}" if isinstance(value, float) else str(value)
+                    rows.append({"Metric": label, "Value": rendered})
+                for hint in profile.get("diagnosis_hints", []):
+                    rows.append({"Metric": "hint", "Value": hint})
+                if rows:
+                    st.subheader("Profile Summary")
+                    st.table(rows)
+            except Exception:
+                st.warning("Could not parse vllm_metrics_profile.json")
         if vms.exists():
             try:
                 vs = json.loads(vms.read_text())
@@ -521,6 +582,16 @@ def render_run_detail(run_dir: Path):
                 st.code(_read_file(raw, tail=100), language="text")
             else:
                 st.info("No server metrics collected for this run.")
+        timeseries = run_dir / "vllm_metrics_timeseries.jsonl"
+        gpu_series = run_dir / "gpu_metrics_timeseries.jsonl"
+        if timeseries.exists() or gpu_series.exists():
+            with st.expander("Raw profiling artifacts", expanded=False):
+                if timeseries.exists():
+                    st.caption("vLLM metrics timeseries")
+                    st.code(_read_file(timeseries, tail=80), language="json")
+                if gpu_series.exists():
+                    st.caption("GPU metrics timeseries")
+                    st.code(_read_file(gpu_series, tail=80), language="json")
 
 
 def render_agent_conversation(agent_log_path: Path):

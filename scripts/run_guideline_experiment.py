@@ -42,12 +42,16 @@ def main() -> int:
         "--max-seconds", cfg["max_seconds"],
         "--data", cfg["data"],
         "--output-dir", str(run_dir),
-        "--outputs", "json",
-        "--outputs", "csv",
+        "--outputs", "benchmarks.json",
+        "--outputs", "benchmarks.csv",
     ]
     if cfg["max_requests"]:
         cmd.extend(["--max-requests", cfg["max_requests"]])
     # No --disable-progress so we get progress output to parse
+
+    env = os.environ.copy()
+    env["GUIDELLM__MP_CONTEXT_TYPE"] = "spawn"
+    env["GUIDELLM__LOGGING__CONSOLE_LOG_LEVEL"] = "DEBUG"
 
     progress_file = run_dir / "query_progress.json"
     harness_log = run_dir / "harness_output.txt"
@@ -67,6 +71,7 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=env,
     )
     max_completed = 0
     with open(harness_log, "w", encoding="utf-8") as logf:

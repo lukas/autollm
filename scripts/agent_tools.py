@@ -215,7 +215,8 @@ class ToolContext:
     benchmark_ran: bool = False
     benchmark_success: bool = False
     benchmark_result: str = ""
-    max_benchmarks: int = 2
+    # Keep one benchmark per agent loop so a single run directory maps to one config attempt.
+    max_benchmarks: int = 1
     _benchmark_count: int = 0
 
     tool_log: list[dict[str, Any]] = field(default_factory=list)

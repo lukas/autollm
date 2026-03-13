@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -118,6 +119,10 @@ def main() -> int:
         cmd.extend(["--max-requests", str(args.max_requests)])
     if args.max_seconds:
         cmd.extend(["--max-seconds", str(args.max_seconds)])
+
+    baseline_runllm = baseline_dir / "runllm"
+    if not baseline_runllm.exists():
+        shutil.copytree(model_path, baseline_runllm, ignore=shutil.ignore_patterns(".git"))
 
     r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
     if r.returncode != 0:

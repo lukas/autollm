@@ -83,6 +83,12 @@ make dashboard
 | `summary.html` | Simple metrics table (latency, TTFT, ITL, throughput) |
 | `vllm_config.yaml` | Copy of `vllm-config.yaml` at run time |
 | `pod_status.txt` | `kubectl describe pod` output |
+| `hardware_context.json` | Pod placement plus resource requests/limits captured for profiling |
+| `vllm_metrics.txt` | Final raw scrape of vLLM Prometheus `/metrics` |
+| `vllm_metrics_summary.json` | Final parsed subset of important vLLM metrics |
+| `vllm_metrics_timeseries.jsonl` | Periodic `/metrics` samples taken during the benchmark |
+| `gpu_metrics_timeseries.jsonl` | Best-effort `nvidia-smi` samples during the benchmark, if available in the container |
+| `vllm_metrics_profile.json` | Compact profile summary: cache pressure, queue depth, throughput, GPU usage, diagnosis hints |
 | `run_metadata.json` | Timestamp, description |
 | `run.log` | Harness log + Guideline stdout/stderr |
 | `RETRO.md` | Agent-written retrospective (every sweep run) |
@@ -100,6 +106,8 @@ make leaderboard SWEEP=qwen-latency
 
 Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
 
+Both `make benchmark` and `make improve` now collect lightweight run profiling automatically. The profiler samples vLLM's built-in Prometheus endpoint every few seconds during the benchmark and writes a compact summary plus raw JSONL timeseries. If `nvidia-smi` is available inside the pod, GPU utilization, memory use, temperature, and power draw are also sampled.
+
 **Agent handoff:** See [AGENT_HANDOFF.md](AGENT_HANDOFF.md) for a concise summary so another agent can pick up this work quickly.
 
 ## Tips
@@ -107,3 +115,4 @@ Each improve run copies the current best model config, uses tools to research an
 - **Label runs:** Always use `DESCRIPTION=` so you can tell runs apart in the index
 - **Port-forward:** Use `benchmark-run` or `benchmark-run-quick` when iterating against an already-running pod
 - **Compare configs:** Open `vllm_config.yaml` from different runs to diff vLLM settings
+- **Profile bottlenecks:** Check `vllm_metrics_profile.json` first. It highlights queue buildup, KV cache pressure, preemption growth, and whether GPU utilization stayed low.

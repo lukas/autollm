@@ -33,6 +33,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `scripts/agent_tools.py` | Tool definitions, execution engine, and provider-agnostic agent loop (Anthropic + OpenAI) |
 | `scripts/benchmark_config.py` | Shared benchmark presets and Guideline progress parsing helpers |
 | `scripts/benchmark_harness.py` | One-shot benchmark harness for `results/runs/` |
+| `scripts/vllm_profiling.py` | Shared helpers for periodic vLLM `/metrics` sampling, best-effort GPU sampling, and hardware profile summaries |
 | `scripts/run_guideline_experiment.py` | Guideline subprocess wrapper for experiment mode; writes `query_progress.json` |
 | `scripts/start_sweep.py` | Baseline sweep creation |
 | `scripts/sweep_utils.py` | Best-run scoring and objective helpers |
@@ -70,15 +71,25 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - The retro agent gets up to 10 tool calls to inspect logs and gather evidence.
 - Retros are designed for consumption by future AI agents. They capture: exact knob changes, key metrics or errors, causal explanations, crashes from any phase, research findings, and non-obvious pitfalls.
 - Retros should be terse (3-10 lines) but complete.
+- If a single run directory contains multiple internal attempts, new retros are appended to `RETRO.md` with a markdown separator instead of overwriting the previous attempt.
+- New improve prompts include both the newest per-run `RETRO.md` in the sweep and the synthesized `FULL_RETRO.txt`, so the next agent sees the freshest local context plus the higher-level summary.
 
 ### Benchmark / Retry Flow
 
 - `ai_experiment.py` uses up to 10 internal attempts per improve run.
-- A retry can return `NO_CONFIG_CHANGE`, which currently means “rerun benchmark with the same YAML” rather than “stop immediately”.
+- Improve runs are now intended to test one experiment hypothesis per run directory. Internal retries are for debugging that same experiment when the benchmark exposed a crash/startup/harness bug, not for pivoting to a new tuning idea.
+- A retry can return `NO_CONFIG_CHANGE`, which now means “stop this run and let the next run/agent choose the next experiment”, not “rerun benchmark with the same YAML”.
 - Benchmark output is more verbose now:
   - live `guidellm` output is streamed into the terminal
   - stalled runs print periodic waiting messages with the last harness line
 - The old 180s generic abort no longer kills benchmarks that are still making request progress.
+- Both `make improve` and `make benchmark` now run a lightweight profiler during the benchmark:
+  - samples vLLM `/metrics` every few seconds into `vllm_metrics_timeseries.jsonl`
+  - writes a compact `vllm_metrics_profile.json` summary with queue/cache/throughput peaks and diagnosis hints
+  - writes `hardware_context.json` with node placement and resource limits
+  - writes `gpu_metrics_timeseries.jsonl` if `nvidia-smi` is available inside the pod
+- If you are debugging a bad run, check `vllm_metrics_profile.json` before reading raw logs. It often tells you whether the failure was KV cache pressure, queue buildup, or low GPU utilization.
+- A single improve run directory can contain multiple internal attempts. When reading a bad `RETRO.md`, verify the final outcome against `results.txt`, `benchmarks.json`, and the terminal output if the retro seems inconsistent.
 
 ### Pod Management
 
@@ -97,6 +108,22 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
 - Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig`.
 - Sweeps store `model_dir` in `sweep_metadata.json` so `make improve` uses the right model config.
+
+### Tensorizer / PVC Model Loading
+
+- All models use `--load-format tensorizer` with pre-serialized weights on a shared PVC (`tensorized-models`, 1Ti, `shared-vast`). The PVC mounts at `/mnt/tensorized/`. Serialized weights at `/mnt/tensorized/vllm/<org>/<model>/v1/`.
+- PVC definition: `runllm/tensorized-models-pvc.yaml`.
+- To serialize: `make tensorize MODEL_DIR=qwen2.5-1.5b` (K8s Job; idempotent — skips if marker file already exists on PVC).
+- The nightly vllm image doesn't bundle tensorizer, so all configs use `command: ["/bin/bash", "-c"]` to `pip install tensorizer` before `vllm serve`.
+- All configs use `--served-model-name <HF-name>` (e.g. `Qwen/Qwen2.5-1.5B-Instruct`) so the API model name matches what Makefiles and query scripts expect, even though the actual `--model` path points to the PVC.
+- **Startup patches (applied at container init):** Two vllm bugs require runtime patching in the init script:
+  1. **Patch-1 (vllm#25751):** `MetaTensorMode` only intercepts `aten::empty`, causing 2x GPU memory during deserialization. Fix: expand to 18 factory ops via `sed` on `tensorizer.py`.
+  2. **Patch-2:** `TensorizerLoader.load_model` skips `process_weights_after_loading`, causing MoE kernel assertion failures. Fix: add `process_weights_after_loading` call (with `requires_grad_(False)` + `torch.no_grad()` guard) via Python patching of `tensorizer_loader.py`.
+  These patches can be removed once vllm PR#33235 is merged and the TensorizerLoader is fixed upstream.
+- **Loading speeds:** qwen2.5-1.5b: ~1.2s (2.5 GB/s). qwen3-235b: ~12s total (10 GB/s per GPU, 117.6 GB/rank). Compare to multi-minute HF downloads.
+- For TP-sharded models (TP>1), `--model-loader-extra-config '{"tensorizer_uri": ".../model-rank-%03d.tensors"}'` is required.
+- The PVC is `ReadWriteOnce` — multiple pods can mount it on the same node but not across nodes.
+- **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
 
 ---
 
@@ -117,6 +144,9 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 5. **Prompt contract changes are high leverage.**
    Small wording changes in `ai_experiment.py` can materially change agent behavior. Be deliberate.
 
+6. **Speculative decoding gotchas on this nightly:**
+   `draft_model` speculative decoding is still broken with the tensorized main-model path on `v0.17.0rc1.dev204`, and `draft_load_config.load_format=auto` did not avoid the duplicate-layer startup failure. `ngram` works only with dot-notation CLI args (not the older JSON blob examples), but it regressed badly on the short synchronous qwen throughput benchmark (~521 tok/s vs 739 tok/s best), so treat it as workload-specific rather than a general win.
+
 ---
 
 ## Validation Shortlist
@@ -125,6 +155,7 @@ When changing this area, the cheap checks that have been useful are:
 
 ```bash
 python3 -m py_compile scripts/ai_experiment.py scripts/agent_tools.py scripts/benchmark_config.py scripts/benchmark_harness.py scripts/run_guideline_experiment.py scripts/start_sweep.py scripts/sweep_utils.py scripts/list_sweep_pods.py
+python3 -m py_compile scripts/vllm_profiling.py
 python3 scripts/test_sweep_setup.py
 env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --refresh-leaderboard --sweep qwen-throughput
 ```

@@ -19,7 +19,7 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard ai-optimize query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names
+.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard ai-optimize query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
@@ -99,6 +99,12 @@ sweep: BENCHMARK=quick
 sweep: sync ensure-kubeconfig
 	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
 
+# Full sweep: create sweep + run baseline, then run N improvement iterations
+# Usage: make full-sweep SWEEP=my-sweep RUNS=5
+#        make full-sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b RUNS=10 GOAL="maximize throughput"
+full-sweep: sweep
+	@$(MAKE) improve SWEEP="$(SWEEP)" RUNS="$(RUNS)" $(if $(ALLOW_MODEL_CHANGE),ALLOW_MODEL_CHANGE=1,)
+
 # Refresh leaderboard in sweep dir (also written automatically during improve runs)
 # Usage: make leaderboard SWEEP=my-sweep
 leaderboard:
@@ -141,6 +147,12 @@ experiment-inspect:
 # Backfill short names for runs that don't have one (uses gpt-4o-mini by default)
 backfill-names: sync
 	env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py backfill-names
+
+# Serialize model weights to PVC via Tensorizer (one-time per model, idempotent).
+# Usage: make tensorize MODEL_DIR=qwen3-235b
+#        make tensorize MODEL_DIR=kimi
+tensorize: ensure-kubeconfig
+	$(MAKE) -C runllm/$(MODEL_DIR) tensorize
 
 # AI optimizer (CLI)
 ai-optimize: sync

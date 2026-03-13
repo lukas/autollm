@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from benchmark_config import BENCHMARK_PRESETS, parse_completed_count
+from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
@@ -154,10 +155,12 @@ def main() -> None:
     )
 
     # 4. Optionally start LLM
+    pf_proc = None
+    profiler: VLLMProfiler | None = None
     if args.start_llm:
         _log(run_dir, "run.log", f"Starting vLLM (runllm) pod={VLLM_POD} dir={RUNLLM_DIR}...")
         proc = subprocess.Popen(
-            ["make", "start", f"VLLM_POD={VLLM_POD}"],
+            ["make", "apply", f"VLLM_POD={VLLM_POD}"],
             cwd=str(RUNLLM_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -173,17 +176,65 @@ def main() -> None:
                 print(line, end="")
         proc.wait()
         if proc.returncode != 0:
-            _log(run_dir, "run.log", f"runllm start failed: exit {proc.returncode}")
+            _log(run_dir, "run.log", f"runllm apply failed: exit {proc.returncode}")
             sys.exit(proc.returncode)
+
+        _log(run_dir, "run.log", "Waiting for pod to become ready...")
+        r = subprocess.run(
+            ["kubectl", "wait", "--for=condition=Ready", f"pod/{VLLM_POD}", "--timeout=600s"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            _log(run_dir, "run.log", f"Pod did not become ready: {r.stderr or r.stdout}")
+            sys.exit(1)
+
+        _log(run_dir, "run.log", "Pod ready, waiting for vLLM health...")
+        for i in range(180):
+            hr = subprocess.run(
+                ["kubectl", "exec", VLLM_POD, "--", "curl", "-sf", "http://localhost:8000/health"],
+                capture_output=True, timeout=10,
+            )
+            if hr.returncode == 0:
+                break
+            if i == 179:
+                _log(run_dir, "run.log", "Health check timed out after 6 min")
+                sys.exit(1)
+            time.sleep(2)
+
+        _log(run_dir, "run.log", "vLLM healthy, starting port-forward...")
+        subprocess.run(["pkill", "-f", f"kubectl port-forward {VLLM_POD}"], capture_output=True)
+        time.sleep(1)
+        pf_proc = subprocess.Popen(
+            ["kubectl", "port-forward", VLLM_POD, "8000:8000"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(3)
         _log(run_dir, "run.log", "vLLM ready")
 
     # 5. Run benchmark
+    profiler = VLLMProfiler(
+        pod_name=VLLM_POD,
+        run_dir=run_dir,
+        env=os.environ.copy(),
+        yaml_path=VLLM_YAML,
+        interval_sec=float(os.environ.get("VLLM_PROFILE_INTERVAL_SEC", "5")),
+        log_fn=lambda msg: _log(run_dir, "run.log", msg),
+    )
+    profiler.start()
     _log(run_dir, "run.log", f"Starting Guideline benchmark: profile={cfg['profile']} {cfg['max_requests'] or '?'} req, {cfg['max_seconds']}s max...")
     print("[Guideline] Running benchmark now (you will see output after each request completes)...")
-    if args.skip_port_forward or args.start_llm:
-        result = _run_guideline(run_dir, config=cfg)
-    else:
-        result = _run_with_port_forward(run_dir, config=cfg)
+    try:
+        if args.skip_port_forward or args.start_llm:
+            result = _run_guideline(run_dir, config=cfg)
+        else:
+            result = _run_with_port_forward(run_dir, config=cfg)
+    finally:
+        if profiler is not None:
+            profiler.stop()
+            profiler = None
+        write_vllm_snapshot(VLLM_POD, run_dir, os.environ.copy())
+        if pf_proc and pf_proc.poll() is None:
+            pf_proc.terminate()
 
     if result != 0:
         _log(run_dir, "run.log", "Benchmark failed")
@@ -233,8 +284,8 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
         "--max-seconds", max_seconds,
         "--data", data,
         "--output-dir", str(run_dir),
-        "--outputs", "json",
-        "--outputs", "csv",
+        "--outputs", "benchmarks.json",
+        "--outputs", "benchmarks.csv",
         # No --disable-progress so we get per-request progress to parse
     ]
     if max_requests:
@@ -242,7 +293,11 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
     BENCHMARK_LIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
     BENCHMARK_LIVE_FILE.write_text(f"Starting benchmark (profile={profile}, {max_requests or '?'} req, {max_seconds}s max)...\n")
 
-    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    env = os.environ.copy()
+    env["GUIDELLM__MP_CONTEXT_TYPE"] = "spawn"
+    env["GUIDELLM__LOGGING__CONSOLE_LOG_LEVEL"] = "DEBUG"
+
+    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     if proc.pid:
         _log(run_dir, "run.log", f"Guideline benchmark process started (PID {proc.pid})")
         print(f"[Guideline] Process started (PID {proc.pid})")
@@ -254,15 +309,19 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
 
     max_req = int(max_requests) if max_requests else None
 
+    setup_complete = threading.Event()
+
     def reader() -> None:
         try:
             if proc.stdout:
                 for line in proc.stdout:
                     log_lines.append(line)
                     last_output_ts[0] = time.monotonic()
+                    if "starting benchmarks" in line.lower():
+                        setup_complete.set()
+                        print(f"[Guideline] Setup phase done, benchmark starting...")
                     completed = parse_completed_count(line)
                     if completed is not None:
-                        # Cap at max_requests: regex can match wrong numbers (e.g. 30 from max_seconds)
                         if max_req is not None and completed > max_req:
                             completed = max_req
                         if completed > last_completed[0]:
@@ -293,11 +352,27 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
                             .get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 1))
         except Exception:
             _gpu_count = 1
-        _no_output_timeout = 120 if _gpu_count >= 4 else 20
-        _stall_timeout = 120 if _gpu_count >= 4 else 10
+        if _gpu_count >= 4:
+            _no_output_timeout = 600
+            _stall_timeout = 600
+        elif _gpu_count >= 2:
+            _no_output_timeout = 120
+            _stall_timeout = 60
+        else:
+            _no_output_timeout = 60
+            _stall_timeout = 30
+        _abs_timeout = int(max_seconds) * 3 + 300 if max_seconds else 1800
 
         if elapsed > _no_output_timeout and last_output_ts[0] <= start_ts:
             stalled_reason = f"no output after {_no_output_timeout}s (guideline may not have started)"
+            break
+        # Output received but no completions ever — guidellm started but requests aren't completing
+        if (
+            last_completed[0] == 0
+            and last_output_ts[0] > start_ts
+            and (now - last_output_ts[0]) > _no_output_timeout
+        ):
+            stalled_reason = f"output received but no completions after {_no_output_timeout}s"
             break
         # Had at least 1 completion, but none for stall timeout -> single request stalled
         # Skip if we've hit max_requests (benchmark may be writing final report)
@@ -308,6 +383,9 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
         ):
             stalled_reason = f"no new completion for {_stall_timeout}s after request {last_completed[0]}"
             break
+        if elapsed > _abs_timeout:
+            stalled_reason = f"absolute timeout after {int(elapsed)}s"
+            break
 
     if stalled_reason:
         proc.terminate()
@@ -315,8 +393,16 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        _log(run_dir, "run.log", f"Guideline benchmark stopped: {stalled_reason}")
-        print(f"[Guideline] Stopped: {stalled_reason}")
+        diag = (
+            f"stall_reason={stalled_reason} | "
+            f"elapsed={time.monotonic() - start_ts:.1f}s | "
+            f"completed={last_completed[0]} | "
+            f"setup_done={setup_complete.is_set()} | "
+            f"last_output_age={time.monotonic() - last_output_ts[0]:.1f}s | "
+            f"output_lines={len(log_lines)}"
+        )
+        _log(run_dir, "run.log", f"Guideline benchmark stopped: {diag}")
+        print(f"[Guideline] Stopped: {diag}")
 
     done.wait(timeout=2)
     if proc.poll() is None:
