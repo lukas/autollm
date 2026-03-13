@@ -135,6 +135,9 @@ For long sweeps, run the agent inside the Kubernetes cluster so it survives lapt
 # Start remote sweep (creates a lightweight controller pod, syncs code, runs in background)
 make sweep-remote SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
 
+# Continue a local sweep remotely (syncs local results to controller, runs improve in-cluster)
+make improve-remote SWEEP=qwen-throughput-async RUNS=20
+
 # Monitor
 make sweep-logs                                # tail live output
 make sweep-status                              # check running sweeps
@@ -157,6 +160,7 @@ The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccou
 | `make improve SWEEP=name` | AI agent suggests improvements |
 | `make full-sweep SWEEP=name RUNS=N` | Create sweep + baseline + N improvement runs |
 | `make sweep-remote SWEEP=name RUNS=N` | Run full sweep on a K8s controller pod |
+| `make improve-remote SWEEP=name RUNS=N` | Continue a local sweep remotely (sync results + improve) |
 | `make sync-results SWEEP=name` | Copy results from remote controller to local |
 | `make sweep-logs` | Tail live remote sweep output |
 | `make sweep-status` | Check remote sweep status |
