@@ -19,7 +19,7 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard ai-optimize query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize
+.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote sync-results sweep-logs sweep-status sweep-remote-teardown
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
@@ -35,30 +35,6 @@ query:
 # Install deps (unset VIRTUAL_ENV to avoid uv warning when parent cuda-play venv is active)
 sync:
 	env -u VIRTUAL_ENV uv sync --extra guidellm --extra ai_optimizer
-
-# Guideline benchmarks (runllm forward in another terminal)
-guidellm-bench: sync
-	@echo "Run 'cd runllm/$(MODEL_DIR) && make forward' in another terminal first"
-	mkdir -p results
-	env -u VIRTUAL_ENV uv run guidellm benchmark \
-		--target "http://localhost:8000" \
-		--backend-args '{"http2":false}' \
-		--profile sweep \
-		--request-type chat_completions \
-		--max-seconds 60 \
-		--data "prompt_tokens=256,output_tokens=128" \
-		--output-path results
-
-guidellm-bench-quick: sync
-	@echo "Run 'cd runllm/$(MODEL_DIR) && make forward' first"
-	mkdir -p results
-	env -u VIRTUAL_ENV uv run guidellm benchmark \
-		--target "http://localhost:8000" \
-		--backend-args '{"http2":false}' \
-		--profile synchronous \
-		--max-requests 20 --max-seconds 60 \
-		--data "prompt_tokens=64,output_tokens=64" \
-		--output-path results
 
 # One-shot: start LLM, run Guideline benchmark, save to results/runs/YYYYMMDD_HHMMSS/
 # Usage: make benchmark
@@ -154,7 +130,30 @@ backfill-names: sync
 tensorize: ensure-kubeconfig
 	$(MAKE) -C runllm/$(MODEL_DIR) tensorize
 
-# AI optimizer (CLI)
-ai-optimize: sync
-	@echo "Requires: runllm forward, ANTHROPIC_API_KEY or OPENAI_API_KEY"
-	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml env -u VIRTUAL_ENV uv run python scripts/ai_benchmark_optimizer.py
+# ── Remote sweep (runs on a K8s controller pod) ──────────────────────────────
+# Start a sweep on a remote controller pod (agent + benchmarks run in-cluster).
+# The controller pod is created once and reused. Code is synced from local.
+# Usage: make sweep-remote SWEEP=my-sweep RUNS=10 GOAL="maximize throughput"
+#        make sweep-remote SWEEP=qwen3-235b MODEL_DIR=qwen3-235b BENCHMARK=medium-throughput RUNS=30
+sweep-remote: ensure-kubeconfig
+	@scripts/sweep_remote.sh start \
+		--sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" \
+		--runs "$(RUNS)" $(if $(GOAL),--goal "$(GOAL)",) $(if $(FORCE),--force,)
+
+# Copy sweep results from the remote controller pod to local machine.
+# Usage: make sync-results SWEEP=my-sweep     # sync one sweep
+#        make sync-results                     # sync all results
+sync-results: ensure-kubeconfig
+	@scripts/sweep_remote.sh sync $(if $(SWEEP),--sweep "$(SWEEP)",)
+
+# Tail live output from the most recent remote sweep.
+sweep-logs: ensure-kubeconfig
+	@scripts/sweep_remote.sh logs
+
+# Check status of remote sweeps on the controller pod.
+sweep-status: ensure-kubeconfig
+	@scripts/sweep_remote.sh status
+
+# Delete the remote controller pod (results are lost unless synced first!).
+sweep-remote-teardown: ensure-kubeconfig
+	@scripts/sweep_remote.sh teardown

@@ -4,6 +4,7 @@ Run Guideline benchmark with progress tracking for experiment mode.
 Writes query_progress.json with queries_completed; output is streamed to run_dir.
 Used by ai_experiment.py when EXPERIMENT_RUN_DIR is set.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,37 +31,57 @@ def main() -> int:
         "profile": preset["profile"],
         "max_requests": preset["max_requests"],
         "max_seconds": preset["max_seconds"],
+        "rate": preset.get("rate"),
         "data": preset["data"],
     }
 
     cmd = [
-        "uv", "run", "guidellm", "benchmark",
-        "--target", os.environ.get("EXPERIMENT_TARGET", "http://localhost:8000"),
-        "--backend-args", '{"http2":false}',
-        "--profile", cfg["profile"],
-        "--request-type", "chat_completions",
-        "--max-seconds", cfg["max_seconds"],
-        "--data", cfg["data"],
-        "--output-dir", str(run_dir),
-        "--outputs", "benchmarks.json",
-        "--outputs", "benchmarks.csv",
+        "uv",
+        "run",
+        "guidellm",
+        "benchmark",
+        "--target",
+        os.environ.get("EXPERIMENT_TARGET", "http://localhost:8000"),
+        "--backend-args",
+        '{"http2":false}',
+        "--profile",
+        cfg["profile"],
+        "--request-type",
+        "chat_completions",
+        "--max-seconds",
+        cfg["max_seconds"],
+        "--data",
+        cfg["data"],
+        "--output-dir",
+        str(run_dir),
+        "--outputs",
+        "benchmarks.json",
+        "--outputs",
+        "benchmarks.csv",
+        "--disable-console-interactive",
     ]
     if cfg["max_requests"]:
         cmd.extend(["--max-requests", cfg["max_requests"]])
+    if cfg.get("rate"):
+        cmd.extend(["--rate", cfg["rate"]])
     # No --disable-progress so we get progress output to parse
 
     env = os.environ.copy()
-    env["GUIDELLM__MP_CONTEXT_TYPE"] = "spawn"
-    env["GUIDELLM__LOGGING__CONSOLE_LOG_LEVEL"] = "DEBUG"
+    env["GUIDELLM__MP_CONTEXT_TYPE"] = "fork"
 
     progress_file = run_dir / "query_progress.json"
     harness_log = run_dir / "harness_output.txt"
 
     def write_progress(queries: int) -> None:
-        progress_file.write_text(json.dumps({
-            "queries_completed": queries,
-            "last_updated": datetime.now().isoformat(),
-        }, indent=2))
+        progress_file.write_text(
+            json.dumps(
+                {
+                    "queries_completed": queries,
+                    "last_updated": datetime.now().isoformat(),
+                },
+                indent=2,
+            )
+        )
 
     write_progress(0)
 
@@ -92,11 +113,17 @@ def main() -> int:
 
     write_progress(max_completed)
 
-    if proc.returncode == 0 and (run_dir / "benchmark.json").exists() and not (run_dir / "benchmarks.json").exists():
+    if (
+        proc.returncode == 0
+        and (run_dir / "benchmark.json").exists()
+        and not (run_dir / "benchmarks.json").exists()
+    ):
         import shutil
+
         shutil.copy(run_dir / "benchmark.json", run_dir / "benchmarks.json")
 
     return proc.returncode
+
 
 if __name__ == "__main__":
     sys.exit(main())

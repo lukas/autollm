@@ -6,3 +6,4 @@ kubeconfig
 results/
 results.txt
 runllm-*/
+sweep*.log

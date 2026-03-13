@@ -21,6 +21,20 @@ make sweep-pods SWEEP=qwen-latency
 - `make leaderboard` refreshes `results/sweep-NAME/leaderboard.txt`.
 - `make sweep-pods` lists currently running pods labeled for a sweep.
 
+### Remote sweep (agent runs in-cluster)
+
+```bash
+make sweep-remote SWEEP=qwen-throughput-async MODEL_DIR=qwen2.5-1.5b BENCHMARK=medium-throughput RUNS=30 GOAL="maximize throughput"
+make sweep-logs                            # tail live output
+make sweep-status                          # check running sweeps
+make sync-results SWEEP=qwen-throughput-async  # copy results to local machine
+make sweep-remote-teardown                 # delete controller pod
+```
+
+- `make sweep-remote` creates a lightweight controller pod (`autollm-controller`) in the cluster, syncs local code to it, and starts the sweep in the background. The controller uses a ServiceAccount with RBAC permissions to manage vLLM pods. API keys come from `.env`.
+- The sweep runs autonomously inside the pod (survives laptop disconnect). Results stay on the controller.
+- `make sync-results` uses tar+kubectl to pull results back. Syncs a specific sweep or all results.
+
 The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but it is no longer the main tuning workflow.
 
 ---
@@ -33,10 +47,14 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `scripts/agent_tools.py` | Tool definitions, execution engine, and provider-agnostic agent loop (Anthropic + OpenAI) |
 | `scripts/benchmark_config.py` | Shared benchmark presets and Guideline progress parsing helpers |
 | `scripts/benchmark_harness.py` | One-shot benchmark harness for `results/runs/` |
+| `scripts/k8s_benchmark.py` | Shared K8s Job runner for guidellm benchmarks (replaces local guidellm execution) |
 | `scripts/vllm_profiling.py` | Shared helpers for periodic vLLM `/metrics` sampling, best-effort GPU sampling, and hardware profile summaries |
-| `scripts/run_guideline_experiment.py` | Guideline subprocess wrapper for experiment mode; writes `query_progress.json` |
+| `scripts/run_guideline_experiment.py` | Guideline K8s Job wrapper for experiment mode; writes `query_progress.json` |
 | `scripts/start_sweep.py` | Baseline sweep creation |
 | `scripts/sweep_utils.py` | Best-run scoring and objective helpers |
+| `scripts/sweep_remote.sh` | Remote sweep orchestration: create controller pod, sync code, start sweep, sync results |
+| `sweep-controller.yaml` | Controller pod spec (python:3.13-slim + kubectl + uv, ServiceAccount for pod management) |
+| `sweep-controller-rbac.yaml` | RBAC: ServiceAccount, Role, RoleBinding for controller to manage vLLM pods |
 | `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`). Each has `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
 
@@ -74,16 +92,33 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - If a single run directory contains multiple internal attempts, new retros are appended to `RETRO.md` with a markdown separator instead of overwriting the previous attempt.
 - New improve prompts include both the newest per-run `RETRO.md` in the sweep and the synthesized `FULL_RETRO.txt`, so the next agent sees the freshest local context plus the higher-level summary.
 
+### In-Cluster Benchmarking (K8s Jobs)
+
+- **guidellm runs as a K8s Job inside the cluster**, not locally on macOS. This was changed because guidellm 0.5.3's multiprocessing deadlocks on macOS for anything beyond trivial benchmarks, and `kubectl port-forward` is unreliable for long runs.
+- The shared module `scripts/k8s_benchmark.py` handles job creation, log streaming, result extraction, and cleanup.
+- **Networking:** The benchmark Job gets the vLLM pod's cluster IP via `kubectl get pod -o jsonpath` and connects directly (e.g. `http://10.0.0.164:8000`). No port-forward, no Service object.
+- **Image:** Currently uses `python:3.12-slim` with `pip install guidellm[recommended]` at Job startup (~30-60s overhead). Set `GUIDELLM_BENCH_IMAGE=lbiewald/guidellm-bench:latest` to use a pre-built image (build from `runllm/Dockerfile.guidellm`).
+- **Result extraction:** The Job dumps `benchmarks.json` to stdout via markers (`===BENCHMARKS_JSON_START===` / `===BENCHMARKS_JSON_END===`). The harness extracts JSON from the captured `kubectl logs` stream. This avoids `kubectl cp` which fails on completed pods.
+- **Node placement:** Benchmark Job uses the same `nodeSelector` (`lukas-4h200-pool`) as the vLLM pod for network proximity, but requests 0 GPUs (CPU + 4GB RAM only).
+- **Who calls it:**
+  - `benchmark_harness.py` (baseline runs) calls `run_benchmark_k8s()` directly.
+  - `ai_experiment.py` (improve runs) calls `run_benchmark_k8s()` directly in `_deploy_and_benchmark()`. Port-forward is no longer used.
+  - `run_guideline_experiment.py` also uses `run_benchmark_k8s()` and expects `EXPERIMENT_POD_NAME` env var.
+
+### Deploy Watchdog (Activity-Aware Timeout)
+
+The health check watchdog in `ai_experiment.py` uses an activity-aware strategy instead of a flat timer:
+- **`INSPECT_AFTER_SEC` (180s default):** If no new kubectl log output appears for this long during deploy/health phases, the run is aborted. Env var: `EXPERIMENT_INSPECT_AFTER_SEC`.
+- **`DEPLOY_HARD_TIMEOUT` (600s default):** Absolute ceiling for deploy+health phases regardless of log activity. Env var: `EXPERIMENT_DEPLOY_HARD_TIMEOUT`.
+- During `health_check`, the watchdog tracks kubectl log file size. As long as vLLM is actively writing logs (loading weights, CUDA graph capture, fp8 scale calibration), the timeout keeps sliding forward. Only aborts when logs go stale.
+- This allows large models (Qwen3-235B) and slow startup configs (fp8 KV cache calibration) to complete startup without hitting the watchdog, while still catching truly stuck deployments.
+
 ### Benchmark / Retry Flow
 
-- `ai_experiment.py` uses up to 10 internal attempts per improve run.
+- `ai_experiment.py` uses up to 3 internal attempts per improve run.
 - Improve runs are now intended to test one experiment hypothesis per run directory. Internal retries are for debugging that same experiment when the benchmark exposed a crash/startup/harness bug, not for pivoting to a new tuning idea.
 - A retry can return `NO_CONFIG_CHANGE`, which now means “stop this run and let the next run/agent choose the next experiment”, not “rerun benchmark with the same YAML”.
-- Benchmark output is more verbose now:
-  - live `guidellm` output is streamed into the terminal
-  - stalled runs print periodic waiting messages with the last harness line
-- The old 180s generic abort no longer kills benchmarks that are still making request progress.
-- Both `make improve` and `make benchmark` now run a lightweight profiler during the benchmark:
+- Both `make improve` and `make benchmark` run a lightweight profiler during the benchmark:
   - samples vLLM `/metrics` every few seconds into `vllm_metrics_timeseries.jsonl`
   - writes a compact `vllm_metrics_profile.json` summary with queue/cache/throughput peaks and diagnosis hints
   - writes `hardware_context.json` with node placement and resource limits
@@ -122,7 +157,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   These patches can be removed once vllm PR#33235 is merged and the TensorizerLoader is fixed upstream.
 - **Loading speeds:** qwen2.5-1.5b: ~1.2s (2.5 GB/s). qwen3-235b: ~12s total (10 GB/s per GPU, 117.6 GB/rank). Compare to multi-minute HF downloads.
 - For TP-sharded models (TP>1), `--model-loader-extra-config '{"tensorizer_uri": ".../model-rank-%03d.tensors"}'` is required.
-- The PVC is `ReadWriteOnce` — multiple pods can mount it on the same node but not across nodes.
+- The PVC is `ReadWriteMany` — multiple pods across different nodes can mount it.
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
 
 ---

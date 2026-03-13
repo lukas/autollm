@@ -8,6 +8,7 @@ Usage:
   python scripts/benchmark_harness.py [--description "My change"]
   VLLM_CONFIG=runllm/qwen2.5-1.5b/vllm-config.yaml make benchmark-run
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,6 +39,7 @@ def _pod_name_from_yaml(yaml_path: Path) -> str:
     if yaml_path.exists():
         try:
             import yaml
+
             doc = yaml.safe_load(yaml_path.read_text())
             name = doc.get("metadata", {}).get("name", "")
             if name:
@@ -51,9 +53,12 @@ VLLM_POD = os.environ.get("VLLM_POD") or _pod_name_from_yaml(VLLM_YAML)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run benchmark and save to timestamped dir")
+    parser = argparse.ArgumentParser(
+        description="Run benchmark and save to timestamped dir"
+    )
     parser.add_argument(
-        "--description", "-d",
+        "--description",
+        "-d",
         default="",
         help="Description of this run (e.g. 'baseline', 'increased TP to 2')",
     )
@@ -68,7 +73,8 @@ def main() -> None:
         help="Quick benchmark: 5 requests, 30s max (alias for --benchmark quick)",
     )
     parser.add_argument(
-        "--benchmark", "-b",
+        "--benchmark",
+        "-b",
         choices=list(BENCHMARK_PRESETS),
         default="medium",
         help="Preset: quick, sync, sweep, medium, or long",
@@ -117,7 +123,9 @@ def main() -> None:
         shutil.copy(VLLM_YAML, run_dir / "vllm_config.yaml")
         _log(run_dir, "run.log", f"Captured vLLM config from {VLLM_YAML}")
     else:
-        _log(run_dir, "run.log", f"VLLM config not found: {VLLM_YAML} (set VLLM_CONFIG)")
+        _log(
+            run_dir, "run.log", f"VLLM config not found: {VLLM_YAML} (set VLLM_CONFIG)"
+        )
 
     # 2. Capture pod status (best-effort)
     try:
@@ -134,11 +142,18 @@ def main() -> None:
         _log(run_dir, "run.log", f"Could not capture pod status: {e}")
 
     # Resolve benchmark config
-    preset = BENCHMARK_PRESETS.get("quick" if args.fast else args.benchmark, BENCHMARK_PRESETS["medium"])
+    preset = BENCHMARK_PRESETS.get(
+        "quick" if args.fast else args.benchmark, BENCHMARK_PRESETS["medium"]
+    )
     cfg = {
         "profile": args.profile or str(preset["profile"]),
-        "max_requests": str(args.max_requests) if args.max_requests is not None else preset["max_requests"],
-        "max_seconds": str(args.max_seconds) if args.max_seconds is not None else str(preset["max_seconds"]),
+        "max_requests": str(args.max_requests)
+        if args.max_requests is not None
+        else preset["max_requests"],
+        "max_seconds": str(args.max_seconds)
+        if args.max_seconds is not None
+        else str(preset["max_seconds"]),
+        "rate": preset.get("rate"),
         "data": args.data or str(preset["data"]),
     }
 
@@ -158,7 +173,11 @@ def main() -> None:
     pf_proc = None
     profiler: VLLMProfiler | None = None
     if args.start_llm:
-        _log(run_dir, "run.log", f"Starting vLLM (runllm) pod={VLLM_POD} dir={RUNLLM_DIR}...")
+        _log(
+            run_dir,
+            "run.log",
+            f"Starting vLLM (runllm) pod={VLLM_POD} dir={RUNLLM_DIR}...",
+        )
         proc = subprocess.Popen(
             ["make", "apply", f"VLLM_POD={VLLM_POD}"],
             cwd=str(RUNLLM_DIR),
@@ -181,18 +200,36 @@ def main() -> None:
 
         _log(run_dir, "run.log", "Waiting for pod to become ready...")
         r = subprocess.run(
-            ["kubectl", "wait", "--for=condition=Ready", f"pod/{VLLM_POD}", "--timeout=600s"],
-            capture_output=True, text=True,
+            [
+                "kubectl",
+                "wait",
+                "--for=condition=Ready",
+                f"pod/{VLLM_POD}",
+                "--timeout=600s",
+            ],
+            capture_output=True,
+            text=True,
         )
         if r.returncode != 0:
-            _log(run_dir, "run.log", f"Pod did not become ready: {r.stderr or r.stdout}")
+            _log(
+                run_dir, "run.log", f"Pod did not become ready: {r.stderr or r.stdout}"
+            )
             sys.exit(1)
 
         _log(run_dir, "run.log", "Pod ready, waiting for vLLM health...")
         for i in range(180):
             hr = subprocess.run(
-                ["kubectl", "exec", VLLM_POD, "--", "curl", "-sf", "http://localhost:8000/health"],
-                capture_output=True, timeout=10,
+                [
+                    "kubectl",
+                    "exec",
+                    VLLM_POD,
+                    "--",
+                    "curl",
+                    "-sf",
+                    "http://localhost:8000/health",
+                ],
+                capture_output=True,
+                timeout=10,
             )
             if hr.returncode == 0:
                 break
@@ -202,11 +239,14 @@ def main() -> None:
             time.sleep(2)
 
         _log(run_dir, "run.log", "vLLM healthy, starting port-forward...")
-        subprocess.run(["pkill", "-f", f"kubectl port-forward {VLLM_POD}"], capture_output=True)
+        subprocess.run(
+            ["pkill", "-f", f"kubectl port-forward {VLLM_POD}"], capture_output=True
+        )
         time.sleep(1)
         pf_proc = subprocess.Popen(
             ["kubectl", "port-forward", VLLM_POD, "8000:8000"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         time.sleep(3)
         _log(run_dir, "run.log", "vLLM ready")
@@ -221,8 +261,14 @@ def main() -> None:
         log_fn=lambda msg: _log(run_dir, "run.log", msg),
     )
     profiler.start()
-    _log(run_dir, "run.log", f"Starting Guideline benchmark: profile={cfg['profile']} {cfg['max_requests'] or '?'} req, {cfg['max_seconds']}s max...")
-    print("[Guideline] Running benchmark now (you will see output after each request completes)...")
+    _log(
+        run_dir,
+        "run.log",
+        f"Starting Guideline benchmark: profile={cfg['profile']} {cfg['max_requests'] or '?'} req, {cfg['max_seconds']}s max...",
+    )
+    print(
+        "[Guideline] Running benchmark now (you will see output after each request completes)..."
+    )
     try:
         if args.skip_port_forward or args.start_llm:
             result = _run_guideline(run_dir, config=cfg)
@@ -244,7 +290,11 @@ def main() -> None:
 
     # 6. Generate summary for this run
     subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "benchmark_summary.py"), str(run_dir)],
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "benchmark_summary.py"),
+            str(run_dir),
+        ],
         cwd=str(PROJECT_ROOT),
         check=True,
     )
@@ -276,30 +326,55 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
     data = config["data"]
 
     cmd = [
-        "uv", "run", "guidellm", "benchmark",
-        "--target", "http://localhost:8000",
-        "--backend-args", '{"http2":false}',
-        "--profile", profile,
-        "--request-type", "chat_completions",
-        "--max-seconds", max_seconds,
-        "--data", data,
-        "--output-dir", str(run_dir),
-        "--outputs", "benchmarks.json",
-        "--outputs", "benchmarks.csv",
-        # No --disable-progress so we get per-request progress to parse
+        "uv",
+        "run",
+        "guidellm",
+        "benchmark",
+        "--target",
+        "http://localhost:8000",
+        "--backend-args",
+        '{"http2":false}',
+        "--profile",
+        profile,
+        "--request-type",
+        "chat_completions",
+        "--max-seconds",
+        max_seconds,
+        "--data",
+        data,
+        "--output-dir",
+        str(run_dir),
+        "--outputs",
+        "benchmarks.json",
+        "--outputs",
+        "benchmarks.csv",
+        "--disable-console-interactive",
     ]
     if max_requests:
         cmd.extend(["--max-requests", max_requests])
+    rate = config.get("rate")
+    if rate:
+        cmd.extend(["--rate", rate])
     BENCHMARK_LIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BENCHMARK_LIVE_FILE.write_text(f"Starting benchmark (profile={profile}, {max_requests or '?'} req, {max_seconds}s max)...\n")
+    BENCHMARK_LIVE_FILE.write_text(
+        f"Starting benchmark (profile={profile}, {max_requests or '?'} req, {max_seconds}s max)...\n"
+    )
 
     env = os.environ.copy()
-    env["GUIDELLM__MP_CONTEXT_TYPE"] = "spawn"
-    env["GUIDELLM__LOGGING__CONSOLE_LOG_LEVEL"] = "DEBUG"
+    env["GUIDELLM__MP_CONTEXT_TYPE"] = "fork"
 
-    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
     if proc.pid:
-        _log(run_dir, "run.log", f"Guideline benchmark process started (PID {proc.pid})")
+        _log(
+            run_dir, "run.log", f"Guideline benchmark process started (PID {proc.pid})"
+        )
         print(f"[Guideline] Process started (PID {proc.pid})")
     log_lines: list[str] = []
     last_completed: list[int] = [0]  # mutable so thread can update
@@ -347,9 +422,15 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
         # Timeouts scale with model size — large models (4+ GPUs) need more time
         try:
             import yaml as _y
-            _gpu_count = int(_y.safe_load(VLLM_YAML.read_text())
-                            .get("spec", {}).get("containers", [{}])[0]
-                            .get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 1))
+
+            _gpu_count = int(
+                _y.safe_load(VLLM_YAML.read_text())
+                .get("spec", {})
+                .get("containers", [{}])[0]
+                .get("resources", {})
+                .get("limits", {})
+                .get("nvidia.com/gpu", 1)
+            )
         except Exception:
             _gpu_count = 1
         if _gpu_count >= 4:
@@ -363,25 +444,12 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
             _stall_timeout = 30
         _abs_timeout = int(max_seconds) * 3 + 300 if max_seconds else 1800
 
+        if (run_dir / "benchmarks.json").exists() or (
+            run_dir / "benchmark.json"
+        ).exists():
+            break
         if elapsed > _no_output_timeout and last_output_ts[0] <= start_ts:
             stalled_reason = f"no output after {_no_output_timeout}s (guideline may not have started)"
-            break
-        # Output received but no completions ever — guidellm started but requests aren't completing
-        if (
-            last_completed[0] == 0
-            and last_output_ts[0] > start_ts
-            and (now - last_output_ts[0]) > _no_output_timeout
-        ):
-            stalled_reason = f"output received but no completions after {_no_output_timeout}s"
-            break
-        # Had at least 1 completion, but none for stall timeout -> single request stalled
-        # Skip if we've hit max_requests (benchmark may be writing final report)
-        if (
-            last_completed[0] >= 1
-            and (max_req is None or last_completed[0] < max_req)
-            and (now - last_completed_ts[0]) > _stall_timeout
-        ):
-            stalled_reason = f"no new completion for {_stall_timeout}s after request {last_completed[0]}"
             break
         if elapsed > _abs_timeout:
             stalled_reason = f"absolute timeout after {int(elapsed)}s"
@@ -415,7 +483,11 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
             encoding="utf-8",
         )
     # Guideline may write benchmark.json (singular); ensure benchmarks.json exists
-    if proc.returncode == 0 and (run_dir / "benchmark.json").exists() and not (run_dir / "benchmarks.json").exists():
+    if (
+        proc.returncode == 0
+        and (run_dir / "benchmark.json").exists()
+        and not (run_dir / "benchmarks.json").exists()
+    ):
         shutil.copy(run_dir / "benchmark.json", run_dir / "benchmarks.json")
     return proc.returncode if proc.returncode is not None else 1
 
@@ -446,7 +518,11 @@ def _run_with_port_forward(run_dir: Path, *, config: dict) -> int:
             except Exception:
                 time.sleep(4)
         else:
-            _log(run_dir, "run.log", f"Timeout: {VLLM_POD} not reachable. Run: cd runllm && make forward")
+            _log(
+                run_dir,
+                "run.log",
+                f"Timeout: {VLLM_POD} not reachable. Run: cd runllm && make forward",
+            )
             return 1
 
         return _run_guideline(run_dir, config=config)
@@ -474,27 +550,43 @@ def generate_runs_index() -> None:
             data = __import__("json").loads((run_dir / "benchmarks.json").read_text())
             b = data.get("benchmarks", [{}])[0]
             m = b.get("metrics", {})
+
             def _s(k, sk="successful"):
                 o = m.get(k, {})
                 return (o.get(sk) or {}).get("mean") if isinstance(o, dict) else None
+
             lat = _s("request_latency")
             ttft = _s("time_to_first_token_ms")
             tok = _s("tokens_per_second")
             if lat is not None:
-                metrics = f"{lat*1000:.0f}ms · TTFT {ttft:.0f}ms · {tok:.0f} tok/s" if tok else f"{lat*1000:.0f}ms"
+                metrics = (
+                    f"{lat * 1000:.0f}ms · TTFT {ttft:.0f}ms · {tok:.0f} tok/s"
+                    if tok
+                    else f"{lat * 1000:.0f}ms"
+                )
         except Exception:
             pass
 
-        summary_link = f"{run_dir.name}/summary.html" if (run_dir / "summary.html").exists() else ""
-        config_link = f"{run_dir.name}/vllm_config.yaml" if (run_dir / "vllm_config.yaml").exists() else ""
+        summary_link = (
+            f"{run_dir.name}/summary.html"
+            if (run_dir / "summary.html").exists()
+            else ""
+        )
+        config_link = (
+            f"{run_dir.name}/vllm_config.yaml"
+            if (run_dir / "vllm_config.yaml").exists()
+            else ""
+        )
 
-        rows.append({
-            "ts": run_dir.name,
-            "desc": desc,
-            "metrics": metrics,
-            "summary_link": summary_link,
-            "config_link": config_link,
-        })
+        rows.append(
+            {
+                "ts": run_dir.name,
+                "desc": desc,
+                "metrics": metrics,
+                "summary_link": summary_link,
+                "config_link": config_link,
+            }
+        )
 
     html = _index_html(rows)
     (RUNS_DIR / "index.html").write_text(html)
@@ -572,10 +664,21 @@ if __name__ == "__main__":
         if VLLM_YAML.exists():
             shutil.copy(VLLM_YAML, run_dir / "vllm_config.yaml")
         (run_dir / "run_metadata.json").write_text(
-            __import__("json").dumps({"timestamp": ts, "description": sys.argv[2] if len(sys.argv) > 2 else "imported", "imported": True}, indent=2)
+            __import__("json").dumps(
+                {
+                    "timestamp": ts,
+                    "description": sys.argv[2] if len(sys.argv) > 2 else "imported",
+                    "imported": True,
+                },
+                indent=2,
+            )
         )
         subprocess.run(
-            [sys.executable, str(PROJECT_ROOT / "scripts" / "benchmark_summary.py"), str(run_dir)],
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "scripts" / "benchmark_summary.py"),
+                str(run_dir),
+            ],
             cwd=str(PROJECT_ROOT),
             check=True,
         )

@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: autollm-controller
+  labels:
+    autollm-managed: "true"
+    autollm-component: "controller"
+spec:
+  serviceAccountName: autollm-controller
+  restartPolicy: Never
+  containers:
+    - name: controller
+      image: python:3.13-slim
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          apt-get update -qq && apt-get install -y -qq curl git procps make > /dev/null 2>&1
+          ARCH=$(uname -m)
+          case $ARCH in x86_64) K=amd64;; aarch64) K=arm64;; *) K=amd64;; esac
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${K}/kubectl"
+          chmod +x kubectl && mv kubectl /usr/local/bin/
+          curl -sL https://astral.sh/uv/install.sh | sh
+          ln -sf /root/.local/bin/uv /usr/local/bin/uv
+          ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
+          export PATH="/root/.local/bin:$PATH"
+          mkdir -p /workspace/autollm
+          cat > /workspace/autollm/kubeconfig <<'KUBEEOF'
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              server: https://kubernetes.default.svc
+            name: in-cluster
+          contexts:
+          - context:
+              cluster: in-cluster
+              user: in-cluster
+            name: in-cluster
+          current-context: in-cluster
+          users:
+          - name: in-cluster
+            user:
+              tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+          KUBEEOF
+          touch /tmp/ready
+          echo "Controller ready (kubectl + uv installed)"
+          sleep infinity
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      workingDir: /workspace

@@ -27,6 +27,7 @@ import yaml
 
 from agent_tools import AgentResult, ToolContext, run_agent
 from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
+from k8s_benchmark import run_benchmark_k8s
 from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
 from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 
@@ -70,11 +71,15 @@ RUNS_DIR = PROJECT_ROOT / "results" / "runs"
 RESULTS_DIR = PROJECT_ROOT / "results"
 PROGRESS_FILE = PROJECT_ROOT / "results" / "experiment_progress.json"
 
-# After this many seconds, we inspect progress; if still in a long phase, abort and log.
+# If no log activity for this many seconds during deploy/health phases, abort.
 INSPECT_AFTER_SEC = int(os.environ.get("EXPERIMENT_INSPECT_AFTER_SEC", "180"))
 
+# Hard ceiling for deploy+health phases regardless of log activity.
+DEPLOY_HARD_TIMEOUT = int(os.environ.get("EXPERIMENT_DEPLOY_HARD_TIMEOUT", "600"))
+
 # If query count unchanged for this many seconds during benchmark, assume stuck and abort.
-QUERY_STALE_SEC = int(os.environ.get("EXPERIMENT_QUERY_STALE_SEC", "30"))
+# 60s default gives non-synchronous profiles (concurrent, sweep) enough time between progress updates.
+QUERY_STALE_SEC = int(os.environ.get("EXPERIMENT_QUERY_STALE_SEC", "60"))
 
 # Timeout for sample query before benchmark (must complete or we abort)
 SAMPLE_QUERY_TIMEOUT = int(os.environ.get("EXPERIMENT_SAMPLE_QUERY_TIMEOUT", "30"))
@@ -447,6 +452,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                     n_completed = completed_request_count(data)
                     failures.append({
                         "name": d.name,
+                        "short_name": short_name,
                         "desc": desc,
                         "result": f"insufficient benchmark traffic: only {n_completed} requests completed",
                         "changes": _summarize_config_changes(
@@ -497,6 +503,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
         if desc or result:
             failures.append({
                 "name": d.name,
+                "short_name": short_name,
                 "desc": desc,
                 "result": result,
                 "changes": _summarize_config_changes(config_text, reference_config_text),
@@ -524,7 +531,10 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
         lines.append(f"\nFailed runs ({len(failures)} total — DO NOT repeat these strategies):")
         for f in failures[-20:]:
             err_brief = f['result'][:120] if f['result'] else "no details"
-            lines.append(f"  {f['name']}: {f['desc'][:100]}  — {err_brief}")
+            label = f['name']
+            if f.get('short_name'):
+                label += f"  [{f['short_name']}]"
+            lines.append(f"  {label}: {f.get('changes') or f['desc'][:100]}  — {err_brief}")
 
     lines.append(f"\nTo get details on any run, use: read_file('results/{runs_base.name}/<run>/RETRO.md') or read_logs('<run>', 'benchmark')")
 
@@ -775,14 +785,24 @@ In 2-4 sentences, summarize: what you're changing and why it should help. Output
 
 
 def _check_abort(start: float, phase: str, last_progress: float | None = None) -> str | None:
-    """Return abort message if we should abort, unless recent progress was made."""
+    """Return abort message if we should abort, unless recent progress was made.
+
+    For deploy/health phases: abort if no log activity for INSPECT_AFTER_SEC,
+    or if DEPLOY_HARD_TIMEOUT is exceeded regardless of activity.
+    For benchmark phase: uses last_progress (query count updates) with INSPECT_AFTER_SEC.
+    """
     if INSPECT_AFTER_SEC <= 0:
         return None
-    if _elapsed_since(start) < INSPECT_AFTER_SEC:
+    elapsed = _elapsed_since(start)
+    if elapsed >= DEPLOY_HARD_TIMEOUT and phase != "benchmark":
+        return f"Hard timeout after {int(elapsed)}s in phase '{phase}' (limit {DEPLOY_HARD_TIMEOUT}s)"
+    if elapsed < INSPECT_AFTER_SEC:
         return None
     if last_progress is not None and (time.time() - last_progress) < INSPECT_AFTER_SEC:
         return None
-    return f"Aborted after {INSPECT_AFTER_SEC}s: stuck in phase '{phase}'"
+    if last_progress is None and phase != "benchmark":
+        return f"Aborted after {int(elapsed)}s: no activity for {INSPECT_AFTER_SEC}s in phase '{phase}'"
+    return f"Aborted after {int(elapsed)}s: stuck in phase '{phase}'"
 
 
 # Patterns indicating infrastructure/Kubernetes setup errors (NOT fixable by changing vLLM YAML)
@@ -813,14 +833,6 @@ VLLM_FATAL_LOG_PATTERNS = [
     (re.compile(r"CUDA (?:out of memory|error)", re.I), "CUDA OOM/error"),
     (re.compile(r"exit code [1-9]\d*", re.I), "non-zero exit"),
 ]
-
-
-def _find_free_port() -> int:
-    """Find a free local port for port-forwarding."""
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 def _k8s_label_value(value: str) -> str:
@@ -891,13 +903,11 @@ def _deploy_and_benchmark(
     env = os.environ.copy()
     env["VLLM_CONFIG"] = str(vllm_yaml)
     env["KUBECONFIG"] = os.environ.get("KUBECONFIG", "")
-    pf = None
-    bench_proc = None
     logs_proc = None
     profiler: VLLMProfiler | None = None
 
-    # Unique pod name and port for parallel runs
-    short_id = ts.replace("_", "")[-8:]  # e.g. "12112142" from "20260312_112142"
+    # Unique pod name for parallel runs
+    short_id = ts.replace("_", "")[-8:]
     base_pod = "vllm"
     try:
         _doc = yaml.safe_load(vllm_yaml.read_text())
@@ -905,9 +915,8 @@ def _deploy_and_benchmark(
     except Exception:
         pass
     pod_name = f"{base_pod}-{short_id}"
-    local_port = _find_free_port()
     _rewrite_pod_name(vllm_yaml, pod_name, sweep=sweep)
-    _log_run(run_dir, f"Pod: {pod_name}, local port: {local_port}")
+    _log_run(run_dir, f"Pod: {pod_name}")
 
     # Register for cleanup on Ctrl+C / crash
     _active_pods.append(pod_name)
@@ -936,13 +945,12 @@ def _deploy_and_benchmark(
             except Exception:
                 pass
             profiler = None
-        for proc in (logs_proc, bench_proc, pf):
-            if proc and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+        if logs_proc and logs_proc.poll() is None:
+            logs_proc.terminate()
+            try:
+                logs_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logs_proc.kill()
         try:
             subprocess.run(
                 ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true"],
@@ -964,8 +972,14 @@ def _deploy_and_benchmark(
     _write_progress("deploy_delete", {"experiment_dir": str(experiment_dir), "run_dir": str(run_dir), "pod_name": pod_name})
     _log_run(run_dir, "Deploy: delete + apply")
 
-    for cmd, err in [
+    # Delete both the new pod name AND the base pod (from baseline) to free GPUs
+    delete_cmds: list[tuple[list[str], str]] = [
         (["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true"], "delete failed"),
+    ]
+    if base_pod != pod_name:
+        delete_cmds.insert(0, (["kubectl", "delete", "pod", base_pod, "--ignore-not-found=true", "--wait=false"], "base pod delete failed"))
+    for cmd, err in [
+        *delete_cmds,
         (["kubectl", "apply", "-f", str(vllm_yaml)], "apply failed"),
     ]:
         if m := _check_abort(start, "deploy"):
@@ -992,11 +1006,17 @@ def _deploy_and_benchmark(
 
     _write_progress("pod_wait", {})
     _log_run(run_dir, "Waiting for pod Ready...")
+    last_pod_activity = time.time()
+    prev_pod_log_size = 0
     for _ in range(20):
-        if m := _check_abort(start, "pod_wait"):
+        if m := _check_abort(start, "pod_wait", last_progress=last_pod_activity):
             return _cleanup(m)
         if err := _fetch_and_check_logs(run_dir, env, kubectl_logs_file, pod_name):
             return _cleanup(f"vLLM startup error (pod_wait): {err}")
+        cur_pod_log_size = kubectl_logs_file.stat().st_size if kubectl_logs_file.exists() else 0
+        if cur_pod_log_size > prev_pod_log_size:
+            last_pod_activity = time.time()
+            prev_pod_log_size = cur_pod_log_size
         r = subprocess.run(
             ["kubectl", "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=30s"],
             capture_output=True, text=True, env=env,
@@ -1011,12 +1031,21 @@ def _deploy_and_benchmark(
     _write_progress("health_check", {})
     _log_run(run_dir, "Waiting for vLLM health...")
     health_start = time.time()
+    last_log_activity = time.time()
+    prev_log_size = kubectl_logs_file.stat().st_size if kubectl_logs_file.exists() else 0
     for i in range(900):
-        if m := _check_abort(start, "health_check"):
+        if m := _check_abort(start, "health_check", last_progress=last_log_activity):
             return _cleanup(m)
         if i % 5 == 4:
             if err := _fetch_and_check_logs(run_dir, env, kubectl_logs_file, pod_name):
                 return _cleanup(f"vLLM startup error (health_check): {err}")
+            cur_log_size = kubectl_logs_file.stat().st_size if kubectl_logs_file.exists() else 0
+            if cur_log_size > prev_log_size:
+                last_log_activity = time.time()
+                prev_log_size = cur_log_size
+                elapsed = time.time() - health_start
+                if int(elapsed) % 60 < 12:
+                    _log_run(run_dir, f"vLLM still starting ({elapsed:.0f}s, logs active)...")
         r = subprocess.run(
             ["kubectl", "exec", pod_name, "--", "curl", "-sf", "--max-time", "3", "http://localhost:8000/health"],
             capture_output=True, timeout=5, env=env,
@@ -1075,13 +1104,6 @@ def _deploy_and_benchmark(
     )
     profiler.start()
 
-    _write_progress("port_forward", {})
-    pf = subprocess.Popen(
-        ["kubectl", "port-forward", pod_name, f"{local_port}:8000"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-    )
-    time.sleep(2)
-
     with open(kubectl_logs_file, "a", encoding="utf-8") as f:
         f.write(f"\n--- live stream started {datetime.now().isoformat()} ---\n")
     logs_proc = subprocess.Popen(
@@ -1091,158 +1113,67 @@ def _deploy_and_benchmark(
         env=env,
     )
 
-    timeout_sec = 3600  # generous max; real timeout is QUERY_STALE_SEC (no progress for 30s)
+    _write_progress("benchmark", {"run_dir": str(run_dir)})
+    _log_run(run_dir, f"Starting benchmark ({benchmark}) as K8s Job, run_dir={run_dir}")
 
-    _write_progress("benchmark", {"timeout_sec": timeout_sec, "run_dir": str(run_dir)})
-    _log_run(run_dir, f"Starting benchmark ({benchmark}), run_dir={run_dir}")
+    cfg = BENCHMARK_PRESETS.get(benchmark, BENCHMARK_PRESETS["quick"])
+    bench_config = {
+        "profile": cfg["profile"],
+        "max_requests": cfg["max_requests"],
+        "max_seconds": cfg["max_seconds"],
+        "rate": cfg.get("rate"),
+        "data": cfg["data"],
+    }
 
-    bench_env = env.copy()
-    bench_env["EXPERIMENT_RUN_DIR"] = str(run_dir)
-    bench_env["EXPERIMENT_BENCHMARK"] = benchmark
-    bench_env["EXPERIMENT_DESCRIPTION"] = f"ai_experiment {experiment_dir.name}"
-    bench_env["EXPERIMENT_TARGET"] = f"http://localhost:{local_port}"
-
-    guideline_script = PROJECT_ROOT / "scripts" / "run_guideline_experiment.py"
-    bench_proc = subprocess.Popen(
-        [sys.executable, str(guideline_script)],
-        cwd=str(PROJECT_ROOT),
-        env=bench_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    harness_out = run_dir / "harness_output.txt"
-    last_queries = -1
-    last_updated = time.time()
-    last_wait_report = 0.0
-    query_progress_file = run_dir / "query_progress.json"
     max_requests = BENCHMARK_MAX_REQUESTS.get(benchmark, 0)
     bench_start = time.time()
-    last_harness_line = ""
+    last_queries = [0]
 
-    def _count_from_kubectl_logs() -> int:
-        """Count actual chat completion requests (not health checks or model list)."""
-        if not kubectl_logs_file.exists():
-            return 0
-        try:
-            text = kubectl_logs_file.read_text(errors="replace")
-            return len(re.findall(r"POST /v1/chat/completions.* 200", text))
-        except Exception:
-            return 0
-
-    stdout_lines: list[str] = []
-
-    def _read_stdout():
-        if bench_proc.stdout:
-            for line in bench_proc.stdout:
-                stdout_lines.append(line)
-
-    reader = threading.Thread(target=_read_stdout, daemon=True)
-    reader.start()
+    def _progress_cb(completed: int) -> None:
+        if completed > last_queries[0]:
+            last_queries[0] = completed
+            _write_progress("benchmark", {
+                "run_dir": str(run_dir),
+                "queries_completed": completed,
+                "last_progress": datetime.now().isoformat(),
+            })
+            elapsed = time.time() - bench_start
+            if max_requests > 0 and completed > 0:
+                pct = min(completed / max_requests, 1.0)
+                bar_width = 30
+                filled = int(bar_width * pct)
+                bar = "█" * filled + "░" * (bar_width - filled)
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (max_requests - completed) / rate if rate > 0 else 0
+                print(f"\r  [{bar}] {completed}/{max_requests} ({pct*100:.0f}%) | {rate:.1f} req/s | ETA {eta:.0f}s", end="", flush=True)
+            else:
+                print(f"\r  {completed} requests | {elapsed:.0f}s elapsed", end="", flush=True)
 
     try:
-        with open(harness_out, "w", encoding="utf-8") as out:
-            poll_interval = 10
-            while True:
-                ret = bench_proc.poll()
-                if ret is not None:
-                    reader.join(timeout=2)
-                    out.write("".join(stdout_lines))
-                    if last_queries > 0:
-                        print()  # newline after progress bar
-                    break
-
-                while stdout_lines:
-                    line = stdout_lines.pop(0)
-                    out.write(line)
-                    out.flush()
-                    stripped = line.strip()
-                    if stripped:
-                        last_harness_line = stripped
-                        print(f"  [guidellm] {stripped}", flush=True)
-
-                queries = last_queries
-                if query_progress_file.exists():
-                    try:
-                        d = json.loads(query_progress_file.read_text())
-                        queries = d.get("queries_completed", 0)
-                    except Exception:
-                        pass
-                if queries <= 0:
-                    queries = _count_from_kubectl_logs()
-
-                now = time.time()
-                if queries > last_queries:
-                    last_queries = queries
-                    last_updated = now
-                    last_wait_report = now
-                    _write_progress("benchmark", {
-                        "timeout_sec": timeout_sec,
-                        "run_dir": str(run_dir),
-                        "queries_completed": last_queries,
-                        "last_progress": datetime.now().isoformat(),
-                    })
-                    # Progress bar
-                    elapsed = now - bench_start
-                    if max_requests > 0 and last_queries > 0:
-                        pct = min(last_queries / max_requests, 1.0)
-                        bar_width = 30
-                        filled = int(bar_width * pct)
-                        bar = "█" * filled + "░" * (bar_width - filled)
-                        rate = last_queries / elapsed if elapsed > 0 else 0
-                        eta = (max_requests - last_queries) / rate if rate > 0 else 0
-                        print(f"\r  [{bar}] {last_queries}/{max_requests} requests ({pct*100:.0f}%) | {rate:.1f} req/s | ETA {eta:.0f}s", end="", flush=True)
-                    else:
-                        print(f"\r  {last_queries} requests | {elapsed:.0f}s elapsed", end="", flush=True)
-                elif (now - last_updated) >= min(10, QUERY_STALE_SEC) and (now - last_wait_report) >= 10:
-                    last_wait_report = now
-                    wait_for = int(now - last_updated)
-                    last_line = last_harness_line[:200] if last_harness_line else "(no harness output yet)"
-                    print(
-                        f"\n  Waiting for benchmark progress: {queries} completed requests, no update for {wait_for}s",
-                        flush=True,
-                    )
-                    print(f"  Last guidellm output: {last_line}", flush=True)
-                elif (now - last_updated) >= QUERY_STALE_SEC:
-                    if (run_dir / "benchmarks.json").exists():
-                        _log_run(run_dir, "Benchmark output found despite stale query count")
-                        if last_queries > 0:
-                            print()
-                        break
-                    if last_queries > 0:
-                        print()
-                    if last_harness_line:
-                        print(f"  Last guidellm output before abort: {last_harness_line[:200]}", flush=True)
-                    return _cleanup(
-                        f"Query count unchanged at {queries} for {QUERY_STALE_SEC}s (no progress)"
-                    )
-
-                if _elapsed_since(start) >= timeout_sec:
-                    if last_queries > 0:
-                        print()
-                    return _cleanup(f"Benchmark timed out after {timeout_sec}s")
-                if m := _check_abort(start, "benchmark", last_progress=last_updated):
-                    return _cleanup(m)
-
-                time.sleep(min(poll_interval, 2))
-
-        r = subprocess.CompletedProcess(bench_proc.args, bench_proc.returncode, None, None)
+        bench_rc = run_benchmark_k8s(
+            pod_name=pod_name,
+            config=bench_config,
+            run_dir=run_dir,
+            env=env,
+            log_fn=lambda msg: _log_run(run_dir, msg),
+            progress_callback=_progress_cb,
+        )
     except Exception as e:
         return _cleanup(f"Benchmark error: {e}")
     finally:
-        for proc in (logs_proc, pf):
-            if proc and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+        if logs_proc and logs_proc.poll() is None:
+            logs_proc.terminate()
+            try:
+                logs_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logs_proc.kill()
 
-    if r.returncode != 0:
+    if last_queries[0] > 0:
+        print()
+
+    if bench_rc != 0:
         _cleanup()
-        return False, f"Benchmark failed (exit {r.returncode}). See {run_dir}/harness_output.txt"
+        return False, f"Benchmark failed (K8s Job exit {bench_rc}). See {run_dir}/benchmark_live.txt"
 
     _write_progress("done", {})
     _log_run(run_dir, "Benchmark complete")
@@ -1824,6 +1755,7 @@ def _write_conversation(run_dir: Path, turns: list[tuple[str, str]], sweep_dir: 
 
 def _write_agent_result_log(run_dir: Path, agent_result: AgentResult, sweep_dir: Path | None = None) -> None:
     """Append tool summary to the live agent.log and copy to sweep log."""
+    run_dir.mkdir(parents=True, exist_ok=True)
     log_file = run_dir / "agent.log"
 
     summary_lines = []

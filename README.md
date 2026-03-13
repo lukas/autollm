@@ -96,13 +96,15 @@ Every run produces a `RETRO.md` in its run directory. Retros are written by the 
 
 ### Benchmark presets
 
-| Preset | Profile | Requests | Time limit | Data | Use case |
-|--------|---------|----------|------------|------|----------|
-| `quick` | synchronous | 5 | 30s | 64 prompt + 64 output tokens | Fast iteration (~30s) |
-| `sync` | synchronous | 20 | 60s | 64 prompt + 64 output tokens | Moderate (~1 min) |
-| `sweep` | sweep (multiple profiles) | — | 60s | 256 prompt + 128 output tokens | Multi-profile |
-| `medium` | synchronous | 200 | 300s | 256 prompt + 128 output tokens | Thorough (~2–5 min) |
-| `long` | synchronous | 1000 | 600s | 256 prompt + 128 output tokens | Comprehensive (~10 min) |
+| Preset | Profile | Requests | Time limit | Rate | Data | Use case |
+|--------|---------|----------|------------|------|------|----------|
+| `quick` | synchronous | 5 | 30s | — | 64+64 tokens | Fast iteration (~30s) |
+| `sync` | synchronous | 20 | 60s | — | 64+64 tokens | Moderate (~1 min) |
+| `sweep` | sweep | — | 60s | — | 256+128 tokens | Multi-profile |
+| `medium` | synchronous | 200 | 300s | — | 256+128 tokens | Thorough (~2–5 min) |
+| `medium-throughput` | concurrent | 200 | 300s | 64 | 256+128 tokens | Throughput-focused (~3 min) |
+| `large` | concurrent | 500 | 600s | 64 | 256+128 tokens | Thorough throughput (~10 min) |
+| `long` | synchronous | 1000 | 600s | — | 256+128 tokens | Comprehensive (~10 min) |
 
 `--max-requests` has no hard limit — set `MAX_REQUESTS=2000` for even longer runs.
 
@@ -125,12 +127,40 @@ results/sweep-qwen-latency/
     deploy.log, kubectl_logs.txt, run.log, ...
 ```
 
+### Remote sweep (runs in-cluster)
+
+For long sweeps, run the agent inside the Kubernetes cluster so it survives laptop disconnects:
+
+```bash
+# Start remote sweep (creates a lightweight controller pod, syncs code, runs in background)
+make sweep-remote SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+
+# Monitor
+make sweep-logs                                # tail live output
+make sweep-status                              # check running sweeps
+
+# Pull results to local machine
+make sync-results SWEEP=qwen3-235b-throughput  # sync one sweep
+make sync-results                              # sync all results
+
+# Cleanup
+make sweep-remote-teardown                     # delete controller pod (sync first!)
+```
+
+The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys are injected from your local `.env` and environment.
+
 ## Other targets
 
 | Target | Description |
 |--------|-------------|
 | `make sweep SWEEP=name` | Create sweep + run baseline |
 | `make improve SWEEP=name` | AI agent suggests improvements |
+| `make full-sweep SWEEP=name RUNS=N` | Create sweep + baseline + N improvement runs |
+| `make sweep-remote SWEEP=name RUNS=N` | Run full sweep on a K8s controller pod |
+| `make sync-results SWEEP=name` | Copy results from remote controller to local |
+| `make sweep-logs` | Tail live remote sweep output |
+| `make sweep-status` | Check remote sweep status |
+| `make sweep-remote-teardown` | Delete the controller pod |
 | `make benchmark` | One-shot benchmark (deploy + bench, saves to results/runs/) |
 | `make benchmark BENCHMARK=quick` | Quick one-shot benchmark |
 | `make experiment` | Standalone AI experiment (no sweep) |
@@ -150,7 +180,7 @@ results/sweep-qwen-latency/
 | `AI_MODEL` | Default: `claude-opus-4-6`. Override: `gpt-5-codex`, etc. |
 | `ALLOW_MODEL_CHANGE` | Set to `1` to let agent try quantized model variants |
 | `GOAL` | Optimization goal for the agent (e.g. "minimize latency", "maximize throughput") |
-| `BENCHMARK` | Preset: `quick`, `sync`, `sweep`, `medium`, `long` |
+| `BENCHMARK` | Preset: `quick`, `sync`, `sweep`, `medium`, `medium-throughput`, `large`, `long` |
 | `MAX_REQUESTS` | Override max requests (no limit) |
 | `MAX_SECONDS` | Override max benchmark duration |
 | `EXA_API_KEY` | Exa API key for web search (falls back to DuckDuckGo if unset) |
