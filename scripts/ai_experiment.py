@@ -78,6 +78,15 @@ def _metric(m: dict, k: str, sub: str = "successful") -> float | None:
     return suc.get("mean") if isinstance(suc, dict) else None
 
 
+def _metric_pct(m: dict, k: str, pct: str, sub: str = "successful") -> float | None:
+    o = m.get(k, {})
+    suc = o.get(sub) if isinstance(o, dict) else {}
+    if not isinstance(suc, dict):
+        return None
+    pcts = suc.get("percentiles", {})
+    return pcts.get(pct) if isinstance(pcts, dict) else None
+
+
 def _fmt_summary(m: dict) -> str:
     lat = _metric(m, "request_latency")
     ttft = _metric(m, "time_to_first_token_ms")
@@ -93,6 +102,49 @@ def _fmt_summary(m: dict) -> str:
     if rps is not None:
         parts.append(f"Req/s: {rps:.1f}")
     return " | ".join(parts) if parts else "—"
+
+
+def _fmt_detail_lines(m: dict, run_dir: Path) -> list[str]:
+    """Extra detail lines for leaderboard entries: percentiles + server-side metrics."""
+    lines = []
+    # Percentiles
+    lat_p50 = _metric_pct(m, "request_latency", "p50")
+    lat_p95 = _metric_pct(m, "request_latency", "p95")
+    ttft_p50 = _metric_pct(m, "time_to_first_token_ms", "p50")
+    ttft_p95 = _metric_pct(m, "time_to_first_token_ms", "p95")
+    req_totals = m.get("request_totals", {})
+    completed = req_totals.get("successful", req_totals.get("total", "?"))
+    errored = req_totals.get("errored", 0)
+    pct_parts = []
+    if lat_p50 is not None and lat_p95 is not None:
+        pct_parts.append(f"Latency p50={lat_p50*1000:.0f}ms p95={lat_p95*1000:.0f}ms")
+    if ttft_p50 is not None and ttft_p95 is not None:
+        pct_parts.append(f"TTFT p50={ttft_p50:.0f}ms p95={ttft_p95:.0f}ms")
+    pct_parts.append(f"Completed={completed}")
+    if errored:
+        pct_parts.append(f"Errors={errored}")
+    lines.append("  Detail: " + " | ".join(pct_parts))
+
+    # Server-side metrics from vLLM /metrics
+    vllm_summary = run_dir / "vllm_metrics_summary.json"
+    if vllm_summary.exists():
+        try:
+            vs = json.loads(vllm_summary.read_text())
+            server_parts = []
+            preemptions = vs.get("vllm:num_preemptions_total")
+            if preemptions is not None:
+                server_parts.append(f"Preemptions={int(preemptions)}")
+            gpu_cache = vs.get("vllm:gpu_cache_usage_perc")
+            if gpu_cache is not None:
+                server_parts.append(f"GPU-cache={gpu_cache:.1%}")
+            cpu_cache = vs.get("vllm:cpu_cache_usage_perc")
+            if cpu_cache is not None and cpu_cache > 0:
+                server_parts.append(f"CPU-cache={cpu_cache:.1%}")
+            if server_parts:
+                lines.append("  Server: " + " | ".join(server_parts))
+        except Exception:
+            pass
+    return lines
 
 
 def _get_sample_benchmark_data(runs_dir: Path | None = None) -> str:
@@ -310,6 +362,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                                       "latency": lat or 999,
                                       "throughput": tok or 0,
                                       "ttft": ttft or 999999,
+                                      "detail_lines": _fmt_detail_lines(m, d),
                                       "path": str(d.relative_to(project_root))})
                     continue
             except Exception:
@@ -349,6 +402,8 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
         lines.append("-" * 100)
         for s in successes[:10]:
             lines.append(f"{s['name']}  {s['metrics']}")
+            for dl in s.get("detail_lines", []):
+                lines.append(dl)
             if s["desc"]:
                 lines.append(f"  Strategy: {s['desc']}")
             if s["changes"]:
@@ -623,6 +678,51 @@ def _fetch_and_check_logs(run_dir: Path, env: dict, logs_file: Path, pod_name: s
     except Exception:
         pass
     return None
+
+
+def _scrape_vllm_metrics(pod_name: str, run_dir: Path, env: dict) -> None:
+    """Scrape vLLM's Prometheus /metrics endpoint and save raw + summary."""
+    try:
+        r = subprocess.run(
+            ["kubectl", "exec", pod_name, "--", "curl", "-sf", "--max-time", "5", "http://localhost:8000/metrics"],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+        if r.returncode != 0 or not r.stdout:
+            return
+        raw = r.stdout
+        (run_dir / "vllm_metrics.txt").write_text(raw)
+
+        summary: dict[str, float] = {}
+        for line in raw.splitlines():
+            if line.startswith("#"):
+                continue
+            for key in (
+                "vllm:num_preemptions_total",
+                "vllm:gpu_cache_usage_perc",
+                "vllm:cpu_cache_usage_perc",
+                "vllm:num_requests_waiting",
+                "vllm:num_requests_running",
+                "vllm:avg_prompt_throughput_toks_per_s",
+                "vllm:avg_generation_throughput_toks_per_s",
+                "vllm:time_to_first_token_seconds_sum",
+                "vllm:time_to_first_token_seconds_count",
+                "vllm:e2e_request_latency_seconds_sum",
+                "vllm:e2e_request_latency_seconds_count",
+            ):
+                prom_name = key.replace(":", ":")
+                if line.startswith(prom_name + " ") or line.startswith(prom_name + "{"):
+                    parts = line.rsplit(" ", 1)
+                    if len(parts) == 2:
+                        try:
+                            summary[key] = float(parts[1])
+                        except ValueError:
+                            pass
+        if summary:
+            (run_dir / "vllm_metrics_summary.json").write_text(
+                json.dumps(summary, indent=2) + "\n"
+            )
+    except Exception:
+        pass
 
 
 def _deploy_and_benchmark(
@@ -962,6 +1062,9 @@ def _deploy_and_benchmark(
     _write_progress("done", {})
     _log_run(run_dir, "Benchmark complete")
 
+    # Scrape vLLM Prometheus metrics while pod is still alive
+    _scrape_vllm_metrics(pod_name, run_dir, env)
+
     benchmarks_json = run_dir / "benchmarks.json"
     if not benchmarks_json.exists() and (run_dir / "benchmark.json").exists():
         shutil.copy(run_dir / "benchmark.json", benchmarks_json)
@@ -1080,6 +1183,17 @@ def main() -> int:
             fb = meta_feedback_file.read_text().strip()
             if fb:
                 meta_feedback_section = f"\n## Meta-feedback (suggestions from an external reviewer — consider these for your next experiment)\n\n{fb}\n"
+        except Exception:
+            pass
+
+    # Load vLLM tuning guide if available
+    tuning_guide_section = ""
+    tuning_guide_file = PROJECT_ROOT / "docs" / "vllm_tuning_guide.md"
+    if tuning_guide_file.exists():
+        try:
+            tg = tuning_guide_file.read_text().strip()
+            if tg:
+                tuning_guide_section = f"\n## vLLM Tuning Guide (from official docs)\n\n{tg}\n"
         except Exception:
             pass
 
@@ -1208,9 +1322,11 @@ env:
 - `--disable-log-stats` — Disable periodic stats logging (minor perf gain)
 - NOTE: `--disable-log-requests` and `--num-scheduler-steps` do NOT exist in this image.
 
+{tuning_guide_section}
 ## Your task
 
 **IMPORTANT:** Review the leaderboard above. Do NOT repeat a strategy that already failed or that produced worse results than the current best. Try something genuinely different.
+Pay attention to the Detail and Server lines in the leaderboard — preemption counts, GPU cache usage, and p50/p95 latency spreads reveal whether the bottleneck is memory pressure, scheduling, or compute.
 
 Use a search mindset: each run should help the sweep learn what works, not just make a large grab-bag of edits.
 - Default to exactly one meaningful change relative to the current best config.
