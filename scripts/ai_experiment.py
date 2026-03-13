@@ -656,10 +656,16 @@ def _deploy_and_benchmark(
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-        subprocess.run(
-            ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true"],
-            capture_output=True, timeout=30, env=env,
-        )
+        try:
+            subprocess.run(
+                ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true"],
+                capture_output=True, timeout=30, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true", "--force", "--grace-period=0"],
+                capture_output=True, timeout=30, env=env,
+            )
         if pod_name in _active_pods:
             _active_pods.remove(pod_name)
         if msg:
@@ -677,7 +683,18 @@ def _deploy_and_benchmark(
     ]:
         if m := _check_abort(start, "deploy"):
             return _cleanup(m)
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        except subprocess.TimeoutExpired:
+            if "delete" in cmd:
+                # Force-delete on timeout and continue to apply
+                subprocess.run(
+                    ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true", "--force", "--grace-period=0"],
+                    capture_output=True, text=True, timeout=30, env=env,
+                )
+                continue
+            _cleanup()
+            return False, f"{err}: timed out after 120s"
         _append_deploy_log(cmd, r)
         if r.returncode != 0:
             _cleanup()
