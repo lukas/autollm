@@ -2,7 +2,7 @@
 
 AI-driven vLLM optimization on Kubernetes. Deploys vLLM, benchmarks latency/throughput, and uses an AI agent to iteratively improve the config.
 
-**Requires:** [runllm](runllm/) submodule + Kubernetes cluster with GPU nodes.
+**Requires:** Kubernetes cluster with GPU nodes.
 
 ## Setup
 
@@ -12,8 +12,8 @@ cd autollm
 
 # 1. Configure cluster access (pick one):
 cp .env.example .env           # fill in KUBECONFIG_SERVER + KUBECONFIG_TOKEN
-make kubeconfig                 # generates autollm/kubeconfig
-# OR: copy your kubeconfig directly to autollm/kubeconfig
+make kubeconfig                 # generates kubeconfig
+# OR: copy your kubeconfig directly to ./kubeconfig
 
 # 2. Set your AI API key in .env:
 # ANTHROPIC_API_KEY=sk-...

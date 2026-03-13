@@ -1,7 +1,6 @@
 # autollm - Benchmark harness, AI optimizer, dashboard
 # Requires: runllm submodule (runllm/<model>/) for vLLM config
 
--include ../.env
 -include .env
 
 # Kubeconfig: copy to autollm/kubeconfig OR set KUBECONFIG_SERVER + KUBECONFIG_TOKEN in .env and run `make kubeconfig`

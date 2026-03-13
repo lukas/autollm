@@ -71,17 +71,11 @@ sync_code() {
         -C "$PROJECT_DIR" . \
         | kubectl exec -i "$CONTROLLER_POD" -- tar xzf - -C "$REMOTE_DIR"
 
-    # Copy .env files for API keys
-    for envfile in "$PROJECT_DIR/.env" "$PROJECT_DIR/../.env"; do
-        if [ -f "$envfile" ]; then
-            info "Copying $(basename "$envfile") from $(dirname "$envfile")..."
-            if [ "$envfile" = "$PROJECT_DIR/.env" ]; then
-                kubectl cp "$envfile" "$CONTROLLER_POD:$REMOTE_DIR/.env" --no-preserve=true
-            else
-                kubectl cp "$envfile" "$CONTROLLER_POD:/workspace/.env" --no-preserve=true
-            fi
-        fi
-    done
+    # Copy .env for API keys
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        info "Copying .env..."
+        kubectl cp "$PROJECT_DIR/.env" "$CONTROLLER_POD:$REMOTE_DIR/.env" --no-preserve=true
+    fi
 
     # Inject API keys from local environment (they may not be in .env files)
     local env_append=""

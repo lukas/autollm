@@ -139,9 +139,8 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 - `autollm/runllm/` contains per-model subdirectories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`).
 - Each model dir is self-contained with `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
-- The top-level sibling `../runllm` was intentionally removed.
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
-- Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig`.
+- Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig` (relative to the model dir).
 - Sweeps store `model_dir` in `sweep_metadata.json` so `make improve` uses the right model config.
 
 ### Tensorizer / PVC Model Loading
