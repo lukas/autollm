@@ -18,7 +18,7 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote sync-results sweep-logs sweep-status sweep-remote-teardown
+.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sync-results sweep-logs sweep-status sweep-remote-teardown
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
@@ -138,6 +138,14 @@ sweep-remote: ensure-kubeconfig
 	@scripts/sweep_remote.sh start \
 		--sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" \
 		--runs "$(RUNS)" $(if $(GOAL),--goal "$(GOAL)",) $(if $(FORCE),--force,)
+
+# Continue a local sweep remotely: sync local results to controller pod, run improve in-cluster.
+# Reuses existing controller pod if one is running. If the sweep is already running, just reports status.
+# Usage: make improve-remote SWEEP=my-sweep RUNS=10
+#        make improve-remote SWEEP=my-sweep RUNS=5 ALLOW_MODEL_CHANGE=1
+improve-remote: ensure-kubeconfig
+	@scripts/sweep_remote.sh improve \
+		--sweep "$(SWEEP)" --runs "$(RUNS)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,)
 
 # Copy sweep results from the remote controller pod to local machine.
 # Usage: make sync-results SWEEP=my-sweep     # sync one sweep

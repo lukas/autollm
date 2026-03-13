@@ -3,8 +3,9 @@
 # Remote sweep controller: run sweeps on a Kubernetes pod.
 #
 # Usage:
-#   scripts/sweep_remote.sh start --sweep NAME [--model-dir DIR] [--benchmark BENCH] [--runs N] [--goal GOAL] [--force]
-#   scripts/sweep_remote.sh sync  [--sweep NAME]
+#   scripts/sweep_remote.sh start   --sweep NAME [--model-dir DIR] [--benchmark BENCH] [--runs N] [--goal GOAL] [--force]
+#   scripts/sweep_remote.sh improve --sweep NAME [--runs N] [--allow-model-change]
+#   scripts/sweep_remote.sh sync    [--sweep NAME]
 #   scripts/sweep_remote.sh logs
 #   scripts/sweep_remote.sh status
 #   scripts/sweep_remote.sh teardown
@@ -90,6 +91,26 @@ sync_code() {
     info "Code synced"
 }
 
+sync_sweep_results() {
+    local sweep="$1"
+    local local_sweep="$PROJECT_DIR/results/sweep-${sweep}"
+
+    [ -d "$local_sweep" ] || die "Local sweep results not found: $local_sweep"
+
+    info "Syncing local results for sweep-${sweep} to controller pod..."
+    kubectl exec "$CONTROLLER_POD" -- mkdir -p "$REMOTE_DIR/results"
+    tar czf - -C "$PROJECT_DIR/results" "sweep-${sweep}" \
+        | kubectl exec -i "$CONTROLLER_POD" -- tar xzf - -C "$REMOTE_DIR/results"
+    info "Sweep results synced to pod"
+}
+
+sweep_is_running() {
+    local sweep="$1"
+    local pid_file="/workspace/sweep-${sweep}.pid"
+    kubectl exec "$CONTROLLER_POD" -- bash -c \
+        "[ -f '$pid_file' ] && kill -0 \$(cat '$pid_file') 2>/dev/null" &>/dev/null
+}
+
 # ── actions ──────────────────────────────────────────────────────────────────
 
 action_start() {
@@ -146,6 +167,73 @@ make full-sweep SWEEP=${sweep} MODEL_DIR=${model_dir} BENCHMARK=${benchmark} RUN
 
     info ""
     info "Sweep started in background on '$CONTROLLER_POD'"
+    info ""
+    info "Useful commands:"
+    info "  make sweep-logs                           # tail live output"
+    info "  make sweep-status                         # check if sweep is running"
+    info "  make sync-results SWEEP=${sweep}          # copy results to local machine"
+    info "  make sweep-remote-teardown                # delete controller pod"
+}
+
+action_improve() {
+    local sweep="" runs="1" allow_model_change=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sweep)              sweep="$2";            shift 2 ;;
+            --runs)               runs="$2";             shift 2 ;;
+            --allow-model-change) allow_model_change="1"; shift   ;;
+            *) die "Unknown arg: $1" ;;
+        esac
+    done
+    [ -n "$sweep" ] || die "--sweep NAME is required"
+
+    ensure_controller
+
+    if sweep_is_running "$sweep"; then
+        info "Sweep '${sweep}' is already running on the controller pod."
+        info ""
+        info "Useful commands:"
+        info "  make sweep-logs                           # tail live output"
+        info "  make sweep-status                         # check running sweeps"
+        info "  make sync-results SWEEP=${sweep}          # copy results to local machine"
+        return 0
+    fi
+
+    sync_code
+    sync_sweep_results "$sweep"
+
+    local log_file="/workspace/sweep-${sweep}.log"
+    local script_file="/workspace/sweep-${sweep}.sh"
+    local pid_file="/workspace/sweep-${sweep}.pid"
+
+    local script_body="#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/root/.local/bin:\$PATH
+cd $REMOTE_DIR
+
+set -a
+[ -f /workspace/.env ] && source /workspace/.env
+[ -f .env ] && source .env
+set +a
+
+env -u VIRTUAL_ENV uv sync --extra guidellm --extra ai_optimizer
+make improve SWEEP=${sweep} RUNS=${runs}"
+    [ -n "$allow_model_change" ] && script_body+=" ALLOW_MODEL_CHANGE=1"
+    script_body+=$'\n'
+
+    kubectl exec -i "$CONTROLLER_POD" -- tee "$script_file" > /dev/null <<< "$script_body"
+    kubectl exec "$CONTROLLER_POD" -- chmod +x "$script_file"
+
+    info "Starting improve for sweep '${sweep}' on controller pod (${runs} runs)..."
+    info "Logs: kubectl exec $CONTROLLER_POD -- tail -f $log_file"
+    info ""
+
+    kubectl exec "$CONTROLLER_POD" -- bash -c \
+        "nohup $script_file > $log_file 2>&1 & echo \$! > $pid_file; echo \"Sweep PID: \$(cat $pid_file)\""
+
+    info ""
+    info "Improve started in background on '$CONTROLLER_POD'"
     info ""
     info "Useful commands:"
     info "  make sweep-logs                           # tail live output"
@@ -249,14 +337,15 @@ action_teardown() {
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-[ $# -ge 1 ] || die "Usage: $0 {start|sync|logs|status|teardown} [args...]"
+[ $# -ge 1 ] || die "Usage: $0 {start|improve|sync|logs|status|teardown} [args...]"
 ACTION="$1"; shift
 
 case "$ACTION" in
     start)    action_start "$@" ;;
+    improve)  action_improve "$@" ;;
     sync)     action_sync "$@" ;;
     logs)     action_logs "$@" ;;
     status)   action_status "$@" ;;
     teardown) action_teardown "$@" ;;
-    *)        die "Unknown action: $ACTION. Use: start, sync, logs, status, teardown" ;;
+    *)        die "Unknown action: $ACTION. Use: start, improve, sync, logs, status, teardown" ;;
 esac
