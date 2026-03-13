@@ -28,7 +28,8 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 
 | Path | Purpose |
 |------|---------|
-| `scripts/ai_experiment.py` | Main sweep improve loop, prompt construction, deploy/benchmark, retries, cleanup |
+| `scripts/ai_experiment.py` | Main sweep improve loop, prompt construction, deploy/benchmark, retries, retro writing, cleanup |
+| `scripts/agent_tools.py` | Tool definitions, execution engine, and provider-agnostic agent loop (Anthropic + OpenAI) |
 | `scripts/benchmark_config.py` | Shared benchmark presets and Guideline progress parsing helpers |
 | `scripts/benchmark_harness.py` | One-shot benchmark harness for `results/runs/` |
 | `scripts/run_guideline_experiment.py` | Guideline subprocess wrapper for experiment mode; writes `query_progress.json` |
@@ -53,6 +54,21 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - structured `Changed knobs vs baseline`
   - full arg summaries extracted from YAML using structured parsing, not fragile regex
 - Prompt guidance pushes the agent toward single-change experiments and allows `NO_CONFIG_CHANGE: ...` on retries when logs suggest a harness/watchdog issue rather than a config issue.
+
+### Tool-Calling Agent
+
+- The agent now uses a full tool stack defined in `scripts/agent_tools.py` (10 tools: `search_web`, `fetch_url`, `read_file`, `write_file`, `list_files`, `run_shell`, `run_benchmark`, `read_logs`, `kubectl_get`, `kubectl_logs`).
+- `run_agent()` in `agent_tools.py` implements the agentic loop for both Anthropic Messages API and OpenAI Chat Completions API.
+- Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
+- `write_file` is sandboxed: only writes `vllm-qwen.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
+- Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
+
+### Run Retros
+
+- Every run (success or failure) writes a `RETRO.md` via `_write_run_retro()` in `ai_experiment.py`.
+- The retro agent gets up to 10 tool calls to inspect logs and gather evidence.
+- Retros are designed for consumption by future AI agents. They capture: exact knob changes, key metrics or errors, causal explanations, crashes from any phase, research findings, and non-obvious pitfalls.
+- Retros should be terse (3-10 lines) but complete.
 
 ### Benchmark / Retry Flow
 
@@ -105,7 +121,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 When changing this area, the cheap checks that have been useful are:
 
 ```bash
-python3 -m py_compile scripts/ai_experiment.py scripts/benchmark_config.py scripts/benchmark_harness.py scripts/run_guideline_experiment.py scripts/start_sweep.py scripts/sweep_utils.py scripts/list_sweep_pods.py
+python3 -m py_compile scripts/ai_experiment.py scripts/agent_tools.py scripts/benchmark_config.py scripts/benchmark_harness.py scripts/run_guideline_experiment.py scripts/start_sweep.py scripts/sweep_utils.py scripts/list_sweep_pods.py
 python3 scripts/test_sweep_setup.py
 env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --refresh-leaderboard --sweep qwen-throughput
 ```

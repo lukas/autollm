@@ -84,6 +84,7 @@ The index lists all runs with metrics and links. Use it to compare configuration
 | `pod_status.txt` | `kubectl describe pod vllm-qwen` |
 | `run_metadata.json` | Timestamp, description |
 | `run.log` | Harness log + Guideline stdout/stderr |
+| `RETRO.md` | Agent-written retrospective (every sweep run) |
 
 ## AI-Driven Optimization
 
@@ -95,7 +96,7 @@ make improve SWEEP=qwen-latency
 make leaderboard SWEEP=qwen-latency
 ```
 
-Each improve run copies the current best `runllm/`, proposes one experiment, deploys it, runs a sample query, benchmarks it, and writes sweep artifacts under `results/sweep-NAME/`.
+Each improve run copies the current best `runllm/`, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
 
 **Agent handoff:** See [AGENT_HANDOFF.md](AGENT_HANDOFF.md) for a concise summary so another agent can pick up this work quickly.
 

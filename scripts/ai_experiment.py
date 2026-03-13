@@ -25,6 +25,7 @@ from pathlib import Path
 
 import yaml
 
+from agent_tools import AgentResult, ToolContext, run_agent
 from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
 from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
 
@@ -71,6 +72,37 @@ QUERY_STALE_SEC = int(os.environ.get("EXPERIMENT_QUERY_STALE_SEC", "30"))
 
 # Timeout for sample query before benchmark (must complete or we abort)
 SAMPLE_QUERY_TIMEOUT = int(os.environ.get("EXPERIMENT_SAMPLE_QUERY_TIMEOUT", "30"))
+
+AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "50"))
+
+TOOL_SYSTEM_PROMPT = """\
+You are a vLLM optimizer agent running on Kubernetes (H200 GPU, CoreWeave).
+You have tools to explore files, search the web, read logs, interact with Kubernetes, and run benchmarks.
+
+## Workflow
+1. Review the provided context (current config, leaderboard, workload, goal).
+2. Use tools as needed: read_file, list_files, read_logs, search_web, fetch_url, kubectl_get, kubectl_logs, run_shell.
+3. Decide on ONE isolated config change (prefer single-variable experiments).
+4. Write the config: write_file('vllm-qwen.yaml', <complete pod YAML>).
+5. Optionally: write_file('Makefile', ...) if you changed the model.
+6. Optionally: run_benchmark(<description>) to deploy and benchmark your config.
+
+## File safety
+- write_file ONLY writes to the isolated per-run experiment directory (results/sweep-NAME/TIMESTAMP/runllm/).
+- It NEVER modifies the shared project runllm/ or any other directory.
+- You can only write 'vllm-qwen.yaml' and 'Makefile' — nothing else.
+- read_file can read from results/, runllm/, docs/, scripts/ for reference.
+
+## Output format
+Before writing the config, state your strategy:
+- Experiment type: single-change | bundle
+- Evidence: 1-3 bullets grounded in the leaderboard/workload/logs
+- Changed knobs: one bullet per knob, format: `knob: old -> new`
+- Why: 1-2 short bullets
+
+If you determine no config change is needed, say NO_CONFIG_CHANGE: <reason> in your final message.
+"""
+
 
 def _metric(m: dict, k: str, sub: str = "successful") -> float | None:
     o = m.get(k, {})
@@ -327,6 +359,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
             except Exception:
                 pass
         desc = meta.get("description", "")
+        short_name = _read_short_name(d)
         if (d / "benchmarks.json").exists():
             try:
                 data = json.loads((d / "benchmarks.json").read_text())
@@ -356,7 +389,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                     lat = metric_mean(m, "request_latency")
                     tok = metric_mean(m, "tokens_per_second")
                     ttft = metric_mean(m, "time_to_first_token_ms")
-                    successes.append({"name": d.name, "metrics": metrics, "desc": desc,
+                    successes.append({"name": d.name, "short_name": short_name, "metrics": metrics, "desc": desc,
                                       "config_summary": _extract_vllm_args(config_text) if config_text else "",
                                       "changes": _summarize_config_changes(config_text, reference_config_text),
                                       "latency": lat or 999,
@@ -401,7 +434,10 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
         lines.append(f"LEADERBOARD (successful runs, ranked by {sweep_ranking_label(sweep_name)}):")
         lines.append("-" * 100)
         for s in successes[:10]:
-            lines.append(f"{s['name']}  {s['metrics']}")
+            header = s["name"]
+            if s.get("short_name"):
+                header += f"  [{s['short_name']}]"
+            lines.append(f"{header}  {s['metrics']}")
             for dl in s.get("detail_lines", []):
                 lines.append(dl)
             if s["desc"]:
@@ -498,6 +534,38 @@ def _call_openai(prompt: str, model: str) -> str:
         return r.output_text if hasattr(r, "output_text") and r.output_text else ""
     r = client.chat.completions.create(model=model, max_tokens=8192, messages=[{"role": "user", "content": prompt}])
     return r.choices[0].message.content if r.choices else ""
+
+
+def _generate_short_name(description: str, result: str, call_fn) -> str:
+    """Ask the LLM for a 3-6 word descriptive name for this run."""
+    prompt = (
+        "Give a short descriptive name (3-6 words, no quotes, no punctuation) for this vLLM optimization experiment.\n\n"
+        f"Strategy: {description[:500]}\n"
+        f"Result: {result[:200]}\n\n"
+        "Reply with ONLY the short name, nothing else. Examples: 'flashinfer + larger batches', 'prefix caching disabled', 'fp8 kv cache', 'baseline config'"
+    )
+    try:
+        name = call_fn(prompt).strip().strip('"\'').strip()
+        if len(name) > 60:
+            name = name[:60].rsplit(" ", 1)[0]
+        return name
+    except Exception:
+        return ""
+
+
+def _save_short_name(run_dir: Path, name: str) -> None:
+    if name:
+        (run_dir / "short_name.txt").write_text(name)
+
+
+def _read_short_name(run_dir: Path) -> str:
+    f = run_dir / "short_name.txt"
+    if f.exists():
+        try:
+            return f.read_text().strip()
+        except Exception:
+            pass
+    return ""
 
 
 def _extract_code_block(text: str, lang: str = "") -> str | None:
@@ -1095,6 +1163,66 @@ def _deploy_and_benchmark(
     return True, "Benchmark completed (no metrics extracted)"
 
 
+def _write_run_retro(
+    *, run_dir: Path, experiment_dir: Path, description: str,
+    result: str, success: bool, attempt: int, max_attempts: int,
+    provider: str, model: str, sweep_dir: Path | None, sweep: str | None,
+    benchmark: str, ts: str, call_fn,
+) -> None:
+    """Write a short RETRO.md for every run — success or failure."""
+    outcome = "succeeded" if success else "failed"
+    retro_prompt = f"""Write a RETRO.md for this vLLM optimization run that {outcome}.
+
+**Strategy:** {description[:500]}
+**Result:** {result[:300]}
+**Attempt:** {attempt}/{max_attempts}
+**Run directory:** {run_dir.name}
+
+Use read_logs('{run_dir.name}', 'benchmark') to check the benchmark data if available.
+Use read_logs('{run_dir.name}', 'deploy') or read_logs('{run_dir.name}', 'kubectl') for deploy/runtime details.
+
+Write a RETRO.md (in a ```markdown block```). Be as brief as possible — no filler, no boilerplate.
+The audience is a future AI agent that will read this before designing the next experiment.
+Include ANYTHING that helps that agent avoid pitfalls or design a better run:
+
+- **Change:** what knob(s) were changed, from what to what (exact values)
+- **Result:** key metrics (throughput, latency, TTFT) or the specific error. Numbers only, skip prose.
+- **Why it worked / failed:** the causal explanation, not just a restatement of the result
+- **Crashes / errors:** if the LLM, benchmark tool, deploy, or any other step crashed or
+  errored at any point during this run, note what happened and how to avoid it.
+  Check deploy logs and kubectl logs for OOMs, timeouts, pod evictions, etc.
+- **Research findings:** if web search, docs, or log analysis revealed useful vLLM knowledge
+  during the research phase (e.g. version-specific behavior, undocumented defaults,
+  interactions between flags), capture it here even if it wasn't directly tested.
+- **Pitfall or insight:** anything non-obvious that a future agent should know
+  (e.g. "gpu-memory-utilization above 0.95 causes OOM on H200 with this model",
+   "enabling chunked-prefill hurt throughput at low concurrency",
+   "this arg is silently ignored in vLLM 0.7.x",
+   "benchmark timed out because pod took 4min to load model — increase wait")
+
+Skip sections that have nothing useful to say. Aim for 3-10 lines — terse but complete."""
+    try:
+        retro_ctx = ToolContext(
+            project_root=PROJECT_ROOT, experiment_dir=experiment_dir,
+            run_dir=run_dir, sweep_dir=sweep_dir, sweep=sweep or None,
+            benchmark=benchmark, ts=ts, env=os.environ.copy(),
+        )
+        retro_result = run_agent(
+            "You write terse, high-signal retrospectives for vLLM optimization runs. A future AI agent will read this to plan better experiments. No filler. Use tools to get exact numbers.",
+            retro_prompt, provider, model, retro_ctx, max_turns=10,
+        )
+        retro_content = retro_result.text
+    except Exception as e:
+        retro_content = f"# Retrospective\n\nFailed to generate: {e}"
+    retro_md = _extract_code_block(retro_content, "markdown") or retro_content
+    if retro_md:
+        (run_dir / "RETRO.md").write_text(retro_md)
+        print(f"Saved RETRO.md to {run_dir}")
+
+    short_name = _generate_short_name(description, result, call_fn)
+    _save_short_name(run_dir, short_name)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI experiment: LLM suggests vLLM changes, deploy and benchmark")
     parser.add_argument("--sweep", "-s", help="Sweep name (use runs from results/sweep-NAME/)")
@@ -1341,10 +1469,12 @@ Use a search mindset: each run should help the sweep learn what works, not just 
    - `Changed knobs:` with one bullet per changed knob in the form `knob: old -> new`
    - `Why:` with 1-2 short bullets
 2. Describe a config that is different from the baseline AND from previous attempts shown in the leaderboard.
-3. Return the complete vllm-qwen.yaml in a ```yaml block```.
-{"3. If you changed the model, also return the Makefile in a ```makefile block``` with updated VLLM_MODEL." if allow_model_change else ""}
+3. Write the complete vllm-qwen.yaml using write_file('vllm-qwen.yaml', <full YAML>).
+{"4. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
+5. Optionally call run_benchmark(<description>) to deploy and test your config.
 
-**To request a file** from a previous run: respond with `REQUEST_FILE: results/sweep-NAME/TIMESTAMP/FILE` (e.g. deploy.log, kubectl_logs.txt). You'll get the contents and can then provide your YAML."""
+**Tools available:** You have read_file, list_files, read_logs, search_web, fetch_url, kubectl_get, kubectl_logs, run_shell, write_file, run_benchmark.
+Use them to investigate previous runs, look up vLLM docs, or inspect the cluster before proposing changes."""
 
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
         try:
@@ -1362,12 +1492,10 @@ Use a search mindset: each run should help the sweep learn what works, not just 
     max_attempts = 10
     failure_context: dict | None = None
     last_description = ""
-    conversation_turns: list[tuple[str, str]] = []
 
     for attempt in range(max_attempts):
         if attempt > 0 and failure_context:
             result_msg = failure_context.get("result", "")
-            # Infrastructure errors (kubectl/K8s) cannot be fixed by changing YAML—exit early
             if _is_infrastructure_error(result_msg):
                 print("\n*** Infrastructure error (not fixable by vLLM config) ***")
                 print(result_msg[:600])
@@ -1375,27 +1503,15 @@ Use a search mindset: each run should help the sweep learn what works, not just 
                 print("  1. KUBECONFIG is set and points to your cluster")
                 print("  2. kubectl auth can-i delete pods  (must return yes)")
                 print("  3. kubectl get pods  (should reach the cluster)")
-                _write_conversation(run_dir, conversation_turns, sweep_dir)
                 return 1
 
-            # Fix prompt: crash + logs + current config
-            deploy_log = failure_context.get("deploy_log", "")[-4000:]
-            kubectl_logs = failure_context.get("kubectl_logs", "")[-6000:]
             vllm_cur = (experiment_dir / "vllm-qwen.yaml").read_text()
-            makefile_cur = (experiment_dir / "Makefile").read_text()
-            prompt = f"""Attempt {attempt} FAILED. Diagnose whether this is actually a config problem before changing anything.
+            user_prompt = f"""Attempt {attempt} FAILED: {result_msg}
 
-**Failure:** {result_msg}
-
-**deploy.log (last 4k):**
-```
-{deploy_log}
-```
-
-**kubectl logs (last 6k):**
-```
-{kubectl_logs}
-```
+The run directory is '{run_dir.name}'. Use tools to investigate:
+- read_logs('{run_dir.name}', 'deploy') for deploy.log
+- read_logs('{run_dir.name}', 'kubectl') for kubectl logs
+- kubectl_get('pods') to check pod status
 
 **Failed vllm-qwen.yaml:**
 ```yaml
@@ -1403,124 +1519,74 @@ Use a search mindset: each run should help the sweep learn what works, not just 
 ```
 
 **Fix rules:**
-- Base your diagnosis on the provided logs and benchmark behavior, not generic vLLM heuristics.
-- If the evidence suggests this is a harness/watchdog issue rather than a serving/config issue (for example, many successful `POST /v1/chat/completions` lines), you may respond with `NO_CONFIG_CHANGE: <reason>` and do not return YAML.
-- Otherwise, keep the fix minimal and targeted.
-- Change exactly one knob unless the YAML is invalid or multiple settings are inseparable.
-- Preserve all other args/env/image/resources lines byte-for-byte.
-- First consider reverting the most recent knob change before inventing a new hypothesis.
-- Keep Pod kind, name=vllm-qwen. Image must stay vllm/vllm-openai:nightly.
-- Do NOT change the container entrypoint. No `command:` field. Use `args:` with `--model` as a flag.
-- Do NOT use `--disable-log-requests` (does not exist). Use `--disable-log-stats` instead.
-- If --kv-cache-dtype fp8 fails, set --dtype bfloat16.
-- Do NOT introduce `VLLM_ATTENTION_BACKEND` if it is absent. Do NOT introduce `--performance-mode`.
+- Diagnose using the tools, not assumptions. Check logs before changing config.
+- If the evidence shows a harness/watchdog issue (not a config problem), say NO_CONFIG_CHANGE: <reason>.
+- Otherwise fix minimally: one knob change, revert the last change first.
+- Keep Pod kind, name=vllm-qwen. Image: vllm/vllm-openai:nightly.
+- No `command:` field. Use `args:` with `--model` as a flag.
+- No `--disable-log-requests` (doesn't exist). No `VLLM_ATTENTION_BACKEND` if absent.
 
-If you are changing config, start with this exact structure before the YAML:
-- `Experiment type: single-change` or `Experiment type: bundle`
-- `Evidence:` with 1-3 bullets grounded in the logs
-- `Changed knobs:` with one bullet per changed knob in the form `knob: old -> new`
-- `Why:` with 1-2 short bullets
-
-If you return YAML, it must be the complete corrected config in a ```yaml block```."""
-            current_prompt = prompt
-            print(f"Retry {attempt + 1}/{max_attempts}: asking agent to fix crash...")
+When ready, call write_file('vllm-qwen.yaml', <complete fixed YAML>)."""
+            print(f"Retry {attempt + 1}/{max_attempts}: agent investigating failure with tools...")
         else:
-            current_prompt = prompt
+            user_prompt = prompt
 
         _write_progress("llm_call", {"experiment_dir": str(experiment_dir), "attempt": attempt + 1})
-        max_file_rounds = 3 if attempt == 0 else 1  # Allow REQUEST_FILE only on first attempt
-        call_prompt = current_prompt
-        response = ""
-        req_path = ""
-        file_content = ""
-        for round_num in range(max_file_rounds + 1):
-            if round_num > 0:
-                call_prompt = f"{call_prompt}\n\n**File you requested ({req_path}):**\n```\n{file_content}\n```\n\nNow provide your YAML suggestion (modified vllm-qwen.yaml and optionally Makefile), or `NO_CONFIG_CHANGE: <reason>` if the evidence shows the config should stay the same."
-            print(f"Calling {provider} ({model})..." + (f" [round {round_num + 1}, after file read]" if round_num > 0 else "") + (f" (attempt {attempt + 1}/{max_attempts})" if attempt > 0 else ""))
-            try:
-                response = call_fn(call_prompt)
-            except Exception as e:
-                print(f"LLM error: {e}")
-                conversation_turns.append((call_prompt, f"[LLM error: {e}]"))
-                _write_conversation(run_dir, conversation_turns, sweep_dir)
-                _append_result(experiment_dir, f"LLM error: {e}", "", results_path=results_txt)
-                return 1
-            conversation_turns.append((call_prompt, response))
-            _write_conversation(run_dir, conversation_turns, sweep_dir)
-            req_match = re.search(r"REQUEST_FILE:\s*([^\s\n]+)", response)
-            if not req_match or round_num >= max_file_rounds:
-                break
-            req_path = req_match.group(1).strip()
-            fp = (PROJECT_ROOT / req_path).resolve()
-            if not str(fp).startswith(str(PROJECT_ROOT.resolve())):
-                response = response.replace(req_match.group(0), f"[Path {req_path} denied: outside project]")
-                break
-            try:
-                rel = str(fp.relative_to(PROJECT_ROOT))
-            except ValueError:
-                response = response.replace(req_match.group(0), "[Path outside project]")
-                break
-            if not rel.startswith("results"):
-                response = response.replace(req_match.group(0), "[Path must be under results/]")
-                break
-            if not fp.exists():
-                response = response.replace(req_match.group(0), f"[File not found: {req_path}]")
-                break
-            if fp.is_dir():
-                try:
-                    children = list(fp.iterdir())
-                    file_content = "Directory contents:\n" + "\n".join(f.name for f in sorted(children)[:50])
-                    if len(children) > 50:
-                        file_content += "\n... (and more)"
-                except Exception:
-                    file_content = "(read error)"
+        print(f"Calling {provider} ({model})..." + (f" (attempt {attempt + 1}/{max_attempts})" if attempt > 0 else ""))
+
+        # Set up tool context
+        tool_env = os.environ.copy()
+        tool_env["KUBECONFIG"] = os.environ.get("KUBECONFIG", "")
+        ctx = ToolContext(
+            project_root=PROJECT_ROOT,
+            experiment_dir=experiment_dir,
+            run_dir=run_dir,
+            sweep_dir=sweep_dir,
+            sweep=sweep or None,
+            benchmark=benchmark,
+            ts=ts,
+            env=tool_env,
+            deploy_and_benchmark=_deploy_and_benchmark,
+        )
+
+        try:
+            agent_result = run_agent(TOOL_SYSTEM_PROMPT, user_prompt, provider, model, ctx, max_turns=AGENT_MAX_TURNS)
+        except Exception as e:
+            print(f"Agent error: {e}")
+            _append_result(experiment_dir, f"Agent error: {e}", "", results_path=results_txt)
+            return 1
+
+        _write_agent_result_log(run_dir, agent_result, sweep_dir)
+
+        if agent_result.error:
+            print(f"Agent loop error: {agent_result.error}")
+            _append_result(experiment_dir, agent_result.error, "", results_path=results_txt)
+            return 1
+
+        # Determine config content: prefer tool-written config, fall back to YAML extraction
+        yaml_content = None
+        no_config_change_reason = None
+
+        if agent_result.config_written:
+            yaml_content = agent_result.config_content
+            description = agent_result.description or _extract_description(agent_result.text)
+        else:
+            no_config_change_reason = _extract_no_config_change_reason(agent_result.text)
+            yaml_content = _extract_yaml(agent_result.text)
+            if no_config_change_reason and not yaml_content:
+                yaml_content = (experiment_dir / "vllm-qwen.yaml").read_text()
+                description = f"No config change: {no_config_change_reason}"
+            elif yaml_content:
+                description = agent_result.description or _extract_description(agent_result.text)
             else:
-                try:
-                    raw = fp.read_text(errors="replace")
-                    file_content = raw[:50000] + ("\n... (truncated)" if len(raw) > 50000 else "")
-                except Exception as e:
-                    file_content = f"(read error: {e})"
-            print(f"Read {req_path} ({len(file_content)} chars)")
-
-        no_config_change_reason = _extract_no_config_change_reason(response)
-        yaml_content = _extract_yaml(response)
-        if no_config_change_reason and not yaml_content:
-            yaml_content = (experiment_dir / "vllm-qwen.yaml").read_text()
-        if not yaml_content:
-            # Retry once: agent may have returned prose instead of YAML block
-            retry_prompt = f"""Your previous response did not include a valid result. You must either:
-1. return `NO_CONFIG_CHANGE: <reason>` if the logs show the config should stay the same, or
-2. return the complete Kubernetes Pod YAML in a ```yaml block```.
-
-**Failure we're fixing:** {(failure_context or {}).get("result", "unknown")[:300]}
-
-**Current config (return this or a fixed version in ```yaml ... ```):**
-```yaml
-{(experiment_dir / "vllm-qwen.yaml").read_text()[:2000]}
-```
-
-Return either `NO_CONFIG_CHANGE: <reason>` or the fixed vllm-qwen.yaml in a ```yaml block```. If you didn't change it, return it unchanged."""
-            print("Could not extract YAML—asking agent to retry with explicit format...")
-            try:
-                retry_response = call_fn(retry_prompt)
-                conversation_turns.append((retry_prompt, retry_response))
-                no_config_change_reason = _extract_no_config_change_reason(retry_response)
-                yaml_content = _extract_yaml(retry_response)
-                if no_config_change_reason and not yaml_content:
-                    yaml_content = (experiment_dir / "vllm-qwen.yaml").read_text()
-            except Exception as e:
-                print(f"Retry failed: {e}")
-            if not yaml_content:
-                description = _extract_description(response)
-                err = "Could not extract YAML from agent response (after retry)"
+                description = _extract_description(agent_result.text)
+                err = "Could not extract YAML from agent response"
                 print(err)
-                _write_conversation(run_dir, conversation_turns, sweep_dir)
                 _append_result(experiment_dir, description, err, results_path=results_txt)
                 return 1
-            response = retry_response  # use for description extraction
 
-        # Validate: if model changes not allowed, revert any model change in the YAML
-        if not allow_model_change:
+        # Validate: revert unauthorized model changes
+        if not allow_model_change and yaml_content:
             baseline_model_m = re.search(r'"--model"\s*\n\s*-\s*"([^"]+)"', vllm_content)
             proposed_model_m = re.search(r'"--model"\s*\n\s*-\s*"([^"]+)"', yaml_content)
             if baseline_model_m and proposed_model_m:
@@ -1530,19 +1596,14 @@ Return either `NO_CONFIG_CHANGE: <reason>` or the fixed vllm-qwen.yaml in a ```y
                     print(f"Agent tried to change model to {proposed_model} — reverting to {baseline_model}")
                     yaml_content = yaml_content.replace(proposed_model, baseline_model)
 
-        # Ask agent for a concise summary (for terminal/metadata); fallback to parsed description
-        if no_config_change_reason:
-            description = f"No config change: {no_config_change_reason}"
-        else:
-            summary = _ask_agent_summary(response, call_fn)
-            description = summary if summary else _extract_description(response)
         last_description = description
 
-        makefile_content_new = _extract_makefile(response) or (makefile_content if attempt == 0 else (experiment_dir / "Makefile").read_text())
-        (experiment_dir / "vllm-qwen.yaml").write_text(yaml_content)
-        (experiment_dir / "Makefile").write_text(makefile_content_new)
+        if not agent_result.config_written:
+            (experiment_dir / "vllm-qwen.yaml").write_text(yaml_content)
+            shutil.copy(experiment_dir / "vllm-qwen.yaml", run_dir / "vllm_config.yaml")
+            makefile_new = _extract_makefile(agent_result.text) or (experiment_dir / "Makefile").read_text()
+            (experiment_dir / "Makefile").write_text(makefile_new)
 
-        shutil.copy(experiment_dir / "vllm-qwen.yaml", run_dir / "vllm_config.yaml")
         (run_dir / "run_metadata.json").write_text(json.dumps({
             "timestamp": ts,
             "description": description[:500],
@@ -1550,6 +1611,7 @@ Return either `NO_CONFIG_CHANGE: <reason>` or the fixed vllm-qwen.yaml in a ```y
             "benchmark": benchmark,
             "sweep": sweep or None,
             "attempt": attempt + 1,
+            "tools_used": len(agent_result.tool_log),
         }, indent=2))
 
         print(f"Run dir: {run_dir} (modified runllm in run_dir/runllm/)")
@@ -1561,15 +1623,30 @@ Return either `NO_CONFIG_CHANGE: <reason>` or the fixed vllm-qwen.yaml in a ```y
         print(description)
         print()
         print(f"Attempt {attempt + 1}/{max_attempts}  |  Benchmark: {benchmark}" + (" (from sweep)" if sweep_dir else ""))
+        if agent_result.tool_log:
+            print(f"Tools used: {len(agent_result.tool_log)} calls")
         print("━" * 60)
         print()
-        print("Deploying and running benchmark...")
 
-        success, result = _deploy_and_benchmark(experiment_dir, benchmark, run_dir, ts, sweep=sweep or None)
+        # If agent already ran benchmark via tool, use those results
+        if agent_result.benchmark_ran:
+            success = agent_result.benchmark_success
+            result = agent_result.benchmark_result
+        else:
+            print("Deploying and running benchmark...")
+            success, result = _deploy_and_benchmark(experiment_dir, benchmark, run_dir, ts, sweep=sweep or None)
+
         _append_result(experiment_dir, description, result, success=success, run_dir=run_dir, results_path=results_txt)
 
+        # Write a short retro for every run (success or failure)
+        _write_run_retro(
+            run_dir=run_dir, experiment_dir=experiment_dir, description=description,
+            result=result, success=success, attempt=attempt + 1, max_attempts=max_attempts,
+            provider=provider, model=model, sweep_dir=sweep_dir, sweep=sweep,
+            benchmark=benchmark, ts=ts, call_fn=call_fn,
+        )
+
         if success:
-            _write_conversation(run_dir, conversation_turns, sweep_dir)
             if sweep_dir:
                 from sweep_utils import update_best_runllm
                 update_best_runllm(sweep_dir, RUNLLM)
@@ -1578,67 +1655,21 @@ Return either `NO_CONFIG_CHANGE: <reason>` or the fixed vllm-qwen.yaml in a ```y
             return 0
 
         # Gather failure context for retry
-        deploy_log = ""
-        kubectl_logs = ""
-        if (run_dir / "deploy.log").exists():
-            deploy_log = (run_dir / "deploy.log").read_text(errors="replace")
-        if (run_dir / "kubectl_logs.txt").exists():
-            kubectl_logs = (run_dir / "kubectl_logs.txt").read_text(errors="replace")
-        failure_context = {"result": result, "deploy_log": deploy_log, "kubectl_logs": kubectl_logs}
+        failure_context = {"result": result}
         print(f"Attempt {attempt + 1} failed: {result[:200]}...")
 
-    # Exhausted retries: ask agent to write retro
-    print("All 10 attempts failed. Asking agent to write retrospective...")
-    retro_prompt = f"""The vLLM optimization run failed after 10 attempts. Write a retrospective for future AI agents to learn from.
-
-**Run directory:** {run_dir}
-**Last description:** {last_description}
-**Final failure:** {failure_context.get("result", "")}
-
-**deploy.log (last 6k):**
-```
-{(failure_context.get("deploy_log", ""))[-6000:]}
-```
-
-**kubectl_logs.txt (last 8k):**
-```
-{(failure_context.get("kubectl_logs", ""))[-8000:]}
-```
-
-**Final vllm-qwen.yaml that was used:**
-```yaml
-{(experiment_dir / "vllm-qwen.yaml").read_text()[:3000]}
-```
-
-Write a RETRO.md document (in markdown) that will be saved to the run directory and shown to future agents. Include:
-1. What went wrong (root cause if identifiable)
-2. What was tried across the 10 attempts
-3. Concrete recommendations for future agents (what to try, what to avoid)
-4. Any vLLM/configuration insights
-
-Return the retrospective in a ```markdown block```."""
-
-    try:
-        retro_response = call_fn(retro_prompt)
-    except Exception as e:
-        retro_response = f"# Retrospective\n\nFailed to generate: {e}"
-    conversation_turns.append((retro_prompt, retro_response))
-    _write_conversation(run_dir, conversation_turns, sweep_dir)
-    retro_content = _extract_code_block(retro_response, "markdown") or retro_response
-    if retro_content:
-        (run_dir / "RETRO.md").write_text(retro_content)
-        print(f"Saved RETRO.md to {run_dir}")
-    _append_result(experiment_dir, last_description, f"Failed after 10 attempts. Retro saved. Last error: {failure_context.get('result', '')}", success=False, run_dir=run_dir, results_path=results_txt)
+    # Exhausted retries
+    _append_result(experiment_dir, last_description, f"Failed after {max_attempts} attempts. Last error: {(failure_context or {}).get('result', '')}", success=False, run_dir=run_dir, results_path=results_txt)
     if sweep_dir:
         if (run_dir / "run_metadata.json").exists():
             try:
                 rm = json.loads((run_dir / "run_metadata.json").read_text())
-                rm["result"] = failure_context.get("result", "")[:500]
+                rm["result"] = (failure_context or {}).get("result", "")[:500]
                 (run_dir / "run_metadata.json").write_text(json.dumps(rm, indent=2))
             except Exception:
                 pass
         _write_leaderboard_to_sweep(sweep_dir)
-    print(f"Results: Failed after 10 attempts. See {run_dir}/RETRO.md")
+    print(f"Results: Failed after {max_attempts} attempts. See {run_dir}/RETRO.md")
     return 1
 
 
@@ -1653,6 +1684,48 @@ def _write_conversation(run_dir: Path, turns: list[tuple[str, str]], sweep_dir: 
     if sweep_dir:
         sweep_log = sweep_dir / "agent.log"
         header = f"\n\n{'#'*70}\n# Run {run_dir.name} ({datetime.now().isoformat()})\n{'#'*70}\n"
+        with open(sweep_log, "a", encoding="utf-8") as f:
+            f.write(header)
+            f.write(content)
+
+
+def _write_agent_result_log(run_dir: Path, agent_result: AgentResult, sweep_dir: Path | None = None) -> None:
+    """Save tool-calling agent conversation and tool log to run_dir."""
+    lines = ["# Agent Tool-Calling Log\n"]
+    for entry in agent_result.conversation:
+        role = entry.get("role", "?")
+        lines.append(f"\n{'='*60}\n{role.upper()}\n{'='*60}\n")
+        if role == "assistant":
+            text = entry.get("content", "")
+            if isinstance(text, list):
+                for block in text:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            lines.append(block.get("text", "")[:4000])
+                        elif block.get("type") == "tool_use":
+                            lines.append(f"[tool_use: {block.get('name')}({block.get('input_keys', [])})]")
+            elif isinstance(text, str):
+                lines.append(text[:4000])
+            if entry.get("tool_calls"):
+                lines.append("[has tool_calls]")
+        elif role in ("tool_results", "tool_result"):
+            content = entry.get("content", entry)
+            lines.append(json.dumps(content, indent=2, default=str)[:2000])
+        else:
+            lines.append(str(entry.get("content", ""))[:4000])
+
+    if agent_result.tool_log:
+        lines.append(f"\n{'='*60}\nTOOL CALL SUMMARY\n{'='*60}\n")
+        for tl in agent_result.tool_log:
+            lines.append(f"  {tl['tool']}() -> {tl['result_length']} chars ({tl['elapsed_s']}s)")
+
+    content = "\n".join(lines)
+    (run_dir / "agent.log").write_text(content, encoding="utf-8")
+    if agent_result.tool_log:
+        (run_dir / "tool_log.json").write_text(json.dumps(agent_result.tool_log, indent=2))
+    if sweep_dir:
+        sweep_log = sweep_dir / "agent.log"
+        header = f"\n\n{'#'*70}\n# Run {run_dir.name} ({datetime.now().isoformat()}) [tool-calling]\n{'#'*70}\n"
         with open(sweep_log, "a", encoding="utf-8") as f:
             f.write(header)
             f.write(content)
@@ -1673,5 +1746,40 @@ def _append_result(experiment_dir: Path, description: str, result: str, success:
         f.write("=" * 60 + "\n")
 
 
+def backfill_short_names():
+    """Generate short names for all existing runs that don't have one."""
+    provider = os.environ.get("AI_PROVIDER", "openai")
+    model = os.environ.get("AI_MODEL", "gpt-4o-mini")
+    call_fn = (lambda p: _call_openai(p, model)) if "openai" in provider else (lambda p: _call_anthropic(p, model))
+
+    count = 0
+    for sweep_dir in sorted(RESULTS_DIR.iterdir()):
+        if not sweep_dir.is_dir() or not sweep_dir.name.startswith("sweep-"):
+            continue
+        for run_dir in sorted(sweep_dir.iterdir()):
+            if not run_dir.is_dir() or run_dir.name.startswith(".") or run_dir.name == "best-runllm":
+                continue
+            if _read_short_name(run_dir):
+                continue
+            meta = {}
+            mf = run_dir / "run_metadata.json"
+            if mf.exists():
+                try:
+                    meta = json.loads(mf.read_text())
+                except Exception:
+                    pass
+            desc = meta.get("description", run_dir.name)
+            result = meta.get("result", "")
+            name = _generate_short_name(desc, result, call_fn)
+            if name:
+                _save_short_name(run_dir, name)
+                count += 1
+                print(f"  {run_dir.name} -> {name}")
+    print(f"Backfilled {count} short names.")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill-names":
+        backfill_short_names()
+    else:
+        sys.exit(main())

@@ -7,6 +7,7 @@
 # Kubeconfig: copy to autollm/kubeconfig OR set KUBECONFIG_SERVER + KUBECONFIG_TOKEN in .env and run `make kubeconfig`
 KUBECONFIG ?= $(CURDIR)/kubeconfig
 export KUBECONFIG
+export EXA_API_KEY
 
 # Generate kubeconfig from .env (KUBECONFIG_SERVER, KUBECONFIG_TOKEN). kubeconfig is gitignored.
 kubeconfig:
@@ -15,7 +16,7 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync bench bench-quick benchmark benchmark-run benchmark-run-quick sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index serve dashboard ai-optimize query kubeconfig ensure-kubeconfig leaderboard sweep-pods
+.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard ai-optimize query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
@@ -79,21 +80,13 @@ results-summary:
 results-index:
 	python3 scripts/benchmark_harness.py --index-only
 
-# Serve dashboard
-serve: results-summary results-index
-	@mkdir -p results
-	@echo "Serving at http://localhost:8765/"
-	python3 scripts/serve_results.py
-
-# Dashboard (reset + serve)
+# Dashboard (Streamlit)
 dashboard:
-	python3 scripts/dashboard_reset.py
-	@mkdir -p results
+	env -u VIRTUAL_ENV uv sync --extra dashboard
 	@echo ""
-	@echo "Dashboard: http://localhost:8765/"
-	@echo "  Start/Stop · Output · Benchmark runs"
+	@echo "Starting dashboard..."
 	@echo ""
-	python3 scripts/serve_results.py
+	env -u VIRTUAL_ENV uv run streamlit run scripts/dashboard.py --server.port 8765
 
 # Start a new sweep: create results/sweep-[name]/, run baseline, save to baseline/
 # Incomplete baselines (no benchmarks.json) are re-run automatically. Add FORCE=1 to overwrite complete baseline.
@@ -140,6 +133,10 @@ experiment: sync ensure-kubeconfig
 # After 3 min, use 'make experiment-inspect KILL=1' to abort if stuck
 experiment-inspect:
 	@env -u VIRTUAL_ENV uv run python scripts/experiment_inspect.py $(if $(KILL),--kill,)
+
+# Backfill short names for runs that don't have one (uses gpt-4o-mini by default)
+backfill-names: sync
+	env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py backfill-names
 
 # AI optimizer (CLI)
 ai-optimize: sync

@@ -7,4 +7,5 @@ dependencies = []
 
 [project.optional-dependencies]
 guidellm = ["guidellm[recommended]>=0.5.3"]
-ai_optimizer = ["anthropic>=0.39", "openai>=1.0"]
+ai_optimizer = ["anthropic>=0.39", "openai>=1.0", "pyyaml>=6.0"]
+dashboard = ["streamlit>=1.35"]

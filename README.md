@@ -50,13 +50,42 @@ make improve SWEEP=qwen-latency RUNS=5 ALLOW_MODEL_CHANGE=1  # 5 runs, allow qua
 ```
 
 Each run:
-1. Shows the agent the current best config + leaderboard
-2. Agent proposes a change (args, env vars, speculative decoding, compilation config, etc.)
-3. Deploys the new config, runs a sample query, benchmarks
-4. If it crashes or stalls, retries up to 10 times with the agent fixing the config or explicitly diagnosing a non-config issue
-5. If all 10 fail, writes a retro for future agents
+1. Shows the agent the current best config + leaderboard + retros from past runs
+2. Agent uses tools (web search, file reading, kubectl, log inspection) to research and propose a change
+3. Agent writes the config via `write_file`, deploys, and benchmarks
+4. If it crashes or stalls, retries up to 10 times with the agent diagnosing via logs/kubectl
+5. After every run (success or failure), the agent writes a `RETRO.md` capturing what changed, what happened, and lessons for future agents
 
 Run `make improve` repeatedly to iterate. The agent always builds on the best config so far.
+
+### Agent tool stack
+
+The agent has access to these tools during each run:
+
+| Tool | Description |
+|------|-------------|
+| `search_web` | Web search via Exa API (falls back to DuckDuckGo) |
+| `fetch_url` | Fetch and extract content from a URL |
+| `read_file` | Read project files (results/, runllm/, docs/, scripts/) |
+| `write_file` | Write `vllm-qwen.yaml` or `Makefile` to the isolated per-run experiment directory only |
+| `list_files` | List files in a project directory |
+| `run_shell` | Run a shell command (read-only, no destructive ops) |
+| `run_benchmark` | Deploy the written config and run the benchmark |
+| `read_logs` | Read deploy, benchmark, or kubectl logs for a run |
+| `kubectl_get` | Run `kubectl get` queries against the cluster |
+| `kubectl_logs` | Fetch pod logs from the cluster |
+
+The tool stack works with both Anthropic and OpenAI APIs. Max tool calls per run defaults to 50 (configurable via `AGENT_MAX_TURNS`).
+
+### Run retros
+
+Every run produces a `RETRO.md` in its run directory. Retros are written by the agent after benchmarking and are designed to be read by future agents. They capture:
+- Exact knob changes and their values
+- Key metrics or the specific error
+- Causal explanation of why the change worked or failed
+- Crashes or errors from any phase (deploy, runtime, benchmark)
+- Research findings discovered during the run (version-specific behavior, undocumented defaults, flag interactions)
+- Non-obvious pitfalls for future experiments
 
 ### What the agent can tune
 
@@ -92,6 +121,7 @@ results/sweep-qwen-latency/
     runllm/                 # modified runllm snapshot
     vllm_config.yaml        # vLLM config used
     benchmarks.json         # benchmark results
+    RETRO.md                # agent-written retrospective (every run)
     agent.log               # agent conversation for this run
     deploy.log, kubectl_logs.txt, run.log, ...
 ```
@@ -124,3 +154,5 @@ results/sweep-qwen-latency/
 | `BENCHMARK` | Preset: `quick`, `sync`, `sweep`, `medium`, `long` |
 | `MAX_REQUESTS` | Override max requests (no limit) |
 | `MAX_SECONDS` | Override max benchmark duration |
+| `EXA_API_KEY` | Exa API key for web search (falls back to DuckDuckGo if unset) |
+| `AGENT_MAX_TURNS` | Max tool calls per agent run (default: 50) |
