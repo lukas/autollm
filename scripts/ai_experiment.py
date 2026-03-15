@@ -1027,6 +1027,26 @@ def _k8s_label_value(value: str) -> str:
     return value[:63] or "default"
 
 
+def _stable_base_pod_name(name: str) -> str:
+    """Strip our run suffix so retries reuse the same canonical base name."""
+    raw = (name or "").strip() or "vllm"
+    stable = re.sub(r"(?:-\d{8})+$", "", raw)
+    return stable or raw
+
+
+def _sample_message_has_output(message: dict) -> bool:
+    """Kimi may answer in reasoning fields even when content is null."""
+    tool_calls = message.get("tool_calls") or []
+    text_fields = [
+        message.get("content"),
+        message.get("reasoning"),
+        message.get("reasoning_content"),
+    ]
+    has_text = any(isinstance(value, str) and bool(value.strip()) for value in text_fields)
+    has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+    return has_text or has_tool_calls
+
+
 def _rewrite_pod_name(yaml_path: Path, new_name: str, sweep: str | None = None) -> None:
     """Rewrite metadata.name and add labels for sweep discovery."""
     text = yaml_path.read_text()
@@ -1078,6 +1098,141 @@ def _fetch_and_check_logs(run_dir: Path, env: dict, logs_file: Path, pod_name: s
     return None
 
 
+def _capture_command_output(run_dir: Path, env: dict, filename: str, cmd: list[str], timeout: int = 30) -> None:
+    """Best-effort capture of pod diagnostics before cleanup deletes the pod."""
+    out_path = run_dir / filename
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        text = [
+            f"command={' '.join(cmd)}",
+            f"returncode={r.returncode}",
+            "",
+            r.stdout or "",
+            "",
+            "STDERR:",
+            r.stderr or "",
+        ]
+    except Exception as exc:
+        text = [f"command={' '.join(cmd)}", f"error={exc}"]
+    out_path.write_text("\n".join(text))
+
+
+def _capture_pod_debug(run_dir: Path, env: dict, pod_name: str) -> None:
+    """Persist enough state to diagnose pod_wait/health_check failures after cleanup."""
+    commands = [
+        ("pod_get.json", ["kubectl", "get", "pod", pod_name, "-o", "json"]),
+        ("pod_describe.txt", ["kubectl", "describe", "pod", pod_name]),
+        (
+            "pod_events.txt",
+            [
+                "kubectl",
+                "get",
+                "events",
+                "--sort-by=.lastTimestamp",
+                "--field-selector",
+                f"involvedObject.name={pod_name}",
+            ],
+        ),
+        ("pod_logs_current.txt", ["kubectl", "logs", pod_name, "--all-containers=true", "--tail=400"]),
+        (
+            "pod_logs_previous.txt",
+            ["kubectl", "logs", pod_name, "--all-containers=true", "--previous", "--tail=400"],
+        ),
+    ]
+    for filename, cmd in commands:
+        _capture_command_output(run_dir, env, filename, cmd)
+
+
+def _summarize_pod_state(pod_doc: dict) -> tuple[str, str | None]:
+    """Return a concise pod status string plus any fatal lifecycle error."""
+    status = pod_doc.get("status") or {}
+    phase = str(status.get("phase") or "Unknown")
+    summary_parts = [f"phase={phase}"]
+    fatal_error: str | None = None
+
+    pod_reason = str(status.get("reason") or "").strip()
+    if pod_reason:
+        summary_parts.append(f"reason={pod_reason}")
+    if phase == "Failed" and not fatal_error:
+        fatal_error = f"Pod entered Failed phase ({pod_reason or 'no reason reported'})"
+
+    for cond in status.get("conditions") or []:
+        cond_type = str(cond.get("type") or "")
+        cond_status = str(cond.get("status") or "")
+        cond_reason = str(cond.get("reason") or "").strip()
+        if cond_type:
+            label = f"{cond_type}={cond_status}"
+            if cond_reason:
+                label += f":{cond_reason}"
+            summary_parts.append(label)
+        if cond_type == "PodScheduled" and cond_status == "False" and cond_reason == "Unschedulable" and not fatal_error:
+            message = str(cond.get("message") or "").strip()
+            fatal_error = f"Pod unschedulable: {message[:300] or cond_reason}"
+
+    fatal_waiting_reasons = {
+        "CrashLoopBackOff",
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "ErrImagePull",
+        "ImageInspectError",
+        "ImagePullBackOff",
+        "InvalidImageName",
+        "RunContainerError",
+    }
+    for container in status.get("containerStatuses") or []:
+        name = str(container.get("name") or "container")
+        state = container.get("state") or {}
+        waiting = state.get("waiting")
+        running = state.get("running")
+        terminated = state.get("terminated")
+        if isinstance(waiting, dict):
+            reason = str(waiting.get("reason") or "Waiting")
+            summary_parts.append(f"{name}=waiting:{reason}")
+            if reason in fatal_waiting_reasons and not fatal_error:
+                message = str(waiting.get("message") or "").strip()
+                fatal_error = f"Container {name} waiting: {reason}: {message[:300] or reason}"
+        elif isinstance(running, dict):
+            summary_parts.append(f"{name}=running")
+        elif isinstance(terminated, dict):
+            exit_code = terminated.get("exitCode")
+            reason = str(terminated.get("reason") or "Terminated")
+            summary_parts.append(f"{name}=terminated:{reason}:{exit_code}")
+            if exit_code not in (None, 0) and not fatal_error:
+                fatal_error = f"Container {name} terminated with exit code {exit_code} ({reason})"
+
+    return " | ".join(summary_parts), fatal_error
+
+
+def _capture_pod_status(run_dir: Path, env: dict, pod_name: str, status_file: Path) -> tuple[str | None, str | None]:
+    """Snapshot current pod status so pod_wait can track lifecycle progress without logs."""
+    try:
+        r = subprocess.run(
+            ["kubectl", "get", "pod", pod_name, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+    except Exception:
+        return None, None
+    if r.returncode != 0:
+        return None, None
+    try:
+        pod_doc = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return None, None
+    summary, fatal_error = _summarize_pod_state(pod_doc)
+    snapshot = {
+        "timestamp": datetime.now().isoformat(),
+        "pod_name": pod_name,
+        "summary": summary,
+        "phase": ((pod_doc.get("status") or {}).get("phase") or "Unknown"),
+    }
+    with open(status_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(snapshot) + "\n")
+    return summary, fatal_error
+
+
 def _deploy_and_benchmark(
     experiment_dir: Path, benchmark: str, run_dir: Path, ts: str, sweep: str | None = None
 ) -> tuple[bool, str]:
@@ -1091,6 +1246,7 @@ def _deploy_and_benchmark(
     env["KUBECONFIG"] = os.environ.get("KUBECONFIG", "")
     logs_proc = None
     profiler: VLLMProfiler | None = None
+    diagnostics_captured = False
 
     # Unique pod name for parallel runs
     short_id = ts.replace("_", "")[-8:]
@@ -1100,6 +1256,7 @@ def _deploy_and_benchmark(
         base_pod = _doc.get("metadata", {}).get("name", "vllm") or "vllm"
     except Exception:
         pass
+    base_pod = _stable_base_pod_name(base_pod)
     pod_name = f"{base_pod}-{short_id}"
     _rewrite_pod_name(vllm_yaml, pod_name, sweep=sweep)
     _log_run(run_dir, f"Pod: {pod_name}")
@@ -1121,6 +1278,7 @@ def _deploy_and_benchmark(
                 f.write("STDERR: " + r.stderr[:1000] + "\n")
 
     def _cleanup(msg: str | None = None) -> tuple[bool, str] | None:
+        nonlocal diagnostics_captured
         nonlocal profiler
         if profiler is not None:
             try:
@@ -1138,6 +1296,12 @@ def _deploy_and_benchmark(
                 logs_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logs_proc.kill()
+        if msg and not diagnostics_captured:
+            try:
+                _capture_pod_debug(run_dir, env, pod_name)
+            except Exception:
+                pass
+            diagnostics_captured = True
         try:
             subprocess.run(
                 ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true"],
@@ -1190,11 +1354,14 @@ def _deploy_and_benchmark(
 
     kubectl_logs_file = run_dir / "kubectl_logs.txt"
     kubectl_logs_file.write_text(f"--- logs started {datetime.now().isoformat()} ---\n")
+    pod_status_file = run_dir / "pod_status.jsonl"
+    pod_status_file.write_text("")
 
     _write_progress("pod_wait", {})
     _log_run(run_dir, "Waiting for pod Ready...")
     last_pod_activity = time.time()
     prev_pod_log_size = 0
+    prev_pod_summary: str | None = None
     for _ in range(20):
         if m := _check_abort(
             start,
@@ -1209,6 +1376,14 @@ def _deploy_and_benchmark(
         if cur_pod_log_size > prev_pod_log_size:
             last_pod_activity = time.time()
             prev_pod_log_size = cur_pod_log_size
+        pod_summary, pod_error = _capture_pod_status(run_dir, env, pod_name, pod_status_file)
+        if pod_summary:
+            last_pod_activity = time.time()
+            if pod_summary != prev_pod_summary:
+                prev_pod_summary = pod_summary
+                _log_run(run_dir, f"Pod status: {pod_summary}")
+        if pod_error:
+            return _cleanup(f"Pod startup error (pod_wait): {pod_error}")
         r = subprocess.run(
             ["kubectl", "wait", "--for=condition=Ready", f"pod/{pod_name}", "--timeout=30s"],
             capture_output=True, text=True, env=env,
@@ -1282,13 +1457,7 @@ def _deploy_and_benchmark(
     try:
         data = json.loads(r.stdout or "{}")
         message = (data.get("choices") or [{}])[0].get("message", {}) or {}
-        content = message.get("content")
-        reasoning = message.get("reasoning")
-        tool_calls = message.get("tool_calls") or []
-        has_text = isinstance(content, str) and bool(content.strip())
-        has_reasoning = isinstance(reasoning, str) and bool(reasoning.strip())
-        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
-        if not (has_text or has_reasoning or has_tool_calls):
+        if not _sample_message_has_output(message):
             _cleanup()
             return False, "Sample query returned empty or invalid response"
     except json.JSONDecodeError:
@@ -1603,6 +1772,8 @@ def main() -> int:
     vllm_content = _vllm_cfg.read_text()
     current_backend = infer_backend(vllm_content, makefile_content)
     backend_templates = _load_backend_templates(RUNLLM, model_variants)
+    if backend_from_model_dir(model_dir) != "vllm":
+        backend_templates = [t for t in backend_templates if t["backend"] == current_backend]
     backend_templates_section = _render_backend_templates_section(backend_templates)
     # Ensure experiment_dir always uses the new name
     (experiment_dir / "vllm-config.yaml").write_text(vllm_content)

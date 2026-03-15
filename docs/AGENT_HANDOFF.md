@@ -112,8 +112,9 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 ### Deploy Watchdog (Activity-Aware Timeout)
 
 The health check watchdog in `ai_experiment.py` uses an activity-aware strategy instead of a flat timer:
-- **`INSPECT_AFTER_SEC` (180s default):** If no new kubectl log output appears for this long during deploy/health phases, the run is aborted. Env var: `EXPERIMENT_INSPECT_AFTER_SEC`.
+- **`INSPECT_AFTER_SEC` (180s default):** If no new deploy activity appears for this long during deploy/health phases, the run is aborted. Env var: `EXPERIMENT_INSPECT_AFTER_SEC`.
 - **`DEPLOY_HARD_TIMEOUT` (600s default):** Absolute ceiling for deploy+health phases regardless of log activity. Env var: `EXPERIMENT_DEPLOY_HARD_TIMEOUT`.
+- During `pod_wait`, the watchdog now also snapshots `kubectl get pod -o json` into `pod_status.jsonl`, treats observed pod lifecycle/status polling as activity, and surfaces fatal states like `Unschedulable`, `ImagePullBackOff`, or terminated containers before cleanup.
 - During `health_check`, the watchdog tracks kubectl log file size. As long as vLLM is actively writing logs (loading weights, CUDA graph capture, fp8 scale calibration), the timeout keeps sliding forward. Only aborts when logs go stale.
 - This allows large models (Qwen3-235B) and slow startup configs (fp8 KV cache calibration) to complete startup without hitting the watchdog, while still catching truly stuck deployments.
 - `ai_experiment.py` now uses a config-aware hard timeout: Kimi-K2.5 gets 1800s by default because the HF safetensors fallback path can spend ~500s in weight loading before health becomes ready.
@@ -134,10 +135,12 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 ### Pod Management
 
-- Improve runs use unique pod names like `<base-pod-name>-<timestamp_suffix>` (base name is read from the YAML `metadata.name`).
+- Improve runs use unique pod names like `<base-pod-name>-<timestamp_suffix>`.
+- The deploy helper strips any trailing prior run suffixes before appending the current one, so internal retries for the same run do not create names like `...-15173225-15173225`.
 - Pods are labeled for sweep discovery:
   - `autollm-managed: "true"`
   - `autollm-sweep: "<sweep-name>"`
+- On failed deploy/health/sample-query attempts, the harness captures `pod_get.json`, `pod_describe.txt`, `pod_events.txt`, and current/previous pod logs before deleting the pod.
 - Pod cleanup happens on success, failure, and normal signal exit.
 - `make sweep-pods` depends on those labels.
 
@@ -195,7 +198,10 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
    The Kimi fallback path currently uses standard HF safetensors loading instead of tensorizer. On 8xH200, weight loading alone can take ~500s before post-load init / health readiness, so `ai_experiment.py` often aborts in `health_check` at ~601s even though logs are still advancing and the server would come up shortly after. Baseline succeeded only after increasing the separate `benchmark_harness.py` health timeout; improve runs still use the 600s `DEPLOY_HARD_TIMEOUT` unless overridden.
 
 8. **Kimi sample queries can be reasoning-only.**
-   Kimi-K2.5 may return `content: null` with non-empty `reasoning` on short chat completions. Treat that as a valid sample-query success in harness code; otherwise improve runs can redeploy forever even though the server is healthy.
+   Kimi-K2.5 may return `content: null` with non-empty `reasoning` or `reasoning_content` on short chat completions. Treat those as valid sample-query success in harness code; otherwise improve runs can redeploy forever even though the server is healthy.
+
+9. **Backend-variant sweeps should keep their backend fixed unless you intentionally want backend swaps.**
+   If a sweep starts from an explicit backend variant like `kimi-sglang`, `ai_experiment.py` now filters the prompt's canonical templates down to that backend so an "SGLang sweep" does not silently benchmark a vLLM retry.
 
 ---
 
