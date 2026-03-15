@@ -3,7 +3,7 @@
 Agent tool-calling framework for the vLLM optimizer.
 
 Defines tools, executes them, and runs an agentic loop that works
-with both Anthropic Messages API and OpenAI Chat Completions API.
+with both Anthropic Messages API and OpenAI Responses API.
 """
 from __future__ import annotations
 
@@ -687,15 +687,13 @@ def _tools_for_anthropic() -> list[dict[str, Any]]:
 
 
 def _tools_for_openai() -> list[dict[str, Any]]:
-    """Convert common tool defs to OpenAI Chat Completions API format."""
+    """Convert common tool defs to OpenAI Responses API format."""
     return [
         {
             "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["parameters"],
-            },
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["parameters"],
         }
         for t in TOOL_DEFS
     ]
@@ -772,6 +770,51 @@ def _serialize_anthropic_content(content: list) -> list[dict]:
 
 # ── OpenAI Agent Loop ───────────────────────────────────────────────────────
 
+def _serialize_openai_response_output(output: list[Any]) -> list[dict[str, Any]]:
+    """Serialize Responses API output items for conversation logging."""
+    out: list[dict[str, Any]] = []
+    for item in output or []:
+        item_type = getattr(item, "type", "")
+        if item_type == "function_call":
+            raw_arguments = getattr(item, "arguments", "") or ""
+            try:
+                parsed_input = json.loads(raw_arguments) if raw_arguments else {}
+            except json.JSONDecodeError:
+                parsed_input = {"_raw": raw_arguments}
+            out.append({"type": "tool_use", "name": getattr(item, "name", ""), "input": parsed_input})
+            continue
+        if item_type == "message":
+            for content in getattr(item, "content", []) or []:
+                if getattr(content, "type", "") == "output_text":
+                    out.append({"type": "text", "text": getattr(content, "text", "")})
+    return out
+
+
+def _extract_openai_response_text(resp: Any) -> str:
+    """Extract assistant text from a Responses API response."""
+    output_text = getattr(resp, "output_text", "") or ""
+    if output_text:
+        return output_text
+    parts: list[str] = []
+    for item in getattr(resp, "output", []) or []:
+        if getattr(item, "type", "") != "message":
+            continue
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", "") == "output_text":
+                text = getattr(content, "text", "") or ""
+                if text:
+                    parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _extract_openai_function_calls(resp: Any) -> list[Any]:
+    """Extract function_call items from a Responses API response."""
+    return [
+        item for item in (getattr(resp, "output", []) or [])
+        if getattr(item, "type", "") == "function_call"
+    ]
+
+
 def _run_openai_loop(
     system: str, messages: list[dict], model: str, ctx: ToolContext, max_turns: int,
 ) -> AgentResult:
@@ -780,31 +823,32 @@ def _run_openai_loop(
     client = OpenAI()
     tools = _tools_for_openai()
     conversation: list[dict[str, Any]] = []
-
-    oai_messages = [{"role": "system", "content": system}] + messages
+    input_items: list[Any] = list(messages)
 
     for turn in range(max_turns):
         print(f"  [agent] OpenAI call (turn {turn + 1}/{max_turns})...")
-        kwargs = {"model": model, "messages": oai_messages, "tools": tools}
-        if model.lower().startswith("gpt-5"):
-            kwargs["max_completion_tokens"] = 8192
-        else:
-            kwargs["max_tokens"] = 8192
-        resp = client.chat.completions.create(**kwargs)
-        choice = resp.choices[0]
-        assistant_msg = choice.message
+        resp = client.responses.create(
+            model=model,
+            instructions=system,
+            input=input_items,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            max_output_tokens=8192,
+        )
 
-        oai_messages.append(_openai_message_to_dict(assistant_msg))
-        tc_summary = None
-        if assistant_msg.tool_calls:
-            tc_summary = [{"name": tc.function.name, "arguments": tc.function.arguments} for tc in assistant_msg.tool_calls]
-        asst_entry = {"role": "assistant", "content": assistant_msg.content or "", "tool_calls": tc_summary}
+        input_items.extend(getattr(resp, "output", []) or [])
+        asst_entry = {
+            "role": "assistant",
+            "content": _serialize_openai_response_output(getattr(resp, "output", []) or []),
+        }
         conversation.append(asst_entry)
         _flush_log_entry(ctx, asst_entry)
 
-        if choice.finish_reason != "tool_calls" or not assistant_msg.tool_calls:
+        tool_calls = _extract_openai_function_calls(resp)
+        if not tool_calls:
             return AgentResult(
-                text=assistant_msg.content or "",
+                text=_extract_openai_response_text(resp),
                 config_written=ctx.config_written,
                 config_content=ctx.config_content,
                 benchmark_ran=ctx.benchmark_ran,
@@ -814,40 +858,23 @@ def _run_openai_loop(
                 tool_log=ctx.tool_log,
             )
 
-        for tc in assistant_msg.tool_calls:
+        for tc in tool_calls:
             try:
-                args = json.loads(tc.function.arguments)
+                args = json.loads(getattr(tc, "arguments", "") or "{}")
             except json.JSONDecodeError:
-                args = {"_raw": tc.function.arguments}
+                args = {"_raw": getattr(tc, "arguments", "")}
 
-            result_str = execute_tool(tc.function.name, args, ctx)
-            oai_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_str,
+            result_str = execute_tool(getattr(tc, "name", ""), args, ctx)
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": getattr(tc, "call_id", ""),
+                "output": result_str,
             })
-            tool_entry = {"role": "tool_result", "tool": tc.function.name, "tool_content": result_str}
+            tool_entry = {"role": "tool_result", "tool": getattr(tc, "name", ""), "tool_content": result_str}
             conversation.append(tool_entry)
             _flush_log_entry(ctx, tool_entry)
 
     return AgentResult(error="Max tool-calling turns reached", conversation=conversation, tool_log=ctx.tool_log)
-
-
-def _openai_message_to_dict(msg: Any) -> dict:
-    """Convert an OpenAI ChatCompletionMessage to a serializable dict."""
-    d: dict[str, Any] = {"role": msg.role}
-    if msg.content:
-        d["content"] = msg.content
-    if msg.tool_calls:
-        d["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            }
-            for tc in msg.tool_calls
-        ]
-    return d
 
 
 # ── Public API ───────────────────────────────────────────────────────────────

@@ -178,7 +178,12 @@ while true; do
     echo \"══════════════════════════════════════════\"
     echo \"  Improvement run \$i/\$target\"
     echo \"══════════════════════════════════════════\"
-    env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep \"${sweep}\" ${improve_flags}|| true
+    rc=0
+    env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep \"${sweep}\" ${improve_flags} || rc=\$?
+    if [ \"\$rc\" -eq 40 ]; then
+        echo \"Sweep stop policy triggered; stopping remote improve loop.\"
+        break
+    fi
 done
 "
 
@@ -267,7 +272,12 @@ while true; do
     echo \"══════════════════════════════════════════\"
     echo \"  Improvement run \$i/\$target\"
     echo \"══════════════════════════════════════════\"
-    env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep \"${sweep}\" ${improve_flags}|| true
+    rc=0
+    env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep \"${sweep}\" ${improve_flags} || rc=\$?
+    if [ \"\$rc\" -eq 40 ]; then
+        echo \"Sweep stop policy triggered; stopping remote improve loop.\"
+        break
+    fi
 done
 "
 

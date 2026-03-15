@@ -59,8 +59,13 @@ Each run:
 1. Shows the agent the current best config + leaderboard + retros from past runs
 2. Agent uses tools (web search, file reading, kubectl, log inspection) to research and propose a change
 3. Agent writes the config via `write_file`, deploys, and benchmarks
-4. If it crashes or stalls, retries up to 10 times with the agent diagnosing via logs/kubectl
+4. If it crashes or stalls, retries up to 3 times with the agent diagnosing via logs/kubectl
 5. After every run (success or failure), the agent writes a `RETRO.md` capturing what changed, what happened, and lessons for future agents
+
+Sweep safety rails:
+- The sweep stops automatically after 10 failed runs in a row.
+- The sweep also stops after 2 consecutive failures classified as unfixable, such as provider/tool credit exhaustion, auth failures, Exa quota failures, or repeated timeout failures.
+- Each sweep directory maintains an `OVERVIEW.md` with the started time, benchmark/data config, agent provider/model, tracked `runllm/` directories, current run counts, and failure-streak status.
 
 Run `make improve` repeatedly to iterate. The agent always builds on the best config so far.
 
@@ -120,6 +125,7 @@ Every run produces a `RETRO.md` in its run directory. Retros are written by the 
 ```
 results/sweep-qwen-latency/
   sweep_metadata.json      # benchmark preset, created_at
+  OVERVIEW.md              # sweep summary: workload, agent model, runllm variants, streak status
   baseline/                # baseline run
   leaderboard.txt          # ranked runs + failed strategies
   best-runllm -> .../runllm  # symlink to best config's runllm
@@ -196,3 +202,5 @@ The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccou
 | `MAX_SECONDS` | Override max benchmark duration |
 | `EXA_API_KEY` | Exa API key for web search (falls back to DuckDuckGo if unset) |
 | `AGENT_MAX_TURNS` | Max tool calls per agent run (default: 50) |
+| `SWEEP_MAX_CONSECUTIVE_FAILURES` | Stop a sweep after this many failed runs in a row (default: 10) |
+| `SWEEP_MAX_CONSECUTIVE_UNFIXABLE_FAILURES` | Stop a sweep after this many unfixable failures in a row (default: 2) |

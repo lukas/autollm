@@ -104,7 +104,12 @@ improve: sync ensure-kubeconfig
 		echo ""; echo "══════════════════════════════════════════"; \
 		echo "  Improvement run $$i/$(RUNS)"; \
 		echo "══════════════════════════════════════════"; \
-		env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep "$(SWEEP)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,) || true; \
+		rc=0; \
+		env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py --sweep "$(SWEEP)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,) || rc=$$?; \
+		if [ "$$rc" -eq 40 ]; then \
+			echo "Sweep stop policy triggered; stopping improve loop."; \
+			break; \
+		fi; \
 	done
 
 # AI experiment (standalone, no sweep): agent suggests changes, deploy, benchmark
@@ -119,7 +124,7 @@ experiment: sync ensure-kubeconfig
 experiment-inspect:
 	@env -u VIRTUAL_ENV uv run python scripts/experiment_inspect.py $(if $(KILL),--kill,)
 
-# Backfill short names for runs that don't have one (uses gpt-4o-mini by default)
+# Backfill short names for runs that don't have one (uses the configured agent model/defaults)
 backfill-names: sync
 	env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py backfill-names
 

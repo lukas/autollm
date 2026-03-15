@@ -78,7 +78,8 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 ### Tool-Calling Agent
 
 - The agent now uses a full tool stack defined in `scripts/agent_tools.py` (10 tools: `search_web`, `fetch_url`, `read_file`, `write_file`, `list_files`, `run_shell`, `run_benchmark`, `read_logs`, `kubectl_get`, `kubectl_logs`).
-- `run_agent()` in `agent_tools.py` implements the agentic loop for both Anthropic Messages API and OpenAI Chat Completions API.
+- `run_agent()` in `agent_tools.py` implements the agentic loop for both Anthropic Messages API and OpenAI Responses API.
+- OpenAI improve runs now use the Responses API in `scripts/agent_tools.py`, so GPT-5-class models can do tool calling without falling back to older chat-completions-only models. User preference in this workspace is GPT-5.4/latest GPT or latest Anthropic only; do not silently downgrade to `gpt-4o`/`gpt-4o-mini`.
 - Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
 - `write_file` is sandboxed: only writes `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
 - Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
@@ -120,6 +121,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - `ai_experiment.py` uses up to 3 internal attempts per improve run.
 - Improve runs are now intended to test one experiment hypothesis per run directory. Internal retries are for debugging that same experiment when the benchmark exposed a crash/startup/harness bug, not for pivoting to a new tuning idea.
 - A retry can return `NO_CONFIG_CHANGE`, which now means “stop this run and let the next run/agent choose the next experiment”, not “rerun benchmark with the same YAML”.
+- Whole sweeps now stop automatically after 10 failed runs in a row, or after 2 consecutive failures classified as unfixable (`credits`, `auth`, `exa`, or `timeout`). `scripts/ai_experiment.py` exits with code `40` when that policy trips, and both local `make improve` and remote controller loops stop on that code.
 - Both `make improve` and `make benchmark` run a lightweight profiler during the benchmark:
   - samples vLLM `/metrics` every few seconds into `vllm_metrics_timeseries.jsonl`
   - writes a compact `vllm_metrics_profile.json` summary with queue/cache/throughput peaks and diagnosis hints
@@ -146,6 +148,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - `runllm/qwen2.5-1.5b-sglang/` is a sibling SGLang variant that intentionally keeps the same filenames and `VLLM_MODEL` Makefile variable for compatibility with the existing `runllm`/sweep directory contract.
 - Sweeps for `qwen2.5-1.5b` now store `model_variants` metadata so improve runs can switch between the canonical `vllm` and `sglang` templates as a first-class experiment choice. Backend switches should replace both `vllm-config.yaml` and `Makefile` from the chosen variant.
 - Sweeps store `model_dir` in `sweep_metadata.json` so `make improve` uses the right model config.
+- Every sweep directory now keeps an `OVERVIEW.md` with started time, benchmark/data config, agent provider/model, tracked `runllm/` variants, run counts, and current failure streak / stop-policy status. Refresh it whenever sweep metadata or run outcomes change.
 
 ### Tensorizer / PVC Model Loading
 

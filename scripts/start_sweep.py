@@ -20,6 +20,7 @@ from pathlib import Path
 
 from benchmark_config import BENCHMARK_PRESETS
 from model_variants import list_model_variants
+from sweep_state import effective_agent_model, write_sweep_overview
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNLLM_ROOT = PROJECT_ROOT / "runllm"
@@ -87,6 +88,8 @@ def main() -> int:
     baseline_dir.mkdir(parents=True, exist_ok=True)
 
     model_variants = list_model_variants(RUNLLM_ROOT, model_dir)
+    agent_provider = os.environ.get("AI_PROVIDER", "anthropic").lower()
+    agent_model = effective_agent_model(agent_provider, os.environ.get("AI_MODEL", ""))
     sweep_metadata = {
         "name": name,
         "model_dir": model_dir,
@@ -97,8 +100,13 @@ def main() -> int:
         "max_requests": args.max_requests,
         "max_seconds": args.max_seconds,
         "goal": args.goal,
+        "agent_provider": agent_provider,
+        "agent_model": agent_model,
+        "last_agent_provider": agent_provider,
+        "last_agent_model": agent_model,
     }
     (sweep_dir / "sweep_metadata.json").write_text(json.dumps(sweep_metadata, indent=2))
+    write_sweep_overview(sweep_dir, agent_provider=agent_provider, agent_model=agent_model)
 
     print(f"Sweep dir: {sweep_dir}")
     print(f"Model: {model_dir} ({model_path / 'vllm-config.yaml'})")
@@ -142,6 +150,7 @@ def main() -> int:
         cwd=str(PROJECT_ROOT),
         capture_output=True,
     )
+    write_sweep_overview(sweep_dir, agent_provider=agent_provider, agent_model=agent_model)
     print(f"Baseline saved to {baseline_dir}")
     print(f"Run 'make improve SWEEP={name}' to try LLM-suggested improvements")
     return 0

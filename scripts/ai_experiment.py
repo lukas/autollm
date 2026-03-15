@@ -5,7 +5,7 @@ write modified runllm to results/runs or results/sweep-NAME/ only (never project
 
 Usage:
   AI_PROVIDER=anthropic AI_MODEL=claude-opus-4-6 make experiment
-  AI_PROVIDER=openai AI_MODEL=gpt-4o make experiment
+  AI_PROVIDER=openai AI_MODEL=gpt-5.4 make experiment
 """
 from __future__ import annotations
 
@@ -29,6 +29,13 @@ from agent_tools import AgentResult, ToolContext, run_agent
 from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
 from k8s_benchmark import run_benchmark_k8s
 from model_variants import backend_from_model_dir, infer_backend, infer_backend_from_runllm_dir, list_model_variants
+from sweep_state import (
+    SWEEP_STOP_EXIT_CODE,
+    classify_failure_text,
+    effective_agent_model,
+    should_stop_sweep,
+    write_sweep_overview,
+)
 from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
 from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 
@@ -631,6 +638,42 @@ def _write_leaderboard_to_sweep(sweep_dir: Path) -> None:
     (sweep_dir / "leaderboard.txt").write_text(leaderboard)
 
 
+def _update_sweep_metadata_agent(sweep_dir: Path | None, provider: str, model: str) -> None:
+    if not sweep_dir:
+        return
+    metadata_path = sweep_dir / "sweep_metadata.json"
+    if not metadata_path.exists():
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except Exception:
+        return
+    metadata["last_agent_provider"] = provider
+    metadata["last_agent_model"] = model
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+
+
+def _update_run_metadata(run_dir: Path, **updates: Any) -> dict[str, Any]:
+    metadata_path = run_dir / "run_metadata.json"
+    metadata: dict[str, Any] = {}
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except Exception:
+            metadata = {}
+    metadata.update(updates)
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    return metadata
+
+
+def _refresh_sweep_outputs(sweep_dir: Path | None, provider: str, model: str) -> None:
+    if not sweep_dir:
+        return
+    _update_sweep_metadata_agent(sweep_dir, provider, model)
+    _write_leaderboard_to_sweep(sweep_dir)
+    write_sweep_overview(sweep_dir, agent_provider=provider, agent_model=model)
+
+
 def _summarize_profile_json(profile: dict) -> str:
     summary = profile.get("summary", {}) if isinstance(profile, dict) else {}
     parts = []
@@ -754,16 +797,10 @@ def _call_anthropic(prompt: str, model: str) -> str:
 def _call_openai(prompt: str, model: str) -> str:
     from openai import OpenAI
     client = OpenAI()
-    if "codex" in model.lower():
-        r = client.responses.create(model=model, max_output_tokens=8192, input=[{"role": "user", "content": prompt}])
-        return r.output_text if hasattr(r, "output_text") and r.output_text else ""
-    kwargs = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-    if model.lower().startswith("gpt-5"):
-        kwargs["max_completion_tokens"] = 8192
-    else:
-        kwargs["max_tokens"] = 8192
-    r = client.chat.completions.create(**kwargs)
-    return r.choices[0].message.content if r.choices else ""
+    if not model.lower().startswith("gpt-5"):
+        raise ValueError(f"Refusing non-GPT-5 OpenAI model '{model}'")
+    r = client.responses.create(model=model, max_output_tokens=8192, input=[{"role": "user", "content": prompt}])
+    return r.output_text if hasattr(r, "output_text") and r.output_text else ""
 
 
 def _generate_short_name(description: str, result: str, call_fn) -> str:
@@ -1488,27 +1525,39 @@ def main() -> int:
         if not sweep_dir:
             print("--refresh-leaderboard requires --sweep")
             return 1
-        _write_leaderboard_to_sweep(sweep_dir)
+        provider = os.environ.get("AI_PROVIDER", "anthropic").lower()
+        model = effective_agent_model(provider, os.environ.get("AI_MODEL", ""))
+        _refresh_sweep_outputs(sweep_dir, provider, model)
         print(f"Wrote {sweep_dir / 'leaderboard.txt'}")
         return 0
 
     provider = os.environ.get("AI_PROVIDER", "anthropic").lower()
     model = os.environ.get("AI_MODEL", "")
     if provider == "anthropic":
-        model = model or "claude-opus-4-6"
+        model = model or effective_agent_model(provider)
         if not os.environ.get("ANTHROPIC_API_KEY"):
             print("Set ANTHROPIC_API_KEY"); return 1
         call_fn = lambda p: _call_anthropic(p, model)
     elif provider == "openai":
-        model = model or "gpt-5-codex"
+        model = model or effective_agent_model(provider)
         if not os.environ.get("OPENAI_API_KEY"):
             print("Set OPENAI_API_KEY"); return 1
+        if not model.lower().startswith("gpt-5"):
+            print(f"Refusing to use non-GPT-5 OpenAI model '{model}'. Use GPT-5.4/latest GPT, or switch to Anthropic.")
+            return 1
         call_fn = lambda p: _call_openai(p, model)
     else:
         print("AI_PROVIDER must be 'anthropic' or 'openai'"); return 1
 
     if not RUNLLM.exists():
         print("runllm submodule not found"); return 1
+
+    if sweep_dir:
+        _refresh_sweep_outputs(sweep_dir, provider, model)
+        stop_status = should_stop_sweep(sweep_dir)
+        if stop_status["stop"]:
+            print(stop_status["reason"])
+            return SWEEP_STOP_EXIT_CODE
 
     # Determine which model subdir to use
     model_dir = DEFAULT_MODEL_DIR
@@ -1753,6 +1802,26 @@ This run should test exactly one experiment hypothesis. If that hypothesis bench
     if benchmark not in BENCHMARK_PRESETS:
         benchmark = "quick"
 
+    initial_backend = infer_backend_from_runllm_dir(experiment_dir)
+    _update_run_metadata(
+        run_dir,
+        timestamp=ts,
+        description="",
+        backend=initial_backend,
+        model_dir=model_dir,
+        model_variants=model_variants,
+        experiment_dir=str(experiment_dir),
+        benchmark=benchmark,
+        sweep=sweep or None,
+        agent_provider=provider,
+        agent_model=model,
+        success=False,
+        result="",
+        failure_classification={"is_unfixable": False, "category": "pending", "matched_text": "", "summary": ""},
+    )
+    if sweep_dir:
+        write_sweep_overview(sweep_dir, agent_provider=provider, agent_model=model)
+
     # Keep retries for debugging benchmark crashes/bugs only; next runs should try new experiments.
     max_attempts = 3
     failure_context: dict | None = None
@@ -1768,6 +1837,20 @@ This run should test exactly one experiment hypothesis. If that hypothesis bench
                 print("  1. KUBECONFIG is set and points to your cluster")
                 print("  2. kubectl auth can-i delete pods  (must return yes)")
                 print("  3. kubectl get pods  (should reach the cluster)")
+                _update_run_metadata(
+                    run_dir,
+                    description="Infrastructure error",
+                    attempt=attempt + 1,
+                    success=False,
+                    result=result_msg[:1000],
+                    failure_classification=classify_failure_text(result_msg),
+                )
+                if sweep_dir:
+                    _refresh_sweep_outputs(sweep_dir, provider, model)
+                    stop_status = should_stop_sweep(sweep_dir)
+                    if stop_status["stop"]:
+                        print(stop_status["reason"])
+                        return SWEEP_STOP_EXIT_CODE
                 return 1
 
             vllm_cur = (experiment_dir / "vllm-config.yaml").read_text()
@@ -1821,15 +1904,49 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
         try:
             agent_result = run_agent(TOOL_SYSTEM_PROMPT, user_prompt, provider, model, ctx, max_turns=AGENT_MAX_TURNS)
         except Exception as e:
-            print(f"Agent error: {e}")
-            _append_result(experiment_dir, f"Agent error: {e}", "", results_path=results_txt)
+            err_msg = f"Agent error: {e}"
+            print(err_msg)
+            classification = classify_failure_text(err_msg)
+            _update_run_metadata(
+                run_dir,
+                description=err_msg[:500],
+                attempt=attempt + 1,
+                tools_used=0,
+                success=False,
+                result=err_msg[:1000],
+                failure_classification=classification,
+            )
+            _append_result(experiment_dir, err_msg, "", results_path=results_txt)
+            if sweep_dir:
+                _refresh_sweep_outputs(sweep_dir, provider, model)
+                stop_status = should_stop_sweep(sweep_dir)
+                if stop_status["stop"]:
+                    print(stop_status["reason"])
+                    return SWEEP_STOP_EXIT_CODE
             return 1
 
         _write_agent_result_log(run_dir, agent_result, sweep_dir)
 
         if agent_result.error:
-            print(f"Agent loop error: {agent_result.error}")
+            err_msg = f"Agent loop error: {agent_result.error}"
+            print(err_msg)
+            classification = classify_failure_text(err_msg)
+            _update_run_metadata(
+                run_dir,
+                description=err_msg[:500],
+                attempt=attempt + 1,
+                tools_used=len(agent_result.tool_log),
+                success=False,
+                result=agent_result.error[:1000],
+                failure_classification=classification,
+            )
             _append_result(experiment_dir, agent_result.error, "", results_path=results_txt)
+            if sweep_dir:
+                _refresh_sweep_outputs(sweep_dir, provider, model)
+                stop_status = should_stop_sweep(sweep_dir)
+                if stop_status["stop"]:
+                    print(stop_status["reason"])
+                    return SWEEP_STOP_EXIT_CODE
             return 1
 
         # Determine config content: prefer tool-written config, fall back to YAML extraction
@@ -1846,6 +1963,15 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
                 if attempt > 0:
                     stop_msg = f"Stopping retries: {no_config_change_reason}"
                     print(stop_msg)
+                    _update_run_metadata(
+                        run_dir,
+                        description=stop_msg[:500],
+                        attempt=attempt + 1,
+                        tools_used=len(agent_result.tool_log),
+                        success=False,
+                        result=(failure_context or {}).get("result", "")[:1000],
+                        failure_classification=classify_failure_text((failure_context or {}).get("result", "")),
+                    )
                     _append_result(
                         experiment_dir,
                         stop_msg,
@@ -1854,6 +1980,12 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
                         run_dir=run_dir,
                         results_path=results_txt,
                     )
+                    if sweep_dir:
+                        _refresh_sweep_outputs(sweep_dir, provider, model)
+                        stop_status = should_stop_sweep(sweep_dir)
+                        if stop_status["stop"]:
+                            print(stop_status["reason"])
+                            return SWEEP_STOP_EXIT_CODE
                     return 1
                 yaml_content = (experiment_dir / "vllm-config.yaml").read_text()
                 description = f"No config change: {no_config_change_reason}"
@@ -1863,7 +1995,23 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
                 description = _extract_description(agent_result.text)
                 err = "Could not extract YAML from agent response"
                 print(err)
+                classification = classify_failure_text(err)
+                _update_run_metadata(
+                    run_dir,
+                    description=description[:500],
+                    attempt=attempt + 1,
+                    tools_used=len(agent_result.tool_log),
+                    success=False,
+                    result=err,
+                    failure_classification=classification,
+                )
                 _append_result(experiment_dir, description, err, results_path=results_txt)
+                if sweep_dir:
+                    _refresh_sweep_outputs(sweep_dir, provider, model)
+                    stop_status = should_stop_sweep(sweep_dir)
+                    if stop_status["stop"]:
+                        print(stop_status["reason"])
+                        return SWEEP_STOP_EXIT_CODE
                 return 1
 
         # Validate: revert unauthorized model changes
@@ -1883,18 +2031,21 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             (experiment_dir / "Makefile").write_text(makefile_new)
 
         run_backend = infer_backend_from_runllm_dir(experiment_dir)
-        (run_dir / "run_metadata.json").write_text(json.dumps({
-            "timestamp": ts,
-            "description": description[:500],
-            "backend": run_backend,
-            "model_dir": model_dir,
-            "model_variants": model_variants,
-            "experiment_dir": str(experiment_dir),
-            "benchmark": benchmark,
-            "sweep": sweep or None,
-            "attempt": attempt + 1,
-            "tools_used": len(agent_result.tool_log),
-        }, indent=2))
+        _update_run_metadata(
+            run_dir,
+            timestamp=ts,
+            description=description[:500],
+            backend=run_backend,
+            model_dir=model_dir,
+            model_variants=model_variants,
+            experiment_dir=str(experiment_dir),
+            benchmark=benchmark,
+            sweep=sweep or None,
+            attempt=attempt + 1,
+            tools_used=len(agent_result.tool_log),
+            agent_provider=provider,
+            agent_model=model,
+        )
 
         print(f"Run dir: {run_dir} (modified runllm in run_dir/runllm/)")
         print()
@@ -1918,6 +2069,18 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             print("Deploying and running benchmark...")
             success, result = _deploy_and_benchmark(experiment_dir, benchmark, run_dir, ts, sweep=sweep or None)
 
+        failure_classification = (
+            {"is_unfixable": False, "category": "success", "matched_text": "", "summary": ""}
+            if success else classify_failure_text(result)
+        )
+        _update_run_metadata(
+            run_dir,
+            success=success,
+            result=result[:1000],
+            failure_classification=failure_classification,
+            attempt=attempt + 1,
+            tools_used=len(agent_result.tool_log),
+        )
         _append_result(experiment_dir, description, result, success=success, run_dir=run_dir, results_path=results_txt)
 
         # Write a short retro for every run (success or failure)
@@ -1932,7 +2095,7 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             if sweep_dir:
                 from sweep_utils import update_best_runllm
                 update_best_runllm(sweep_dir, runllm_model)
-                _write_leaderboard_to_sweep(sweep_dir)
+                _refresh_sweep_outputs(sweep_dir, provider, model)
             print(f"Results: {result}")
             return 0
 
@@ -1943,14 +2106,18 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
     # Exhausted retries
     _append_result(experiment_dir, last_description, f"Failed after {max_attempts} attempts. Last error: {(failure_context or {}).get('result', '')}", success=False, run_dir=run_dir, results_path=results_txt)
     if sweep_dir:
-        if (run_dir / "run_metadata.json").exists():
-            try:
-                rm = json.loads((run_dir / "run_metadata.json").read_text())
-                rm["result"] = (failure_context or {}).get("result", "")[:500]
-                (run_dir / "run_metadata.json").write_text(json.dumps(rm, indent=2))
-            except Exception:
-                pass
-        _write_leaderboard_to_sweep(sweep_dir)
+        final_result = (failure_context or {}).get("result", "")[:1000]
+        _update_run_metadata(
+            run_dir,
+            success=False,
+            result=final_result,
+            failure_classification=classify_failure_text(final_result),
+        )
+        _refresh_sweep_outputs(sweep_dir, provider, model)
+        stop_status = should_stop_sweep(sweep_dir)
+        if stop_status["stop"]:
+            print(stop_status["reason"])
+            return SWEEP_STOP_EXIT_CODE
     print(f"Results: Failed after {max_attempts} attempts. See {run_dir}/RETRO.md")
     return 1
 
@@ -2021,7 +2188,7 @@ def _append_result(experiment_dir: Path, description: str, result: str, success:
 def backfill_short_names():
     """Generate short names for all existing runs that don't have one."""
     provider = os.environ.get("AI_PROVIDER", "openai")
-    model = os.environ.get("AI_MODEL", "gpt-4o-mini")
+    model = os.environ.get("AI_MODEL", "gpt-5.4")
     call_fn = (lambda p: _call_openai(p, model)) if "openai" in provider else (lambda p: _call_anthropic(p, model))
 
     count = 0
