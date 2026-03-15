@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from benchmark_config import BENCHMARK_PRESETS
+from model_variants import list_model_variants
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNLLM_ROOT = PROJECT_ROOT / "runllm"
@@ -85,9 +86,11 @@ def main() -> int:
     sweep_dir.mkdir(parents=True, exist_ok=True)
     baseline_dir.mkdir(parents=True, exist_ok=True)
 
+    model_variants = list_model_variants(RUNLLM_ROOT, model_dir)
     sweep_metadata = {
         "name": name,
         "model_dir": model_dir,
+        "model_variants": model_variants,
         "created_at": datetime.now().isoformat(),
         "benchmark": args.benchmark,
         "data": args.data,
@@ -99,6 +102,8 @@ def main() -> int:
 
     print(f"Sweep dir: {sweep_dir}")
     print(f"Model: {model_dir} ({model_path / 'vllm-config.yaml'})")
+    if model_variants:
+        print(f"Backend variants available to improve runs: {', '.join(model_variants)}")
     print(f"Running baseline ({args.benchmark})...")
 
     vllm_config = str(model_path / "vllm-config.yaml")

@@ -28,6 +28,7 @@ import yaml
 from agent_tools import AgentResult, ToolContext, run_agent
 from benchmark_config import BENCHMARK_MAX_REQUESTS, BENCHMARK_PRESETS
 from k8s_benchmark import run_benchmark_k8s
+from model_variants import backend_from_model_dir, infer_backend, infer_backend_from_runllm_dir, list_model_variants
 from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
 from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 
@@ -87,7 +88,7 @@ SAMPLE_QUERY_TIMEOUT = int(os.environ.get("EXPERIMENT_SAMPLE_QUERY_TIMEOUT", "30
 AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "50"))
 
 TOOL_SYSTEM_PROMPT = """\
-You are a vLLM optimizer agent on Kubernetes (H200 GPU, CoreWeave).
+You are an LLM serving optimizer agent on Kubernetes (H200 GPU, CoreWeave).
 Pick ONE simple change most likely to improve performance, then test it.
 
 ## Workflow
@@ -108,6 +109,7 @@ Pick ONE simple change most likely to improve performance, then test it.
 
 ## Rules — DO NOT violate
 - Do NOT change the model unless ALLOW_MODEL_CHANGE=1. Switching models is cheating, not optimizing.
+- If the prompt offers multiple backend variants, you MAY switch backend, but treat the backend switch itself as the single experiment for that run.
 - Do NOT game the benchmark (e.g. reducing max-model-len below workload needs, disabling production features). Goal is real-world speed improvement.
 - Do NOT disable logging/stats flags (`--disable-log-stats`, `--disable-log-requests`). Logs and Prometheus metrics are essential for diagnosing performance — disabling them is a trivial micro-optimization that removes the data you need to find real improvements.
 
@@ -420,6 +422,77 @@ def _extract_no_config_change_reason(text: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _extract_model_identity(config_text: str) -> str | None:
+    patterns = [
+        r'--served-model-name\s+([^\s\\]+)',
+        r'--model-path\s+([^\s\\]+)',
+        r'"--model"\s*\n\s*-\s*"([^"]+)"',
+        r'--model["\']?\s*\n\s*-\s*["\']?([^"\'\n\r]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, config_text)
+        if match:
+            return match.group(1).strip().rstrip("'\"")
+    return None
+
+
+def _load_backend_templates(runllm_root: Path, model_variants: list[str]) -> list[dict[str, str]]:
+    templates: list[dict[str, str]] = []
+    for model_dir in model_variants:
+        variant_dir = runllm_root / model_dir
+        cfg_path = variant_dir / "vllm-config.yaml"
+        makefile_path = variant_dir / "Makefile"
+        if not cfg_path.exists() or not makefile_path.exists():
+            continue
+        config_text = cfg_path.read_text()
+        makefile_text = makefile_path.read_text()
+        templates.append({
+            "model_dir": model_dir,
+            "backend": backend_from_model_dir(model_dir),
+            "config_path": str(cfg_path.relative_to(runllm_root.parent)),
+            "makefile_path": str(makefile_path.relative_to(runllm_root.parent)),
+            "config_text": config_text,
+            "makefile_text": makefile_text,
+            "summary": _describe_hardware(config_text),
+        })
+    return templates
+
+
+def _render_backend_templates_section(templates: list[dict[str, str]]) -> str:
+    if len(templates) <= 1:
+        return ""
+    lines = [
+        "## Backend variants available for this sweep",
+        "",
+        "You may keep the current backend or switch to one of these canonical variants.",
+        "A backend switch counts as the ONE experiment change for the run, so do not bundle extra tuning with the switch.",
+        "If you switch backend, replace BOTH `vllm-config.yaml` and `Makefile` from the chosen variant template before benchmarking.",
+        "",
+    ]
+    for template in templates:
+        lines.append(
+            f"- `{template['backend']}` via `runllm/{template['model_dir']}` "
+            f"({template['summary']}; config: `{template['config_path']}`, Makefile: `{template['makefile_path']}`)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _backend_label_for_run(run_dir: Path, meta: dict | None = None) -> str:
+    if meta and meta.get("backend"):
+        return str(meta["backend"])
+    config_text = ""
+    for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
+        fp = run_dir / cfg
+        if fp.exists():
+            config_text = fp.read_text()
+            break
+    makefile_text = ""
+    makefile_fp = run_dir / "runllm" / "Makefile"
+    if makefile_fp.exists():
+        makefile_text = makefile_fp.read_text()
+    return infer_backend(config_text, makefile_text)
+
+
 def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
     """Compact leaderboard ranked according to the sweep objective."""
     if not runs_base.exists():
@@ -444,6 +517,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
             except Exception:
                 pass
         desc = meta.get("description", "")
+        backend = _backend_label_for_run(d, meta)
         short_name = _read_short_name(d)
         if (d / "benchmarks.json").exists():
             try:
@@ -453,7 +527,9 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                     failures.append({
                         "name": d.name,
                         "short_name": short_name,
+                        "backend": backend,
                         "desc": desc,
+                        "retro": _read_retro_summary(d),
                         "result": f"insufficient benchmark traffic: only {n_completed} requests completed",
                         "changes": _summarize_config_changes(
                             next((fp.read_text() for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml")
@@ -476,6 +552,7 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                     tok = metric_mean(m, "tokens_per_second")
                     ttft = metric_mean(m, "time_to_first_token_ms")
                     successes.append({"name": d.name, "short_name": short_name, "metrics": metrics, "desc": desc,
+                                      "backend": backend,
                                       "config_summary": _extract_vllm_args(config_text) if config_text else "",
                                       "changes": _summarize_config_changes(config_text, reference_config_text),
                                       "latency": lat or 999,
@@ -500,11 +577,14 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
                 result = rm.get("result", "")
             except Exception:
                 pass
-        if desc or result:
+        retro = _read_retro_summary(d)
+        if desc or result or retro:
             failures.append({
                 "name": d.name,
                 "short_name": short_name,
+                "backend": backend,
                 "desc": desc,
+                "retro": retro,
                 "result": result,
                 "changes": _summarize_config_changes(config_text, reference_config_text),
             })
@@ -524,17 +604,19 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
             header = s["name"]
             if s.get("short_name"):
                 header += f"  [{s['short_name']}]"
+            header += f"  <{s['backend']}>"
             lines.append(f"{header}  {s['metrics']}")
             lines.append("")
 
     if failures:
         lines.append(f"\nFailed runs ({len(failures)} total — DO NOT repeat these strategies):")
         for f in failures[-20:]:
-            err_brief = f['result'][:120] if f['result'] else "no details"
             label = f['name']
             if f.get('short_name'):
                 label += f"  [{f['short_name']}]"
-            lines.append(f"  {label}: {f.get('changes') or f['desc'][:100]}  — {err_brief}")
+            label += f"  <{f['backend']}>"
+            summary = f.get('retro') or f.get('changes') or f['desc'][:120] or "no details"
+            lines.append(f"  {label}: {summary}")
 
     lines.append(f"\nTo get details on any run, use: read_file('results/{runs_base.name}/<run>/RETRO.md') or read_logs('<run>', 'benchmark')")
 
@@ -675,14 +757,19 @@ def _call_openai(prompt: str, model: str) -> str:
     if "codex" in model.lower():
         r = client.responses.create(model=model, max_output_tokens=8192, input=[{"role": "user", "content": prompt}])
         return r.output_text if hasattr(r, "output_text") and r.output_text else ""
-    r = client.chat.completions.create(model=model, max_tokens=8192, messages=[{"role": "user", "content": prompt}])
+    kwargs = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    if model.lower().startswith("gpt-5"):
+        kwargs["max_completion_tokens"] = 8192
+    else:
+        kwargs["max_tokens"] = 8192
+    r = client.chat.completions.create(**kwargs)
     return r.choices[0].message.content if r.choices else ""
 
 
 def _generate_short_name(description: str, result: str, call_fn) -> str:
     """Ask the LLM for a 3-6 word descriptive name for this run."""
     prompt = (
-        "Give a short descriptive name (3-6 words, no quotes, no punctuation) for this vLLM optimization experiment.\n\n"
+        "Give a short descriptive name (3-6 words, no quotes, no punctuation) for this LLM serving optimization experiment.\n\n"
         f"Strategy: {description[:500]}\n"
         f"Result: {result[:200]}\n\n"
         "Reply with ONLY the short name, nothing else. Examples: 'flashinfer + larger batches', 'prefix caching disabled', 'fp8 kv cache', 'baseline config'"
@@ -709,6 +796,43 @@ def _read_short_name(run_dir: Path) -> str:
         except Exception:
             pass
     return ""
+
+
+def _read_retro_summary(run_dir: Path) -> str:
+    """Extract a one-line failure summary from RETRO.md (Change + Result)."""
+    retro = run_dir / "RETRO.md"
+    if not retro.exists():
+        return ""
+    try:
+        text = retro.read_text(errors="replace")
+    except Exception:
+        return ""
+
+    def _clean(s: str) -> str:
+        s = s.replace("**", "").replace("`", "")
+        s = s.strip("*-| ").strip()
+        return s
+
+    change = ""
+    result = ""
+    current_section = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            current_section = stripped[3:].strip().lower()
+            continue
+        if not stripped or stripped.startswith("|"):
+            continue
+        if current_section == "change" and not change:
+            change = _clean(stripped)
+        elif current_section == "result" and not result:
+            result = _clean(stripped)
+    parts = []
+    if change:
+        parts.append(change[:80])
+    if result:
+        parts.append(result[:80])
+    return " → ".join(parts) if parts else ""
 
 
 def _extract_code_block(text: str, lang: str = "") -> str | None:
@@ -784,18 +908,42 @@ In 2-4 sentences, summarize: what you're changing and why it should help. Output
         return ""
 
 
-def _check_abort(start: float, phase: str, last_progress: float | None = None) -> str | None:
+def _effective_deploy_hard_timeout(vllm_yaml: Path) -> int:
+    """Return the deploy watchdog timeout for this config."""
+    if os.environ.get("EXPERIMENT_DEPLOY_HARD_TIMEOUT"):
+        return DEPLOY_HARD_TIMEOUT
+    try:
+        doc = yaml.safe_load(vllm_yaml.read_text()) or {}
+        container = ((doc.get("spec") or {}).get("containers") or [{}])[0]
+        args = "\n".join(container.get("args") or [])
+        limits = (container.get("resources") or {}).get("limits") or {}
+        gpu_count = int(limits.get("nvidia.com/gpu", 1))
+        if "moonshotai/Kimi-K2.5" in args:
+            return 1800
+        if gpu_count >= 8 and "--load-format tensorizer" not in args and "--download-dir" in args:
+            return 1200
+    except Exception:
+        pass
+    return DEPLOY_HARD_TIMEOUT
+
+
+def _check_abort(
+    start: float,
+    phase: str,
+    last_progress: float | None = None,
+    deploy_hard_timeout: int = DEPLOY_HARD_TIMEOUT,
+) -> str | None:
     """Return abort message if we should abort, unless recent progress was made.
 
     For deploy/health phases: abort if no log activity for INSPECT_AFTER_SEC,
-    or if DEPLOY_HARD_TIMEOUT is exceeded regardless of activity.
+    or if deploy_hard_timeout is exceeded regardless of activity.
     For benchmark phase: uses last_progress (query count updates) with INSPECT_AFTER_SEC.
     """
     if INSPECT_AFTER_SEC <= 0:
         return None
     elapsed = _elapsed_since(start)
-    if elapsed >= DEPLOY_HARD_TIMEOUT and phase != "benchmark":
-        return f"Hard timeout after {int(elapsed)}s in phase '{phase}' (limit {DEPLOY_HARD_TIMEOUT}s)"
+    if elapsed >= deploy_hard_timeout and phase != "benchmark":
+        return f"Hard timeout after {int(elapsed)}s in phase '{phase}' (limit {deploy_hard_timeout}s)"
     if elapsed < INSPECT_AFTER_SEC:
         return None
     if last_progress is not None and (time.time() - last_progress) < INSPECT_AFTER_SEC:
@@ -900,6 +1048,7 @@ def _deploy_and_benchmark(
     Uses a unique pod name and local port so multiple runs can execute in parallel."""
     start = time.time()
     vllm_yaml = experiment_dir / "vllm-config.yaml"
+    deploy_hard_timeout = _effective_deploy_hard_timeout(vllm_yaml)
     env = os.environ.copy()
     env["VLLM_CONFIG"] = str(vllm_yaml)
     env["KUBECONFIG"] = os.environ.get("KUBECONFIG", "")
@@ -917,6 +1066,7 @@ def _deploy_and_benchmark(
     pod_name = f"{base_pod}-{short_id}"
     _rewrite_pod_name(vllm_yaml, pod_name, sweep=sweep)
     _log_run(run_dir, f"Pod: {pod_name}")
+    _log_run(run_dir, f"Deploy hard timeout: {deploy_hard_timeout}s")
 
     # Register for cleanup on Ctrl+C / crash
     _active_pods.append(pod_name)
@@ -982,7 +1132,7 @@ def _deploy_and_benchmark(
         *delete_cmds,
         (["kubectl", "apply", "-f", str(vllm_yaml)], "apply failed"),
     ]:
-        if m := _check_abort(start, "deploy"):
+        if m := _check_abort(start, "deploy", deploy_hard_timeout=deploy_hard_timeout):
             return _cleanup(m)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
@@ -1009,7 +1159,12 @@ def _deploy_and_benchmark(
     last_pod_activity = time.time()
     prev_pod_log_size = 0
     for _ in range(20):
-        if m := _check_abort(start, "pod_wait", last_progress=last_pod_activity):
+        if m := _check_abort(
+            start,
+            "pod_wait",
+            last_progress=last_pod_activity,
+            deploy_hard_timeout=deploy_hard_timeout,
+        ):
             return _cleanup(m)
         if err := _fetch_and_check_logs(run_dir, env, kubectl_logs_file, pod_name):
             return _cleanup(f"vLLM startup error (pod_wait): {err}")
@@ -1034,7 +1189,12 @@ def _deploy_and_benchmark(
     last_log_activity = time.time()
     prev_log_size = kubectl_logs_file.stat().st_size if kubectl_logs_file.exists() else 0
     for i in range(900):
-        if m := _check_abort(start, "health_check", last_progress=last_log_activity):
+        if m := _check_abort(
+            start,
+            "health_check",
+            last_progress=last_log_activity,
+            deploy_hard_timeout=deploy_hard_timeout,
+        ):
             return _cleanup(m)
         if i % 5 == 4:
             if err := _fetch_and_check_logs(run_dir, env, kubectl_logs_file, pod_name):
@@ -1062,11 +1222,9 @@ def _deploy_and_benchmark(
     model = "Qwen/Qwen2.5-1.5B-Instruct"
     try:
         text = vllm_yaml.read_text()
-        m = re.search(r'--served-model-name\s+([^\s\\]+)', text)
-        if not m:
-            m = re.search(r'--model["\']?\s*\n\s*-\s*["\']?([^"\'"\n\r]+)', text)
-        if m:
-            model = m.group(1).strip().rstrip("'\"")
+        extracted_model = _extract_model_identity(text)
+        if extracted_model:
+            model = extracted_model
     except Exception:
         pass
     payload = json.dumps({
@@ -1086,8 +1244,14 @@ def _deploy_and_benchmark(
         return False, f"Sample query failed (exit {r.returncode}): {err}"
     try:
         data = json.loads(r.stdout or "{}")
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        if not content or not isinstance(content, str):
+        message = (data.get("choices") or [{}])[0].get("message", {}) or {}
+        content = message.get("content")
+        reasoning = message.get("reasoning")
+        tool_calls = message.get("tool_calls") or []
+        has_text = isinstance(content, str) and bool(content.strip())
+        has_reasoning = isinstance(reasoning, str) and bool(reasoning.strip())
+        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+        if not (has_text or has_reasoning or has_tool_calls):
             _cleanup()
             return False, "Sample query returned empty or invalid response"
     except json.JSONDecodeError:
@@ -1124,6 +1288,8 @@ def _deploy_and_benchmark(
         "rate": cfg.get("rate"),
         "data": cfg["data"],
     }
+    if "--trust-remote-code" in vllm_yaml.read_text():
+        bench_config["processor_args"] = {"trust_remote_code": True}
 
     max_requests = BENCHMARK_MAX_REQUESTS.get(benchmark, 0)
     bench_start = time.time()
@@ -1346,12 +1512,18 @@ def main() -> int:
 
     # Determine which model subdir to use
     model_dir = DEFAULT_MODEL_DIR
+    model_variants: list[str] = []
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
         try:
             _sm = json.loads((sweep_dir / "sweep_metadata.json").read_text())
             model_dir = _sm.get("model_dir", DEFAULT_MODEL_DIR)
+            model_variants = list(_sm.get("model_variants") or [])
         except Exception:
             pass
+    if not model_variants:
+        model_variants = list_model_variants(RUNLLM, model_dir)
+    if not model_variants:
+        model_variants = [model_dir]
     runllm_model = RUNLLM / model_dir
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1380,6 +1552,9 @@ def main() -> int:
     if not _vllm_cfg.exists():
         _vllm_cfg = base_runllm / "vllm-qwen.yaml"  # legacy runs
     vllm_content = _vllm_cfg.read_text()
+    current_backend = infer_backend(vllm_content, makefile_content)
+    backend_templates = _load_backend_templates(RUNLLM, model_variants)
+    backend_templates_section = _render_backend_templates_section(backend_templates)
     # Ensure experiment_dir always uses the new name
     (experiment_dir / "vllm-config.yaml").write_text(vllm_content)
     runs_for_context = sweep_dir or RUNS_DIR
@@ -1461,12 +1636,62 @@ When changing the model, also update the Makefile's `VLLM_MODEL` variable to mat
 Do NOT change to a completely different model family—stay within Qwen2.5.
 """
     hardware_desc = _describe_hardware(vllm_content)
+    has_multiple_backends = len({t["backend"] for t in backend_templates}) > 1
+    vllm_templates = [t for t in backend_templates if t["backend"] == "vllm"]
+    sglang_templates = [t for t in backend_templates if t["backend"] == "sglang"]
+    current_backend_label = current_backend
+    backend_constraint_lines = [
+        "- Keep `apiVersion: v1` and `kind: Pod`. Do NOT change `metadata.name`, `restartPolicy`, `--host`, or `--port`.",
+    ]
+    if has_multiple_backends:
+        backend_constraint_lines.append(
+            f"- Current backend: `{current_backend_label}`. You MAY switch only between these canonical variants: "
+            + ", ".join(f"`{t['model_dir']}` ({t['backend']})" for t in backend_templates)
+            + ". Do NOT invent a new backend or custom image."
+        )
+        backend_constraint_lines.append(
+            "- If you switch backend, copy both `vllm-config.yaml` and `Makefile` from the chosen canonical variant first. "
+            "A backend switch is the single experiment change for the run."
+        )
+    else:
+        backend_constraint_lines.append(f"- Keep the current backend scaffold exactly as-is (`{current_backend_label}`).")
+    if vllm_templates:
+        backend_constraint_lines.extend([
+            "- For any vLLM variant, preserve the `command:`/`args:` init script, `volumeMounts:`, and `volumes:` exactly as-is. "
+            "Only modify the `vllm serve` flags after `exec vllm serve`, unless the experiment is an explicit backend switch.",
+            "- For any vLLM variant, do NOT change `--load-format`, `--model-loader-extra-config`, `--served-model-name`, or the tensorized model path.",
+            "- For any vLLM variant, `--disable-log-requests` and `--num-scheduler-steps` do NOT exist in this image.",
+            "- For any vLLM variant, do NOT use `--disable-log-stats`. Logs and metrics are needed for diagnosis.",
+        ])
+    if sglang_templates:
+        backend_constraint_lines.extend([
+            "- For any SGLang variant, keep the canonical `sglang serve` launcher structure and image family. "
+            "Do not replace it with a custom wrapper or a different serving stack unless the experiment is switching back to another canonical variant.",
+            "- For any SGLang variant, keep the served model name aligned with `VLLM_MODEL` in the Makefile.",
+        ])
+    backend_quirk_lines = [
+        "- Diagnose from evidence (leaderboard, logs), not assumptions. Many successful `POST /v1/chat/completions` in logs = benchmark progress, likely a harness/watchdog issue not a config failure.",
+    ]
+    if vllm_templates:
+        backend_quirk_lines.extend([
+            "- `VLLM_ATTENTION_BACKEND` env var warns \"Unknown vLLM environment variable\". Do NOT introduce it if absent; only change it as a dedicated experiment if already present.",
+            "- `--performance-mode` has failed before. Do NOT introduce unless already in a successful leaderboard run.",
+            "- `draft_model` speculative decoding is broken on this vLLM nightly with our tensorized main model. Do NOT propose draft-model speculation, even with `draft_load_config.load_format=auto`.",
+            "- If you try speculative decoding on vLLM, use ngram only and use dot-notation CLI args (`--speculative-config.method ngram`, etc.), not JSON blob syntax.",
+        ])
+    if sglang_templates:
+        backend_quirk_lines.append(
+            "- SGLang serves the same OpenAI-compatible chat endpoint used by the harness. If you switch to SGLang, benchmark compatibility depends on preserving `/health` and `/v1/chat/completions`."
+        )
+    backend_constraints_section = "\n- ".join(backend_constraint_lines)
+    backend_quirks_section = "\n- ".join(backend_quirk_lines)
 
-    prompt = f"""You are optimizing vLLM inference on Kubernetes (H200 GPU, CoreWeave).
+    prompt = f"""You are optimizing LLM inference on Kubernetes (H200 GPU, CoreWeave).
 
 **Hardware:** {hardware_desc}
 **Benchmark workload:** {workload}
 **Goal:** {goal}
+**Current backend:** {current_backend_label}
 
 ## Current best config (your baseline to improve on)
 
@@ -1477,24 +1702,15 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Experiment leaderboard
 
 {leaderboard}
-{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}
+{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}
 ## Hard constraints (DO NOT violate)
 
-- Keep `apiVersion: v1, kind: Pod`. Do NOT change `metadata.name`, `restartPolicy`, or image (`vllm/vllm-openai:nightly`).
-- Do NOT use Deployments/ReplicaSets, probes, `--host`, or `--port`.
-- PRESERVE the entire `command:`/`args:` init script, `volumeMounts:`, and `volumes:` EXACTLY as-is. The init script installs tensorizer, patches vllm bugs, then runs `exec vllm serve`. You may ONLY modify the `vllm serve` flags on the continued command lines after `exec vllm serve`.
-- Do NOT change `--load-format`, `--model-loader-extra-config`, `--served-model-name`, or the model path (required for tensorizer PVC loading).
-- `--disable-log-requests` and `--num-scheduler-steps` do NOT exist in this image.
-- Do NOT use `--disable-log-stats`. Logs and metrics are needed for diagnosis — disabling them is not a valid optimization.
+- {backend_constraints_section}
 {"- Do NOT change the --model (model changes not enabled for this sweep)" if not allow_model_change else ""}
 {model_change_section}
 ## Observed quirks
 
-- Diagnose from evidence (leaderboard, logs), not assumptions. Many successful `POST /v1/chat/completions` in logs = benchmark progress, likely a harness/watchdog issue not a config failure.
-- `VLLM_ATTENTION_BACKEND` env var warns "Unknown vLLM environment variable". Do NOT introduce it if absent; only change it as a dedicated experiment if already present.
-- `--performance-mode` has failed before. Do NOT introduce unless already in a successful leaderboard run.
-- `draft_model` speculative decoding is broken on this vLLM nightly with our tensorized main model. Do NOT propose draft-model speculation, even with `draft_load_config.load_format=auto`.
-- If you try speculative decoding, use ngram only and use dot-notation CLI args (`--speculative-config.method ngram`, etc.), not JSON blob syntax.
+- {backend_quirks_section}
 
 ## vLLM serve flags reference (performance-relevant subset)
 
@@ -1573,9 +1789,10 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 - Only repair the same experiment so it can be measured once, or conclude it should stop here.
 - If the evidence shows a harness/watchdog issue (not a config problem), say NO_CONFIG_CHANGE: <reason>.
 - Otherwise fix minimally: repair the failed experiment only, reverting the last change first if needed.
-- Keep Pod kind. Image: vllm/vllm-openai:nightly.
-- PRESERVE the `command:` / `args:` init script, PVC volumeMounts/volumes, and tensorizer flags exactly as-is. Only modify vllm serve flags.
-- No `--disable-log-requests` (doesn't exist). No `--disable-log-stats` (logs/metrics needed for diagnosis). No `VLLM_ATTENTION_BACKEND` if absent.
+- Keep Pod kind. Do not invent a new backend or image family; only use the canonical variants for this sweep if you must switch backends.
+- For vLLM variants, preserve the init script, PVC volumeMounts/volumes, and tensorizer flags exactly as-is. Only modify `vllm serve` flags.
+- For SGLang variants, preserve the canonical `sglang serve` launcher shape and keep `/health` plus `/v1/chat/completions` compatible with the harness.
+- No `--disable-log-requests` (doesn't exist for vLLM here). No `--disable-log-stats` (logs/metrics needed for diagnosis). No `VLLM_ATTENTION_BACKEND` if absent.
 
 When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             print(f"Retry {attempt + 1}/{max_attempts}: agent investigating failure with tools...")
@@ -1651,14 +1868,11 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
 
         # Validate: revert unauthorized model changes
         if not allow_model_change and yaml_content:
-            baseline_model_m = re.search(r'"--model"\s*\n\s*-\s*"([^"]+)"', vllm_content)
-            proposed_model_m = re.search(r'"--model"\s*\n\s*-\s*"([^"]+)"', yaml_content)
-            if baseline_model_m and proposed_model_m:
-                baseline_model = baseline_model_m.group(1)
-                proposed_model = proposed_model_m.group(1)
-                if proposed_model != baseline_model:
-                    print(f"Agent tried to change model to {proposed_model} — reverting to {baseline_model}")
-                    yaml_content = yaml_content.replace(proposed_model, baseline_model)
+            baseline_model = _extract_model_identity(vllm_content)
+            proposed_model = _extract_model_identity(yaml_content)
+            if baseline_model and proposed_model and proposed_model != baseline_model:
+                print(f"Agent tried to change model to {proposed_model} — reverting to {baseline_model}")
+                yaml_content = yaml_content.replace(proposed_model, baseline_model)
 
         last_description = description
 
@@ -1668,9 +1882,13 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             makefile_new = _extract_makefile(agent_result.text) or (experiment_dir / "Makefile").read_text()
             (experiment_dir / "Makefile").write_text(makefile_new)
 
+        run_backend = infer_backend_from_runllm_dir(experiment_dir)
         (run_dir / "run_metadata.json").write_text(json.dumps({
             "timestamp": ts,
             "description": description[:500],
+            "backend": run_backend,
+            "model_dir": model_dir,
+            "model_variants": model_variants,
             "experiment_dir": str(experiment_dir),
             "benchmark": benchmark,
             "sweep": sweep or None,

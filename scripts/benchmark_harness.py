@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from benchmark_config import BENCHMARK_PRESETS, parse_completed_count
+from model_variants import infer_backend
 from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +51,7 @@ def _pod_name_from_yaml(yaml_path: Path) -> str:
 
 
 VLLM_POD = os.environ.get("VLLM_POD") or _pod_name_from_yaml(VLLM_YAML)
+BACKEND = infer_backend(VLLM_YAML.read_text() if VLLM_YAML.exists() else "")
 
 
 def main() -> None:
@@ -161,6 +163,7 @@ def main() -> None:
     metadata = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S") if args.run_dir else ts,
         "description": args.description,
+        "backend": BACKEND,
         "benchmark": args.benchmark if not args.fast else "quick",
         "benchmark_config": cfg,
         "vllm_config": str(VLLM_YAML),
@@ -176,7 +179,7 @@ def main() -> None:
         _log(
             run_dir,
             "run.log",
-            f"Starting vLLM (runllm) pod={VLLM_POD} dir={RUNLLM_DIR}...",
+            f"Starting {BACKEND} runllm pod={VLLM_POD} dir={RUNLLM_DIR}...",
         )
         proc = subprocess.Popen(
             ["make", "apply", f"VLLM_POD={VLLM_POD}"],
@@ -217,7 +220,21 @@ def main() -> None:
             sys.exit(1)
 
         _log(run_dir, "run.log", "Pod ready, waiting for vLLM health...")
-        for i in range(180):
+        _health_iters = 180
+        try:
+            import yaml as _yaml
+            _hc_gpu = int(
+                _yaml.safe_load(VLLM_YAML.read_text())
+                .get("spec", {}).get("containers", [{}])[0]
+                .get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 1)
+            )
+        except Exception:
+            _hc_gpu = 1
+        if _hc_gpu >= 8:
+            _health_iters = 900  # 30 min for very large models (1T+)
+        elif _hc_gpu >= 4:
+            _health_iters = 360  # 12 min for large models
+        for i in range(_health_iters):
             hr = subprocess.run(
                 [
                     "kubectl",
@@ -233,8 +250,8 @@ def main() -> None:
             )
             if hr.returncode == 0:
                 break
-            if i == 179:
-                _log(run_dir, "run.log", "Health check timed out after 6 min")
+            if i == _health_iters - 1:
+                _log(run_dir, "run.log", f"Health check timed out after {_health_iters * 2 // 60} min")
                 sys.exit(1)
             time.sleep(2)
 
@@ -349,6 +366,8 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
         "--outputs",
         "benchmarks.csv",
         "--disable-console-interactive",
+        "--processor-args",
+        '{"trust_remote_code": true}',
     ]
     if max_requests:
         cmd.extend(["--max-requests", max_requests])
@@ -362,6 +381,7 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
 
     env = os.environ.copy()
     env["GUIDELLM__MP_CONTEXT_TYPE"] = "fork"
+    env["HF_HUB_TRUST_REMOTE_CODE"] = "1"
 
     proc = subprocess.Popen(
         cmd,

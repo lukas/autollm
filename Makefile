@@ -18,7 +18,7 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sync-results sweep-logs sweep-status sweep-remote-teardown
+.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
@@ -146,6 +146,11 @@ sweep-remote: ensure-kubeconfig
 improve-remote: ensure-kubeconfig
 	@scripts/sweep_remote.sh improve \
 		--sweep "$(SWEEP)" --runs "$(RUNS)" $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,)
+
+# Change the target number of runs for a running remote sweep. Takes effect on next iteration.
+# Usage: make sweep-set-runs SWEEP=my-sweep RUNS=50
+sweep-set-runs: ensure-kubeconfig
+	@scripts/sweep_remote.sh set-runs --sweep "$(SWEEP)" --runs "$(RUNS)"
 
 # Copy sweep results from the remote controller pod to local machine.
 # Usage: make sync-results SWEEP=my-sweep     # sync one sweep

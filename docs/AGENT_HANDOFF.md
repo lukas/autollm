@@ -31,7 +31,7 @@ make sync-results SWEEP=qwen-throughput-async  # copy results to local machine
 make sweep-remote-teardown                 # delete controller pod
 ```
 
-- `make sweep-remote` creates a lightweight controller pod (`autollm-controller`) in the cluster, syncs local code to it, and starts the sweep in the background. The controller uses a ServiceAccount with RBAC permissions to manage vLLM pods. API keys come from `.env`.
+- `make sweep-remote` creates a lightweight controller pod (`autollm-controller`) in the cluster, syncs local code to it, and starts the sweep in the background. The controller uses a ServiceAccount with RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` come from `.env` or the local environment.
 - The sweep runs autonomously inside the pod (survives laptop disconnect). Results stay on the controller.
 - `make sync-results` uses tar+kubectl to pull results back. Syncs a specific sweep or all results.
 
@@ -104,6 +104,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - `benchmark_harness.py` (baseline runs) calls `run_benchmark_k8s()` directly.
   - `ai_experiment.py` (improve runs) calls `run_benchmark_k8s()` directly in `_deploy_and_benchmark()`. Port-forward is no longer used.
   - `run_guideline_experiment.py` also uses `run_benchmark_k8s()` and expects `EXPERIMENT_POD_NAME` env var.
+- If the serving config uses `--trust-remote-code`, the benchmark Job must pass `--processor-args '{"trust_remote_code": true}'` so guidellm can load the same tokenizer/processor path. This is required for Kimi-K2.5.
 
 ### Deploy Watchdog (Activity-Aware Timeout)
 
@@ -112,6 +113,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - **`DEPLOY_HARD_TIMEOUT` (600s default):** Absolute ceiling for deploy+health phases regardless of log activity. Env var: `EXPERIMENT_DEPLOY_HARD_TIMEOUT`.
 - During `health_check`, the watchdog tracks kubectl log file size. As long as vLLM is actively writing logs (loading weights, CUDA graph capture, fp8 scale calibration), the timeout keeps sliding forward. Only aborts when logs go stale.
 - This allows large models (Qwen3-235B) and slow startup configs (fp8 KV cache calibration) to complete startup without hitting the watchdog, while still catching truly stuck deployments.
+- `ai_experiment.py` now uses a config-aware hard timeout: Kimi-K2.5 gets 1800s by default because the HF safetensors fallback path can spend ~500s in weight loading before health becomes ready.
 
 ### Benchmark / Retry Flow
 
@@ -141,11 +143,13 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - Each model dir is self-contained with `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
 - Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig` (relative to the model dir).
+- `runllm/qwen2.5-1.5b-sglang/` is a sibling SGLang variant that intentionally keeps the same filenames and `VLLM_MODEL` Makefile variable for compatibility with the existing `runllm`/sweep directory contract.
+- Sweeps for `qwen2.5-1.5b` now store `model_variants` metadata so improve runs can switch between the canonical `vllm` and `sglang` templates as a first-class experiment choice. Backend switches should replace both `vllm-config.yaml` and `Makefile` from the chosen variant.
 - Sweeps store `model_dir` in `sweep_metadata.json` so `make improve` uses the right model config.
 
 ### Tensorizer / PVC Model Loading
 
-- All models use `--load-format tensorizer` with pre-serialized weights on a shared PVC (`tensorized-models`, 1Ti, `shared-vast`). The PVC mounts at `/mnt/tensorized/`. Serialized weights at `/mnt/tensorized/vllm/<org>/<model>/v1/`.
+- Most large models use `--load-format tensorizer` with pre-serialized weights on a shared PVC (`tensorized-models`, 1Ti, `shared-vast`). The PVC mounts at `/mnt/tensorized/`. Serialized weights at `/mnt/tensorized/vllm/<org>/<model>/v1/`.
 - PVC definition: `runllm/tensorized-models-pvc.yaml`.
 - To serialize: `make tensorize MODEL_DIR=qwen2.5-1.5b` (K8s Job; idempotent — skips if marker file already exists on PVC).
 - The nightly vllm image doesn't bundle tensorizer, so all configs use `command: ["/bin/bash", "-c"]` to `pip install tensorizer` before `vllm serve`.
@@ -158,6 +162,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - For TP-sharded models (TP>1), `--model-loader-extra-config '{"tensorizer_uri": ".../model-rank-%03d.tensors"}'` is required.
 - The PVC is `ReadWriteMany` — multiple pods across different nodes can mount it.
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
+- **Kimi exception:** Kimi-K2.5 currently does *not* use tensorizer in the working path. It serves from HF safetensors cached under `/mnt/tensorized/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack.
 
 ---
 
@@ -180,6 +185,12 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 6. **Speculative decoding gotchas on this nightly:**
    `draft_model` speculative decoding is still broken with the tensorized main-model path on `v0.17.0rc1.dev204`, and `draft_load_config.load_format=auto` did not avoid the duplicate-layer startup failure. `ngram` works only with dot-notation CLI args (not the older JSON blob examples), but it regressed badly on the short synchronous qwen throughput benchmark (~521 tok/s vs 739 tok/s best), so treat it as workload-specific rather than a general win.
+
+7. **Kimi-K2.5 improve runs need a longer deploy hard timeout than the default 600s.**
+   The Kimi fallback path currently uses standard HF safetensors loading instead of tensorizer. On 8xH200, weight loading alone can take ~500s before post-load init / health readiness, so `ai_experiment.py` often aborts in `health_check` at ~601s even though logs are still advancing and the server would come up shortly after. Baseline succeeded only after increasing the separate `benchmark_harness.py` health timeout; improve runs still use the 600s `DEPLOY_HARD_TIMEOUT` unless overridden.
+
+8. **Kimi sample queries can be reasoning-only.**
+   Kimi-K2.5 may return `content: null` with non-empty `reasoning` on short chat completions. Treat that as a valid sample-query success in harness code; otherwise improve runs can redeploy forever even though the server is healthy.
 
 ---
 

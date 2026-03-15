@@ -785,9 +785,12 @@ def _run_openai_loop(
 
     for turn in range(max_turns):
         print(f"  [agent] OpenAI call (turn {turn + 1}/{max_turns})...")
-        resp = client.chat.completions.create(
-            model=model, max_tokens=8192, messages=oai_messages, tools=tools,
-        )
+        kwargs = {"model": model, "messages": oai_messages, "tools": tools}
+        if model.lower().startswith("gpt-5"):
+            kwargs["max_completion_tokens"] = 8192
+        else:
+            kwargs["max_tokens"] = 8192
+        resp = client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         assistant_msg = choice.message
 

@@ -59,6 +59,9 @@ def _build_job_manifest(
         " --outputs benchmarks.json"
         " --outputs benchmarks.csv",
     ]
+    processor_args = config.get("processor_args")
+    if processor_args:
+        cmd_parts[-1] += f" --processor-args '{json.dumps(processor_args)}'"
     extra = ""
     if config.get("max_requests"):
         extra += f" --max-requests {config['max_requests']}"

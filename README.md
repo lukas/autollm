@@ -16,13 +16,17 @@ make kubeconfig                 # generates kubeconfig
 # OR: copy your kubeconfig directly to ./kubeconfig
 
 # 2. Set your AI API key in .env:
-# ANTHROPIC_API_KEY=sk-...
+# ANTHROPIC_API_KEY=sk-...   # default provider
+# OPENAI_API_KEY=sk-...      # for AI_PROVIDER=openai
 
 # 3. Start a sweep (deploys vLLM, runs baseline benchmark):
 make sweep SWEEP=qwen-latency GOAL="minimize latency"
 
 # 4. Let the AI agent optimize:
 make improve SWEEP=qwen-latency
+
+# Or use GPT:
+AI_PROVIDER=openai AI_MODEL=gpt-5.4 make improve SWEEP=qwen-latency
 ```
 
 ## Workflow: sweep + improve
@@ -40,12 +44,15 @@ The `GOAL` tells the AI agent what metric to optimize. `MODEL_DIR` selects which
 
 This deploys vLLM with the chosen model's `vllm-config.yaml`, runs the benchmark, and saves results to the sweep's `baseline/` directory.
 
+Kimi-specific note: `runllm/kimi/` currently uses HuggingFace safetensors cached on the shared PVC plus `--trust-remote-code`, not tensorizer. Startup is therefore slower than the tensorized Qwen paths, but baseline and improve runs now work end-to-end.
+
 ### Step 2: Run AI-driven improvements
 
 ```bash
 make improve SWEEP=qwen-latency                        # single improvement run
 make improve SWEEP=qwen-latency RUNS=10                # run 10 iterations back-to-back
 make improve SWEEP=qwen-latency RUNS=5 ALLOW_MODEL_CHANGE=1  # 5 runs, allow quantized models
+AI_PROVIDER=openai AI_MODEL=gpt-5.4 make improve SWEEP=qwen-latency RUNS=10
 ```
 
 Each run:
@@ -150,7 +157,7 @@ make sync-results                              # sync all results
 make sweep-remote-teardown                     # delete controller pod (sync first!)
 ```
 
-The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys are injected from your local `.env` and environment.
+The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` are injected from your local `.env` and environment, so remote sweeps can be pinned to GPT the same way as local runs.
 
 ## Other targets
 
@@ -181,7 +188,7 @@ The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccou
 | `ANTHROPIC_API_KEY` | Required for AI agent (default provider) |
 | `OPENAI_API_KEY` | For OpenAI provider |
 | `AI_PROVIDER` | `anthropic` (default) or `openai` |
-| `AI_MODEL` | Default: `claude-opus-4-6`. Override: `gpt-5-codex`, etc. |
+| `AI_MODEL` | Default: `claude-opus-4-6`. Override: `gpt-5.4`, `gpt-5-codex`, etc. |
 | `ALLOW_MODEL_CHANGE` | Set to `1` to let agent try quantized model variants |
 | `GOAL` | Optimization goal for the agent (e.g. "minimize latency", "maximize throughput") |
 | `BENCHMARK` | Preset: `quick`, `sync`, `sweep`, `medium`, `medium-throughput`, `large`, `long` |
