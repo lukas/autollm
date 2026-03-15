@@ -26,6 +26,102 @@ info() { echo "==> $*"; }
 pod_exists() { kubectl get pod "$CONTROLLER_POD" &>/dev/null; }
 pod_ready()  { kubectl exec "$CONTROLLER_POD" -- test -f /tmp/ready &>/dev/null; }
 
+sync_tar_entries() {
+    local remote_base="$1"
+    local local_dest="$2"
+    shift 2
+    [ "$#" -gt 0 ] || return 0
+
+    # Results may be actively written during a live sweep; tolerate file changes while archiving.
+    kubectl exec "$CONTROLLER_POD" -- tar --ignore-failed-read --warning=no-file-changed -czf - -C "$remote_base" "$@" 2>/dev/null \
+        | tar xzf - -C "$local_dest"
+}
+
+append_unique() {
+    local item="$1"
+    shift
+    local existing=""
+    for existing in "$@"; do
+        [ "$existing" = "$item" ] && return 0
+    done
+    return 1
+}
+
+sync_single_sweep_incremental() {
+    local sweep="$1"
+    local remote_root="$REMOTE_DIR/results"
+    local remote_sweep="$remote_root/sweep-${sweep}"
+    local local_results="$PROJECT_DIR/results"
+    local local_sweep="$local_results/sweep-${sweep}"
+
+    kubectl exec "$CONTROLLER_POD" -- test -d "$remote_sweep" \
+        || die "Remote sweep not found on controller: sweep-${sweep}"
+
+    mkdir -p "$local_sweep"
+    info "Syncing sweep-${sweep} results from controller..."
+
+    local -a entries=(
+        "sweep-${sweep}/sweep_metadata.json"
+        "sweep-${sweep}/OVERVIEW.md"
+        "sweep-${sweep}/leaderboard.txt"
+        "sweep-${sweep}/FULL_RETRO.txt"
+        "sweep-${sweep}/results.txt"
+        "sweep-${sweep}/agent.log"
+        "sweep-${sweep}/meta-feedback.txt"
+        "sweep-${sweep}/baseline"
+        "sweep-${sweep}/best-runllm"
+    )
+
+    local -a remote_runs=()
+    local remote_runs_text=""
+    remote_runs_text=$(
+        kubectl exec "$CONTROLLER_POD" -- bash -lc \
+            "cd '$remote_sweep' && ls -1d 20[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | sort"
+    )
+    if [ -n "$remote_runs_text" ]; then
+        while IFS= read -r run; do
+            [ -n "$run" ] && remote_runs+=("$run")
+        done <<EOF
+$remote_runs_text
+EOF
+    fi
+
+    local -a selected_runs=()
+    local run=""
+    for run in "${remote_runs[@]}"; do
+        [ -z "$run" ] && continue
+        if [ ! -d "$local_sweep/$run" ]; then
+            selected_runs+=("$run")
+        fi
+    done
+
+    local total_runs="${#remote_runs[@]}"
+    local newest_count=2
+    local start_idx=0
+    if [ "$total_runs" -gt "$newest_count" ]; then
+        start_idx=$((total_runs - newest_count))
+    fi
+    local idx=0
+    for ((idx=start_idx; idx<total_runs; idx++)); do
+        run="${remote_runs[$idx]}"
+        [ -z "$run" ] && continue
+        if [ "${#selected_runs[@]}" -eq 0 ]; then
+            selected_runs+=("$run")
+        elif ! append_unique "$run" "${selected_runs[@]}"; then
+            selected_runs+=("$run")
+        fi
+    done
+
+    if [ "${#selected_runs[@]}" -gt 0 ]; then
+        for run in "${selected_runs[@]}"; do
+            entries+=("sweep-${sweep}/${run}")
+        done
+    fi
+
+    sync_tar_entries "$remote_root" "$local_results" "${entries[@]}"
+    info "Results synced to $local_results (top-level files + ${#selected_runs[@]} run dirs)"
+}
+
 ensure_controller() {
     if pod_exists; then
         info "Controller pod '$CONTROLLER_POD' already exists"
@@ -343,19 +439,28 @@ action_sync() {
     mkdir -p "$local_results"
 
     if [ -n "$sweep" ]; then
-        local remote_path="$REMOTE_DIR/results/sweep-${sweep}"
-        local local_path="$local_results/sweep-${sweep}"
-        info "Syncing sweep-${sweep} results from controller..."
-        mkdir -p "$local_path"
-        kubectl exec "$CONTROLLER_POD" -- tar czf - -C "$REMOTE_DIR/results" "sweep-${sweep}" 2>/dev/null \
-            | tar xzf - -C "$local_results"
+        sync_single_sweep_incremental "$sweep"
     else
-        info "Syncing ALL results from controller..."
-        kubectl exec "$CONTROLLER_POD" -- tar czf - -C "$REMOTE_DIR" results 2>/dev/null \
-            | tar xzf - -C "$PROJECT_DIR"
+        info "Syncing ALL sweeps from controller..."
+        local -a sweeps=()
+        local sweeps_text=""
+        sweeps_text=$(
+            kubectl exec "$CONTROLLER_POD" -- bash -lc \
+                "cd '$REMOTE_DIR/results' && ls -1d sweep-* 2>/dev/null | sed 's/^sweep-//' | sort"
+        )
+        if [ -n "$sweeps_text" ]; then
+            while IFS= read -r sweep_name; do
+                [ -n "$sweep_name" ] && sweeps+=("$sweep_name")
+            done <<EOF
+$sweeps_text
+EOF
+        fi
+        local sweep_name=""
+        for sweep_name in "${sweeps[@]}"; do
+            [ -z "$sweep_name" ] && continue
+            sync_single_sweep_incremental "$sweep_name"
+        done
     fi
-
-    info "Results synced to $local_results"
 }
 
 action_logs() {

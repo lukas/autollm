@@ -34,6 +34,8 @@ make sweep-remote-teardown                 # delete controller pod
 - `make sweep-remote` creates a lightweight controller pod (`autollm-controller`) in the cluster, syncs local code to it, and starts the sweep in the background. The controller uses a ServiceAccount with RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` come from `.env` or the local environment.
 - The sweep runs autonomously inside the pod (survives laptop disconnect). Results stay on the controller.
 - `make sync-results` uses tar+kubectl to pull results back. Syncs a specific sweep or all results.
+- `make sync-results` must tolerate files changing during active sweeps. `scripts/sweep_remote.sh` now uses `tar --ignore-failed-read --warning=no-file-changed` on the controller side so live `benchmark_live.txt` / `benchmarks.json` updates do not corrupt the sync stream.
+- `make sync-results SWEEP=...` is now incremental: it refreshes top-level sweep files (`OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, etc.), always syncs `baseline/`, pulls missing timestamped run dirs, and re-syncs the newest two run dirs. Keep the shell compatible with macOS Bash 3.2; avoid `mapfile` and associative arrays.
 
 The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but it is no longer the main tuning workflow.
 

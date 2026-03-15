@@ -156,7 +156,7 @@ make sweep-logs                                # tail live output
 make sweep-status                              # check running sweeps
 
 # Pull results to local machine
-make sync-results SWEEP=qwen3-235b-throughput  # sync one sweep
+make sync-results SWEEP=qwen3-235b-throughput  # incremental sync for one sweep
 make sync-results                              # sync all results
 
 # Cleanup
@@ -164,6 +164,8 @@ make sweep-remote-teardown                     # delete controller pod (sync fir
 ```
 
 The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` are injected from your local `.env` and environment, so remote sweeps can be pinned to GPT the same way as local runs.
+
+`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
 
 ## Other targets
 
@@ -174,7 +176,7 @@ The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccou
 | `make full-sweep SWEEP=name RUNS=N` | Create sweep + baseline + N improvement runs |
 | `make sweep-remote SWEEP=name RUNS=N` | Run full sweep on a K8s controller pod |
 | `make improve-remote SWEEP=name RUNS=N` | Continue a local sweep remotely (sync results + improve) |
-| `make sync-results SWEEP=name` | Copy results from remote controller to local |
+| `make sync-results SWEEP=name` | Incrementally sync one remote sweep to local |
 | `make sweep-logs` | Tail live remote sweep output |
 | `make sweep-status` | Check remote sweep status |
 | `make sweep-remote-teardown` | Delete the controller pod |
