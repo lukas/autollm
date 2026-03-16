@@ -10,7 +10,10 @@ AI-driven vLLM optimization on Kubernetes. Deploys vLLM, benchmarks latency/thro
 git clone --recurse-submodules https://github.com/lukas/autollm
 cd autollm
 
-# 1. Configure cluster access (pick one):
+# 1. Bootstrap local deps + kubeconfig:
+make setup
+
+# Or do the setup steps manually:
 cp .env.example .env           # fill in KUBECONFIG_SERVER + KUBECONFIG_TOKEN
 make kubeconfig                 # generates kubeconfig
 # OR: copy your kubeconfig directly to ./kubeconfig
@@ -182,6 +185,7 @@ make sweep-remote-teardown                     # delete controller pod (sync fir
 The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` are injected from your local `.env` and environment, so remote sweeps can be pinned to GPT the same way as local runs.
 
 `make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.md`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
+If the controller pod is already gone, `make sync-results` now prints a friendly "nothing to sync" message and exits successfully.
 
 Remote sweep bookkeeping notes:
 - `make sweep-status` now ignores zombie controller-side shell PIDs and cleans stale `.pid` files automatically, so finished sweeps no longer appear stuck in `RUNNING`.
@@ -192,6 +196,7 @@ Remote sweep bookkeeping notes:
 
 | Target | Description |
 |--------|-------------|
+| `make setup` | One-time bootstrap: install deps and generate kubeconfig if needed |
 | `make sweep SWEEP=name` | Create sweep + run baseline |
 | `make improve SWEEP=name` | AI agent suggests improvements |
 | `make full-sweep SWEEP=name RUNS=N` | Create sweep + baseline + N improvement runs |

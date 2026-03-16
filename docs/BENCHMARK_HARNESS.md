@@ -5,6 +5,7 @@ The test harness runs Guideline benchmarks against your vLLM setup, saves every 
 ## Quick Start
 
 1. Ensure cluster access is configured (`make kubeconfig` or export `KUBECONFIG`)
+   On a fresh checkout, `make setup` is the easiest bootstrap path because it installs Python deps and generates `kubeconfig` if needed.
 2. Run a benchmark:
    ```bash
    make benchmark
@@ -66,6 +67,7 @@ make dashboard
 | Command | Description |
 |---------|-------------|
 | `make benchmark` | Deploy + run benchmark and save a timestamped run |
+| `make setup` | One-time bootstrap: install deps and generate kubeconfig if needed |
 | `make benchmark BENCHMARK=quick` | Quick preset |
 | `make benchmark MODEL_DIR=qwen3-235b` | Benchmark a different model |
 | `make benchmark-run` | Run harness only (assumes port-forward exists) |
@@ -128,6 +130,7 @@ Remote sweep lifecycle notes:
 - Each background sweep runs through a small launcher wrapper that deletes `/workspace/sweep-<name>.pid` on exit and records `/workspace/sweep-<name>.exit_code`.
 - The controller pod spec now includes a simple reaper loop for orphaned child processes. If you already have a long-lived controller pod running, recreate it after your active sweeps finish to pick up that reaping behavior.
 - `make sync-results SWEEP=...` refreshes top-level sweep memory artifacts too, including `FULL_RETRO.md`, `FULL_RETRO.txt`, and `RESEARCH_MEMORY.md`, so local inspection stays aligned with the controller-side agent context.
+- If the controller pod is already gone, `make sync-results` now reports that there is nothing to sync and exits successfully.
 
 Both `make benchmark` and `make improve` collect lightweight run profiling automatically. The profiler samples vLLM's built-in Prometheus endpoint every few seconds during the benchmark and writes a compact summary plus raw JSONL timeseries. If `nvidia-smi` is available inside the pod, GPU utilization, memory use, temperature, and power draw are also sampled.
 

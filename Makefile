@@ -12,19 +12,16 @@ export EXA_API_KEY
 # Default model directory under runllm/
 MODEL_DIR ?= qwen2.5-1.5b
 
-# Generate kubeconfig from .env (KUBECONFIG_SERVER, KUBECONFIG_TOKEN). kubeconfig is gitignored.
-kubeconfig:
-	@python3 scripts/gen_kubeconfig.py
-
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: help sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
+.PHONY: help setup sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
 
 help:
 	@echo "autollm make targets"
 	@echo ""
 	@echo "Setup:"
+	@echo "  make setup                 One-time bootstrap: deps + kubeconfig"
 	@echo "  make kubeconfig            Generate autollm/kubeconfig from .env"
 	@echo "  make sync                  Install/update Python deps with uv"
 	@echo ""
@@ -78,24 +75,20 @@ test-sweep-setup:
 query:
 	$(MAKE) -C runllm/$(MODEL_DIR) query PROMPT="$(PROMPT)"
 
-# Install deps (unset VIRTUAL_ENV to avoid uv warning when parent cuda-play venv is active)
-sync:
-	env -u VIRTUAL_ENV uv sync --extra guidellm --extra ai_optimizer
-
 # One-shot: start LLM, run Guideline benchmark, save to results/runs/YYYYMMDD_HHMMSS/
 # Usage: make benchmark
 #        make benchmark BENCHMARK=quick
 #        make benchmark BENCHMARK=sweep DESCRIPTION="baseline"
 # Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req)
-benchmark: sync ensure-kubeconfig
+benchmark: ensure-kubeconfig
 	@VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
 
 # Harness: saves to results/runs/YYYYMMDD_HHMMSS/ (requires port-forward)
-benchmark-run: sync
+benchmark-run:
 	@echo "Requires: cd runllm/$(MODEL_DIR) && make forward"
 	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
 
-benchmark-run-quick: sync
+benchmark-run-quick:
 	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
 
 # Results
@@ -118,7 +111,7 @@ dashboard:
 # Usage: make sweep SWEEP=my-sweep [BENCHMARK=quick] [FORCE=1]
 #        make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
 sweep: BENCHMARK=quick
-sweep: sync ensure-kubeconfig
+sweep: ensure-kubeconfig
 	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
 
 # Full sweep: create sweep + run baseline, then run N improvement iterations
@@ -146,7 +139,7 @@ sweep-pods: ensure-kubeconfig
 #        make improve SWEEP=my-sweep RUNS=5 ALLOW_MODEL_CHANGE=1
 RUNS ?= 1
 improve: BENCHMARK=quick
-improve: sync ensure-kubeconfig
+improve: ensure-kubeconfig
 	@for i in $$(seq 1 $(RUNS)); do \
 		echo ""; echo "══════════════════════════════════════════"; \
 		echo "  Improvement run $$i/$(RUNS)"; \
@@ -163,7 +156,7 @@ improve: sync ensure-kubeconfig
 # Saves to results/runs/exp_[ts]. For sweep-based flow, use 'make improve SWEEP=name'
 # Default: quick. Override: make experiment BENCHMARK=sync|sweep|medium|long
 experiment: BENCHMARK=quick
-experiment: sync ensure-kubeconfig
+experiment: ensure-kubeconfig
 	@env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py $(if $(ALLOW_MODEL_CHANGE),--allow-model-change,)
 
 # Inspect experiment progress (run in another terminal while 'make experiment' or 'make improve' runs)
@@ -172,7 +165,7 @@ experiment-inspect:
 	@env -u VIRTUAL_ENV uv run python scripts/experiment_inspect.py $(if $(KILL),--kill,)
 
 # Backfill short names for runs that don't have one (uses the configured agent model/defaults)
-backfill-names: sync
+backfill-names:
 	env -u VIRTUAL_ENV uv run python scripts/ai_experiment.py backfill-names
 
 # Serialize model weights to PVC via Tensorizer (one-time per model, idempotent).
@@ -221,3 +214,16 @@ sweep-status: ensure-kubeconfig
 # Delete the remote controller pod (results are lost unless synced first!).
 sweep-remote-teardown: ensure-kubeconfig
 	@scripts/sweep_remote.sh teardown
+
+# ── Setup / bootstrap targets ────────────────────────────────────────────────
+
+# One-time local bootstrap for a fresh checkout.
+setup: sync ensure-kubeconfig
+
+# Generate kubeconfig from .env (KUBECONFIG_SERVER, KUBECONFIG_TOKEN). kubeconfig is gitignored.
+kubeconfig:
+	@python3 scripts/gen_kubeconfig.py
+
+# Install deps (unset VIRTUAL_ENV to avoid uv warning when parent cuda-play venv is active)
+sync:
+	env -u VIRTUAL_ENV uv sync --extra guidellm --extra ai_optimizer
