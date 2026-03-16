@@ -207,7 +207,7 @@ sweep_is_running() {
     local sweep="$1"
     local pid_file="/workspace/sweep-${sweep}.pid"
     kubectl exec "$CONTROLLER_POD" -- bash -c \
-        "[ -f '$pid_file' ] && kill -0 \$(cat '$pid_file') 2>/dev/null" &>/dev/null
+        "if [ ! -f '$pid_file' ]; then exit 1; fi; pid=\$(cat '$pid_file'); stat=\$(ps -o stat= -p \"\$pid\" 2>/dev/null | tr -d ' '); [ -n \"\$stat\" ] && [[ \"\$stat\" != Z* ]]" &>/dev/null
 }
 
 save_start_count() {
@@ -215,6 +215,27 @@ save_start_count() {
     local start_file="/workspace/sweep-${sweep}.start_count"
     kubectl exec "$CONTROLLER_POD" -- bash -c \
         "ls -d $REMOTE_DIR/results/sweep-${sweep}/20[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | wc -l | tr -d ' ' > $start_file"
+}
+
+write_remote_launcher() {
+    local sweep="$1"
+    local script_file="$2"
+    local launcher_file="$3"
+    local pid_file="$4"
+    local exit_file="$5"
+
+    local launcher_body="#!/usr/bin/env bash
+set -uo pipefail
+trap 'rm -f \"$pid_file\"' EXIT
+set +e
+\"$script_file\"
+rc=\$?
+echo \"\$rc\" > \"$exit_file\"
+exit \"\$rc\"
+"
+
+    kubectl exec -i "$CONTROLLER_POD" -- tee "$launcher_file" > /dev/null <<< "$launcher_body"
+    kubectl exec "$CONTROLLER_POD" -- chmod +x "$launcher_file"
 }
 
 # ── actions ──────────────────────────────────────────────────────────────────
@@ -240,7 +261,9 @@ action_start() {
 
     local log_file="/workspace/sweep-${sweep}.log"
     local script_file="/workspace/sweep-${sweep}.sh"
+    local launcher_file="/workspace/sweep-${sweep}.launcher.sh"
     local pid_file="/workspace/sweep-${sweep}.pid"
+    local exit_file="/workspace/sweep-${sweep}.exit_code"
 
     local target_file="/workspace/sweep-${sweep}.target_runs"
 
@@ -285,7 +308,9 @@ done
 
     kubectl exec -i "$CONTROLLER_POD" -- tee "$script_file" > /dev/null <<< "$script_body"
     kubectl exec "$CONTROLLER_POD" -- chmod +x "$script_file"
+    write_remote_launcher "$sweep" "$script_file" "$launcher_file" "$pid_file" "$exit_file"
     kubectl exec "$CONTROLLER_POD" -- bash -c "echo ${runs} > $target_file"
+    kubectl exec "$CONTROLLER_POD" -- rm -f "$pid_file" "$exit_file"
 
     save_start_count "$sweep"
 
@@ -295,7 +320,7 @@ done
 
     # Run in background inside the pod so it survives if we disconnect
     kubectl exec "$CONTROLLER_POD" -- bash -c \
-        "nohup $script_file > $log_file 2>&1 & echo \$! > $pid_file; echo \"Sweep PID: \$(cat $pid_file)\""
+        "nohup $launcher_file > $log_file 2>&1 < /dev/null & echo \$! > $pid_file; echo \"Sweep PID: \$(cat $pid_file)\""
 
     info ""
     info "Sweep started in background on '$CONTROLLER_POD'"
@@ -341,7 +366,9 @@ action_improve() {
 
     local log_file="/workspace/sweep-${sweep}.log"
     local script_file="/workspace/sweep-${sweep}.sh"
+    local launcher_file="/workspace/sweep-${sweep}.launcher.sh"
     local pid_file="/workspace/sweep-${sweep}.pid"
+    local exit_file="/workspace/sweep-${sweep}.exit_code"
 
     local improve_flags=""
     [ -n "$allow_model_change" ] && improve_flags+="--allow-model-change "
@@ -379,7 +406,9 @@ done
 
     kubectl exec -i "$CONTROLLER_POD" -- tee "$script_file" > /dev/null <<< "$script_body"
     kubectl exec "$CONTROLLER_POD" -- chmod +x "$script_file"
+    write_remote_launcher "$sweep" "$script_file" "$launcher_file" "$pid_file" "$exit_file"
     kubectl exec "$CONTROLLER_POD" -- bash -c "echo ${runs} > $target_file"
+    kubectl exec "$CONTROLLER_POD" -- rm -f "$pid_file" "$exit_file"
 
     save_start_count "$sweep"
 
@@ -388,7 +417,7 @@ done
     info ""
 
     kubectl exec "$CONTROLLER_POD" -- bash -c \
-        "nohup $script_file > $log_file 2>&1 & echo \$! > $pid_file; echo \"Sweep PID: \$(cat $pid_file)\""
+        "nohup $launcher_file > $log_file 2>&1 < /dev/null & echo \$! > $pid_file; echo \"Sweep PID: \$(cat $pid_file)\""
 
     info ""
     info "Improve started in background on '$CONTROLLER_POD'"
@@ -534,10 +563,16 @@ action_status() {
                 progress=" — ${total_runs} runs total"
             fi
 
-            if kill -0 "$pid" 2>/dev/null; then
+            proc_state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d " ")
+            if [ -n "$proc_state" ] && [[ "$proc_state" != Z* ]]; then
                 echo "  RUNNING: $sweep (PID $pid)${progress}"
             else
-                echo "  DONE:    $sweep (PID $pid)${progress}"
+                rm -f "$f"
+                if [ -n "$proc_state" ] && [[ "$proc_state" == Z* ]]; then
+                    echo "  DONE:    $sweep (stale zombie PID $pid cleaned)${progress}"
+                else
+                    echo "  DONE:    $sweep (PID $pid cleaned)${progress}"
+                fi
             fi
         done' 2>/dev/null || true)
 

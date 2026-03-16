@@ -167,6 +167,11 @@ The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccou
 
 `make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
 
+Remote sweep bookkeeping notes:
+- `make sweep-status` now ignores zombie controller-side shell PIDs and cleans stale `.pid` files automatically, so finished sweeps no longer appear stuck in `RUNNING`.
+- Remote sweep launchers remove their own `.pid` files on normal exit and write `/workspace/sweep-<name>.exit_code` on the controller for postmortem inspection.
+- The controller pod spec now uses a lightweight reaper loop instead of `sleep infinity`, but that change only takes effect after the controller pod is recreated. If you update the controller while long sweeps are in flight, wait for them to finish before running `make sweep-remote-teardown`.
+
 ## Other targets
 
 | Target | Description |

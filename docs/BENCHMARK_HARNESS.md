@@ -115,6 +115,11 @@ make sweep-status        # check running sweeps
 make sync-results SWEEP=qwen3-throughput  # pull results to local
 ```
 
+Remote sweep lifecycle notes:
+- `make sweep-status` now treats zombie controller-side shell PIDs as finished work and removes stale pid files while reporting status.
+- Each background sweep runs through a small launcher wrapper that deletes `/workspace/sweep-<name>.pid` on exit and records `/workspace/sweep-<name>.exit_code`.
+- The controller pod spec now includes a simple reaper loop for orphaned child processes. If you already have a long-lived controller pod running, recreate it after your active sweeps finish to pick up that reaping behavior.
+
 Both `make benchmark` and `make improve` collect lightweight run profiling automatically. The profiler samples vLLM's built-in Prometheus endpoint every few seconds during the benchmark and writes a compact summary plus raw JSONL timeseries. If `nvidia-smi` is available inside the pod, GPU utilization, memory use, temperature, and power draw are also sampled.
 
 **Agent handoff:** See [AGENT_HANDOFF.md](AGENT_HANDOFF.md) for a concise summary so another agent can pick up this work quickly.

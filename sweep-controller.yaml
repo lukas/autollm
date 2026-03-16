@@ -46,7 +46,11 @@ spec:
           KUBEEOF
           touch /tmp/ready
           echo "Controller ready (kubectl + uv installed)"
-          sleep infinity
+          while true; do
+            if ! wait -n 2>/dev/null; then
+              sleep 1
+            fi
+          done
       resources:
         requests:
           cpu: "1"
