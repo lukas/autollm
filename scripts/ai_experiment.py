@@ -93,6 +93,11 @@ QUERY_STALE_SEC = int(os.environ.get("EXPERIMENT_QUERY_STALE_SEC", "60"))
 SAMPLE_QUERY_TIMEOUT = int(os.environ.get("EXPERIMENT_SAMPLE_QUERY_TIMEOUT", "30"))
 
 AGENT_MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "50"))
+PROMPT_LEADERBOARD_SUCCESS_LIMIT = int(os.environ.get("PROMPT_LEADERBOARD_SUCCESS_LIMIT", "8"))
+PROMPT_LEADERBOARD_FAILURE_LIMIT = int(os.environ.get("PROMPT_LEADERBOARD_FAILURE_LIMIT", "8"))
+FULL_RETRO_REFRESH_EVERY = int(os.environ.get("FULL_RETRO_REFRESH_EVERY", "5"))
+RESEARCH_MEMORY_REFRESH_EVERY = int(os.environ.get("RESEARCH_MEMORY_REFRESH_EVERY", "3"))
+PROMPT_RESEARCH_MEMORY_CHAR_LIMIT = int(os.environ.get("PROMPT_RESEARCH_MEMORY_CHAR_LIMIT", "2200"))
 
 TOOL_SYSTEM_PROMPT = """\
 You are an LLM serving optimizer agent on Kubernetes (H200 GPU, CoreWeave).
@@ -101,7 +106,7 @@ Pick ONE simple change most likely to improve performance, then test it.
 ## Workflow
 1. Read the leaderboard and lessons learned (in the prompt).
 2. Pick one untried change. Do NOT bundle multiple changes.
-3. Use read_file/read_logs to inspect past runs if needed; search_web/fetch_url for vLLM docs.
+3. Read the sweep research memory in the prompt first. Use read_file/read_logs to inspect past runs. Use search_web/fetch_url only if that local memory does not already answer the question.
 4. Write the config: write_file('vllm-config.yaml', <complete pod YAML>).
 5. Optionally: run_benchmark(<description>) to deploy and test.
 
@@ -109,6 +114,7 @@ Pick ONE simple change most likely to improve performance, then test it.
 - One run = one experiment. After you benchmark a config, stop. Do NOT pivot to a second experiment in the same run.
 - If the benchmark exposes a crash, invalid arg, startup bug, or harness/runtime issue, you may debug that SAME config idea.
 - Do NOT turn a retry into a fresh optimization pass. Let the next run/agent try the next experiment.
+- Prefer local evidence over web search. Assume repeated failures and prior research are already documented unless the prompt/logs show a genuinely new issue.
 
 ## File safety
 - write_file writes ONLY to the isolated per-run directory. You can only write 'vllm-config.yaml' and 'Makefile'.
@@ -326,6 +332,323 @@ Raw retros:
         return f"(Failed to generate synthesis: {e})\n\n{raw_retros[:3000]}"
 
 
+def _research_cache_paths(sweep_dir: Path) -> tuple[Path, Path, Path]:
+    return (
+        sweep_dir / "RESEARCH_LOG.md",
+        sweep_dir / "RESEARCH_MEMORY.md",
+        sweep_dir / "RESEARCH_MEMORY.meta.json",
+    )
+
+
+def _collect_research_log(sweep_dir: Path | None) -> str:
+    if not sweep_dir or not sweep_dir.exists():
+        return ""
+    log_path, _, _ = _research_cache_paths(sweep_dir)
+    if not log_path.exists():
+        return ""
+    try:
+        return log_path.read_text().strip()
+    except Exception:
+        return ""
+
+
+def _research_entry_count(raw_log: str) -> int:
+    return len(re.findall(r"^##\s", raw_log, flags=re.MULTILINE))
+
+
+def _generate_research_memory(sweep_dir: Path, call_fn) -> str:
+    raw_log = _collect_research_log(sweep_dir)
+    if not raw_log:
+        return ""
+
+    prompt = f"""Below is a sweep-local log of external research already done by previous agents.
+Synthesize it into a compact memory document that future agents should read before doing more web research.
+
+Rules:
+- Deduplicate aggressively.
+- Distinguish confirmed findings from tentative ones.
+- Organize into: Confirmed findings, likely dead ends / avoid repeating, open questions, useful sources.
+- Keep only actionable research that changes tuning/debugging decisions.
+- Mention backend/workload specificity when relevant.
+- Be terse. No filler. Target 15-30 lines.
+
+Raw research log:
+{raw_log}"""
+    try:
+        return call_fn(prompt).strip()
+    except Exception as e:
+        return f"(Failed to synthesize research memory: {e})\n\n{raw_log[:3000]}"
+
+
+def _should_refresh_research_memory(sweep_dir: Path) -> bool:
+    log_path, memory_path, meta_path = _research_cache_paths(sweep_dir)
+    if not log_path.exists():
+        return False
+    if not memory_path.exists() or not meta_path.exists():
+        return True
+    meta = _read_json_file(meta_path)
+    raw_log = _collect_research_log(sweep_dir)
+    entry_count = _research_entry_count(raw_log)
+    source_chars = len(raw_log)
+    previous_entries = int(meta.get("entry_count", -1) or -1)
+    previous_chars = int(meta.get("source_chars", -1) or -1)
+    if previous_entries < 0 or previous_chars < 0:
+        return True
+    if entry_count != previous_entries and entry_count - previous_entries >= RESEARCH_MEMORY_REFRESH_EVERY:
+        return True
+    if source_chars != previous_chars and previous_entries == entry_count:
+        return True
+    return False
+
+
+def _get_or_refresh_research_memory(sweep_dir: Path, call_fn) -> str:
+    log_path, memory_path, meta_path = _research_cache_paths(sweep_dir)
+    if not log_path.exists():
+        return ""
+    if not _should_refresh_research_memory(sweep_dir) and memory_path.exists():
+        try:
+            return memory_path.read_text().strip()
+        except Exception:
+            pass
+    memory = _generate_research_memory(sweep_dir, call_fn).strip()
+    if not memory:
+        return ""
+    raw_log = _collect_research_log(sweep_dir)
+    meta = {
+        "entry_count": _research_entry_count(raw_log),
+        "source_chars": len(raw_log),
+        "updated_at": datetime.now().isoformat(),
+    }
+    memory_path.write_text(memory)
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return memory
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _get_run_dirs(runs_base: Path | None) -> list[Path]:
+    if not runs_base or not runs_base.exists():
+        return []
+    return sorted(
+        [d for d in runs_base.iterdir() if d.is_dir() and not d.name.startswith(".")],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+
+
+def _best_run_name_for_objective(runs_base: Path | None) -> str:
+    if not runs_base or not runs_base.exists():
+        return ""
+    sweep_name = runs_base.name.replace("sweep-", "")
+    objective = sweep_objective(sweep_name)
+    best_name = ""
+    best_key: tuple[float, float] | tuple[float] | None = None
+    for d in _get_run_dirs(runs_base):
+        benchmarks = d / "benchmarks.json"
+        if not benchmarks.exists():
+            continue
+        try:
+            data = json.loads(benchmarks.read_text())
+            if not is_valid_run(d, data):
+                continue
+            metrics = data.get("benchmarks", [{}])[0].get("metrics", {})
+            latency = metric_mean(metrics, "request_latency")
+            throughput = metric_mean(metrics, "tokens_per_second")
+            ttft = metric_mean(metrics, "time_to_first_token_ms")
+            if objective == "throughput":
+                key = (-(throughput or 0), latency or 999999)
+            elif objective == "ttft":
+                key = (ttft or 999999,)
+            else:
+                key = (latency or 999999,)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_name = d.name
+        except Exception:
+            continue
+    return best_name
+
+
+def _full_retro_cache_paths(sweep_dir: Path) -> tuple[Path, Path]:
+    return sweep_dir / "FULL_RETRO.txt", sweep_dir / "FULL_RETRO.meta.json"
+
+
+def _failure_category_signature(runs_base: Path | None) -> list[str]:
+    categories: set[str] = set()
+    for d in _get_run_dirs(runs_base):
+        meta_path = d / "run_metadata.json"
+        if not meta_path.exists():
+            continue
+        meta = _read_json_file(meta_path)
+        if meta.get("success"):
+            continue
+        category = str(((meta.get("failure_classification") or {}).get("category")) or "").strip()
+        if category:
+            categories.add(category)
+    return sorted(categories)
+
+
+def _should_refresh_full_retro(sweep_dir: Path) -> bool:
+    retro_path, meta_path = _full_retro_cache_paths(sweep_dir)
+    if not retro_path.exists() or not meta_path.exists():
+        return True
+    meta = _read_json_file(meta_path)
+    retro_runs = [d.name for d in _get_run_dirs(sweep_dir) if (d / "RETRO.md").exists()]
+    run_count = len(retro_runs)
+    latest_run = retro_runs[0] if retro_runs else ""
+    best_run = _best_run_name_for_objective(sweep_dir)
+    previous_count = int(meta.get("source_run_count", -1) or -1)
+    failure_categories = _failure_category_signature(sweep_dir)
+    if run_count <= 0:
+        return False
+    if best_run and best_run != meta.get("best_run"):
+        return True
+    if failure_categories != meta.get("failure_categories", []):
+        return True
+    if previous_count < 0:
+        return True
+    if run_count - previous_count >= FULL_RETRO_REFRESH_EVERY:
+        return True
+    if not meta.get("latest_run"):
+        return True
+    if latest_run and previous_count == 0:
+        return True
+    return False
+
+
+def _get_or_refresh_full_retro(sweep_dir: Path, call_fn) -> str:
+    retro_path, meta_path = _full_retro_cache_paths(sweep_dir)
+    if not _should_refresh_full_retro(sweep_dir) and retro_path.exists():
+        try:
+            return retro_path.read_text().strip()
+        except Exception:
+            pass
+    full_retro = _generate_full_retro(sweep_dir, call_fn).strip()
+    if not full_retro:
+        return ""
+    retro_runs = [d.name for d in _get_run_dirs(sweep_dir) if (d / "RETRO.md").exists()]
+    meta = {
+        "source_run_count": len(retro_runs),
+        "latest_run": retro_runs[0] if retro_runs else "",
+        "best_run": _best_run_name_for_objective(sweep_dir),
+        "failure_categories": _failure_category_signature(sweep_dir),
+        "updated_at": datetime.now().isoformat(),
+    }
+    retro_path.write_text(full_retro)
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return full_retro
+
+
+def _result_from_metadata(run_dir: Path) -> str:
+    metadata_path = run_dir / "run_metadata.json"
+    if not metadata_path.exists():
+        return ""
+    return str(_read_json_file(metadata_path).get("result", "")).strip()
+
+
+def _known_issue_summary_line(category: str, count: int, example: str) -> str:
+    label = category.replace("_", " ")
+    line = f"- `{label}` seen {count} time(s)"
+    if example:
+        line += f": {example[:180]}"
+    return line
+
+
+def _build_known_issues_section(runs_base: Path | None) -> str:
+    if not runs_base or not runs_base.exists():
+        return ""
+    category_counts: dict[str, int] = {}
+    category_examples: dict[str, str] = {}
+    harness_lines: dict[str, int] = {}
+    good_lines: list[str] = []
+    for d in _get_run_dirs(runs_base):
+        meta = _read_json_file(d / "run_metadata.json") if (d / "run_metadata.json").exists() else {}
+        short_name = _read_short_name(d) or meta.get("description", "") or d.name
+        if meta.get("success") and (d / "benchmarks.json").exists():
+            try:
+                data = json.loads((d / "benchmarks.json").read_text())
+                if not is_valid_run(d, data):
+                    continue
+                metrics = data.get("benchmarks", [{}])[0].get("metrics", {})
+                summary = _fmt_summary(metrics)
+                if summary and summary != "—":
+                    good_lines.append(f"- `{short_name[:70]}`: {summary}")
+            except Exception:
+                pass
+            continue
+
+        classification = meta.get("failure_classification") or {}
+        category = str(classification.get("category") or "unknown").strip().lower() or "unknown"
+        summary = str(classification.get("summary") or meta.get("result") or "").strip()
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if summary and category not in category_examples:
+            category_examples[category] = summary
+
+        result = str(meta.get("result") or "").lower()
+        if "sample query returned empty or invalid response" in result:
+            harness_lines["sample query invalid; likely harness/parser mismatch"] = harness_lines.get(
+                "sample query invalid; likely harness/parser mismatch", 0
+            ) + 1
+        if "stuck in phase 'pod_wait'" in result or "stuck in phase 'health_check'" in result:
+            harness_lines["watchdog timeout during pod wait/health check"] = harness_lines.get(
+                "watchdog timeout during pod wait/health check", 0
+            ) + 1
+
+    lines = ["## Structured sweep memory", ""]
+    if good_lines:
+        lines.append("Best known frontier:")
+        lines.extend(good_lines[:4])
+        lines.append("")
+    if category_counts:
+        lines.append("Known bad / repeated failure classes:")
+        ranked = sorted(category_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        for category, count in ranked[:6]:
+            lines.append(_known_issue_summary_line(category, count, category_examples.get(category, "")))
+        lines.append("")
+    if harness_lines:
+        lines.append("Known harness-only patterns (do not spend a fresh tuning run rediscovering these):")
+        for label, count in sorted(harness_lines.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"- {label} ({count}x)")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_agent_context_cache(sweep_dir: Path) -> None:
+    if not sweep_dir or not sweep_dir.exists():
+        return
+    context_path = sweep_dir / "AGENT_CONTEXT.md"
+    _, research_memory_path, _ = _research_cache_paths(sweep_dir)
+    leaderboard = _get_experiment_leaderboard(
+        sweep_dir,
+        PROJECT_ROOT,
+        max_successes=PROMPT_LEADERBOARD_SUCCESS_LIMIT,
+        max_failures=PROMPT_LEADERBOARD_FAILURE_LIMIT,
+        compact=True,
+    )
+    known_issues = _build_known_issues_section(sweep_dir)
+    pieces = ["# Compact agent context", "", leaderboard]
+    if known_issues:
+        pieces.extend(["", known_issues.rstrip()])
+    if research_memory_path.exists():
+        try:
+            research_memory = research_memory_path.read_text().strip()
+            if research_memory:
+                pieces.extend([
+                    "",
+                    "## Sweep research memory",
+                    "",
+                    research_memory[:PROMPT_RESEARCH_MEMORY_CHAR_LIMIT],
+                ])
+        except Exception:
+            pass
+    context_path.write_text("\n".join(piece for piece in pieces if piece).strip() + "\n")
+
+
 def _extract_vllm_args(config_text: str) -> str:
     """Extract just the image and arg list from a vLLM pod YAML."""
     try:
@@ -500,8 +823,15 @@ def _backend_label_for_run(run_dir: Path, meta: dict | None = None) -> str:
     return infer_backend(config_text, makefile_text)
 
 
-def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
-    """Compact leaderboard ranked according to the sweep objective."""
+def _get_experiment_leaderboard(
+    runs_base: Path,
+    project_root: Path,
+    *,
+    max_successes: int | None = None,
+    max_failures: int = 20,
+    compact: bool = False,
+) -> str:
+    """Leaderboard ranked according to the sweep objective."""
     if not runs_base.exists():
         return "No experiments."
     dirs = [d for d in runs_base.iterdir() if d.is_dir() and not d.name.startswith(".")]
@@ -607,23 +937,32 @@ def _get_experiment_leaderboard(runs_base: Path, project_root: Path) -> str:
     if successes:
         lines.append(f"LEADERBOARD (successful runs, ranked by {sweep_ranking_label(sweep_name)}):")
         lines.append("-" * 100)
-        for s in successes:
+        shown_successes = successes[:max_successes] if max_successes is not None else successes
+        for s in shown_successes:
             header = s["name"]
             if s.get("short_name"):
                 header += f"  [{s['short_name']}]"
             header += f"  <{s['backend']}>"
             lines.append(f"{header}  {s['metrics']}")
+            if not compact and s.get("changes"):
+                lines.append("  changes: " + "; ".join(s["changes"][:4]))
+            lines.append("")
+        if compact and len(successes) > len(shown_successes):
+            lines.append(f"... {len(successes) - len(shown_successes)} more successful runs omitted")
             lines.append("")
 
     if failures:
         lines.append(f"\nFailed runs ({len(failures)} total — DO NOT repeat these strategies):")
-        for f in failures[-20:]:
+        shown_failures = failures[:max_failures]
+        for f in shown_failures:
             label = f['name']
             if f.get('short_name'):
                 label += f"  [{f['short_name']}]"
             label += f"  <{f['backend']}>"
             summary = f.get('retro') or f.get('changes') or f['desc'][:120] or "no details"
             lines.append(f"  {label}: {summary}")
+        if compact and len(failures) > len(shown_failures):
+            lines.append(f"  ... {len(failures) - len(shown_failures)} more failed runs omitted")
 
     lines.append(f"\nTo get details on any run, use: read_file('results/{runs_base.name}/<run>/RETRO.md') or read_logs('<run>', 'benchmark')")
 
@@ -671,6 +1010,7 @@ def _refresh_sweep_outputs(sweep_dir: Path | None, provider: str, model: str) ->
         return
     _update_sweep_metadata_agent(sweep_dir, provider, model)
     _write_leaderboard_to_sweep(sweep_dir)
+    _write_agent_context_cache(sweep_dir)
     write_sweep_overview(sweep_dir, agent_provider=provider, agent_model=model)
 
 
@@ -999,13 +1339,74 @@ INFRASTRUCTURE_ERROR_PATTERNS = [
     "RBAC",
     "Unauthorized",
     "get current server API",
+    "Pod unschedulable",
+    "Unschedulable",
+    "Insufficient nvidia.com/gpu",
 ]
 
 
 def _is_infrastructure_error(result: str) -> bool:
-    """Return True if the error is kubectl/K8s setup, not vLLM config."""
+    """Return True if the error is cluster/setup/capacity, not vLLM config."""
     r = result.lower()
     return any(p.lower() in r for p in INFRASTRUCTURE_ERROR_PATTERNS)
+
+
+def _infrastructure_error_guidance(result: str) -> list[str]:
+    """Actionable next steps for infra/capacity failures."""
+    r = (result or "").lower()
+    if "unschedulable" in r or "insufficient nvidia.com/gpu" in r:
+        return [
+            "This is a cluster-capacity issue, not a config problem. Check:",
+            "  1. kubectl get pods -o wide  (confirm current GPU occupancy)",
+            "  2. kubectl describe nodes  (confirm allocatable GPUs on the target pool)",
+            "  3. Retry later or free capacity before spending another improve run",
+        ]
+    return [
+        "This is a Kubernetes/kubectl setup issue. Check:",
+        "  1. KUBECONFIG is set and points to your cluster",
+        "  2. kubectl auth can-i delete pods  (must return yes)",
+        "  3. kubectl get pods  (should reach the cluster)",
+    ]
+
+
+def _read_tail_if_exists(path: Path, limit: int = 6000) -> str:
+    try:
+        if path.exists():
+            return path.read_text(errors="replace")[-limit:]
+    except Exception:
+        pass
+    return ""
+
+
+def _detect_retry_skip_reason(run_dir: Path, result: str) -> str | None:
+    """Return a reason to skip another agent retry for known harness-only failures."""
+    text = (result or "").lower()
+    deploy_tail = _read_tail_if_exists(run_dir / "deploy.log")
+    kubectl_tail = _read_tail_if_exists(run_dir / "kubectl_logs.txt")
+    combined = f"{deploy_tail}\n{kubectl_tail}".lower()
+
+    if "sample query returned empty or invalid response" in text:
+        if '"reasoning_content"' in combined or '"reasoning"' in combined or '"content": null' in combined:
+            return (
+                "sample query failed because the model answered in reasoning fields; "
+                "treat this as a harness/parser issue, not a new config experiment"
+            )
+
+    if "stuck in phase 'pod_wait'" in text or "stuck in phase 'health_check'" in text:
+        if "traceback" not in combined and "runtimeerror:" not in combined and "error: unrecognized arguments" not in combined:
+            if "condition met" in combined or "containersnotready" in combined or "readiness probe" in combined:
+                return (
+                    "watchdog timed out during pod readiness without a clear config crash; "
+                    "inspect harness/k8s lifecycle instead of spending another agent retry"
+                )
+
+    if "no benchmark json found" in text and "post /v1/chat/completions" in combined:
+        return (
+            "benchmark traffic reached the server but artifacts were not captured; "
+            "this looks like harness bookkeeping rather than a new tuning problem"
+        )
+
+    return None
 
 
 # Patterns that indicate vLLM failed to start (fatal config error, crash, etc.)
@@ -1778,11 +2179,28 @@ def main() -> int:
     # Ensure experiment_dir always uses the new name
     (experiment_dir / "vllm-config.yaml").write_text(vllm_content)
     runs_for_context = sweep_dir or RUNS_DIR
-    leaderboard = _get_experiment_leaderboard(runs_for_context, PROJECT_ROOT)
+    leaderboard = _get_experiment_leaderboard(
+        runs_for_context,
+        PROJECT_ROOT,
+        max_successes=PROMPT_LEADERBOARD_SUCCESS_LIMIT,
+        max_failures=PROMPT_LEADERBOARD_FAILURE_LIMIT,
+        compact=True,
+    )
     if sweep_dir:
+        _get_or_refresh_research_memory(sweep_dir, call_fn)
         _write_leaderboard_to_sweep(sweep_dir)
+        _write_agent_context_cache(sweep_dir)
     workload = _get_workload_description(runs_for_context)
     profile_context = _get_profile_context(runs_for_context, PROJECT_ROOT)
+    known_issues_section = _build_known_issues_section(runs_for_context)
+    research_memory_section = ""
+    if sweep_dir:
+        research_memory = _get_or_refresh_research_memory(sweep_dir, call_fn)
+        if research_memory:
+            research_memory_section = (
+                "\n## Sweep research memory (read this before doing more web research)\n\n"
+                f"{research_memory[:PROMPT_RESEARCH_MEMORY_CHAR_LIMIT]}\n"
+            )
 
     # Include the most recent run retro alongside the synthesized summary.
     latest_retro_section = ""
@@ -1791,21 +2209,19 @@ def main() -> int:
         if latest_retro:
             latest_retro_section = (
                 f"\n## Most recent run retro ({latest_run_name})\n\n"
-                f"{latest_retro[:4000]}\n"
+                f"{latest_retro[:1800]}\n"
             )
 
-    # Generate FULL_RETRO.txt — LLM-synthesized summary of all run retros
+    # Reuse cached FULL_RETRO.txt unless the sweep meaningfully changed.
     full_retro_section = ""
     if sweep_dir:
-        print("Synthesizing retros from all runs into FULL_RETRO.txt...")
-        full_retro = _generate_full_retro(sweep_dir, call_fn)
+        full_retro = _get_or_refresh_full_retro(sweep_dir, call_fn)
         if full_retro:
-            (sweep_dir / "FULL_RETRO.txt").write_text(full_retro)
-            full_retro_section = f"\n## Lessons learned from all previous runs\n\n{full_retro}\n"
+            full_retro_section = f"\n## Lessons learned from all previous runs\n\n{full_retro[:2400]}\n"
     elif runs_for_context and runs_for_context.exists():
         raw = _collect_all_retros(runs_for_context)
         if raw:
-            full_retro_section = f"\n## Lessons from previous runs\n\n{raw[:3000]}\n"
+            full_retro_section = f"\n## Lessons from previous runs\n\n{raw[:1800]}\n"
 
     # Read optional meta-feedback (human/external-model suggestions)
     meta_feedback_section = ""
@@ -1814,20 +2230,21 @@ def main() -> int:
         try:
             fb = meta_feedback_file.read_text().strip()
             if fb:
-                meta_feedback_section = f"\n## Meta-feedback (suggestions from an external reviewer — consider these for your next experiment)\n\n{fb}\n"
+                meta_feedback_section = (
+                    "\n## Meta-feedback (external reviewer)\n\n"
+                    f"{fb[:1200]}\n"
+                )
         except Exception:
             pass
 
-    # Load vLLM tuning guide if available
-    tuning_guide_section = ""
-    tuning_guide_file = PROJECT_ROOT / "docs" / "vllm_tuning_guide.md"
-    if tuning_guide_file.exists():
-        try:
-            tg = tuning_guide_file.read_text().strip()
-            if tg:
-                tuning_guide_section = f"\n## vLLM Tuning Guide (from official docs)\n\n{tg}\n"
-        except Exception:
-            pass
+    high_leverage_knobs_section = """
+## High-leverage knobs
+
+- Batching/scheduling: `--max-num-batched-tokens`, `--max-num-seqs`, `--enable-chunked-prefill`, `--max-num-partial-prefills`, `--async-scheduling`
+- Memory/context: `--gpu-memory-utilization`, `--kv-cache-dtype`, `--block-size`, `--max-model-len`
+- Precision/compile: `--dtype`, `--quantization`, `--compilation-config`, `--enforce-eager`
+- Caching/speculation: `--enable-prefix-caching`; speculative decoding only if already validated on this backend
+"""
 
     # Read optimization goal from sweep metadata
     goal = "Minimize latency and maximize throughput (tok/s)."
@@ -1922,7 +2339,7 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Experiment leaderboard
 
 {leaderboard}
-{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}
+{known_issues_section}{research_memory_section}{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}
 ## Hard constraints (DO NOT violate)
 
 - {backend_constraints_section}
@@ -1931,30 +2348,12 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Observed quirks
 
 - {backend_quirks_section}
-
-## vLLM serve flags reference (performance-relevant subset)
-
-**Model & precision:** `--dtype` (auto|half|bfloat16), `--quantization` (awq|gptq|fp8|None), `--max-model-len` (context length, -1=auto), `--enforce-eager` (disable CUDA graphs; can reduce TTFT, may hurt throughput)
-
-**GPU & memory:** `--tensor-parallel-size` (-tp), `--gpu-memory-utilization` (0-1, default 0.9), `--kv-cache-dtype` (auto|fp8|fp8_e4m3|bfloat16 — fp8 halves KV cache memory), `--block-size` (KV cache block size)
-
-**Scheduling & batching:** `--max-num-batched-tokens`, `--max-num-seqs`, `--enable-chunked-prefill`, `--max-num-partial-prefills` (default 1), `--async-scheduling`
-
-**Caching:** `--enable-prefix-caching` (cache common prefix KV blocks)
-
-**Speculative decoding:** prefer ngram only on this image, using dot-notation CLI args such as `--speculative-config.method ngram`, `--speculative-config.num_speculative_tokens 5`, `--speculative-config.prompt_lookup_max 5`. Do NOT use draft-model speculative decoding here.
-
-**Compilation & CUDA graphs:** `--compilation-config '{{"mode": N}}'` (0=none, 1=inductor, 2=reduce-overhead, 3=max-autotune). `--performance-mode` balanced|interactivity|throughput.
-
-**Env vars** (add to `spec.containers[0].env`): `VLLM_ATTENTION_BACKEND` (FLASH_ATTN|FLASHINFER), `VLLM_USE_TRITON_FLASH_ATTN`, `VLLM_WORKER_MULTIPROC_METHOD` (spawn|fork), `VLLM_LOGGING_LEVEL` (WARNING to reduce overhead).
-
-**Other:** `--optimization-level` (0-3, default 2), `--attention-backend` (CLI alternative to env var), `--disable-log-stats`.
-
-{tuning_guide_section}
+{high_leverage_knobs_section}
 ## Your task
 
 Pick ONE untried change (check leaderboard) backed by evidence. Change exactly one knob.
 This run should test exactly one experiment hypothesis. If that hypothesis benchmarks successfully, stop even if it regresses.
+Prefer local evidence from the sweep. Read the sweep research memory first. Only use `search_web`/`fetch_url` when that memory plus the logs/retros do not already cover the question.
 1. State: `knob: old -> new` and why (2-3 sentences)
 2. write_file('vllm-config.yaml', <complete YAML>)
 {"3. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
@@ -2004,10 +2403,9 @@ This run should test exactly one experiment hypothesis. If that hypothesis bench
             if _is_infrastructure_error(result_msg):
                 print("\n*** Infrastructure error (not fixable by vLLM config) ***")
                 print(result_msg[:600])
-                print("\nThis is a Kubernetes/kubectl setup issue. Check:")
-                print("  1. KUBECONFIG is set and points to your cluster")
-                print("  2. kubectl auth can-i delete pods  (must return yes)")
-                print("  3. kubectl get pods  (should reach the cluster)")
+                print()
+                for line in _infrastructure_error_guidance(result_msg):
+                    print(line)
                 _update_run_metadata(
                     run_dir,
                     description="Infrastructure error",
@@ -2015,6 +2413,34 @@ This run should test exactly one experiment hypothesis. If that hypothesis bench
                     success=False,
                     result=result_msg[:1000],
                     failure_classification=classify_failure_text(result_msg),
+                )
+                if sweep_dir:
+                    _refresh_sweep_outputs(sweep_dir, provider, model)
+                    stop_status = should_stop_sweep(sweep_dir)
+                    if stop_status["stop"]:
+                        print(stop_status["reason"])
+                        return SWEEP_STOP_EXIT_CODE
+                return 1
+
+            retry_skip_reason = _detect_retry_skip_reason(run_dir, result_msg)
+            if retry_skip_reason:
+                stop_msg = f"Stopping retries: {retry_skip_reason}"
+                print(stop_msg)
+                _update_run_metadata(
+                    run_dir,
+                    description=stop_msg[:500],
+                    attempt=attempt + 1,
+                    success=False,
+                    result=result_msg[:1000],
+                    failure_classification=classify_failure_text(result_msg),
+                )
+                _append_result(
+                    experiment_dir,
+                    stop_msg,
+                    result_msg,
+                    success=False,
+                    run_dir=run_dir,
+                    results_path=results_txt,
                 )
                 if sweep_dir:
                     _refresh_sweep_outputs(sweep_dir, provider, model)
@@ -2042,6 +2468,7 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 - This is NOT a fresh optimization pass. Do NOT pick a new experiment or a different tuning idea.
 - Only repair the same experiment so it can be measured once, or conclude it should stop here.
 - If the evidence shows a harness/watchdog issue (not a config problem), say NO_CONFIG_CHANGE: <reason>.
+- Prefer local retros/logs/research memory over web search. Only use `search_web`/`fetch_url` for genuinely new flags or undocumented crashes.
 - Otherwise fix minimally: repair the failed experiment only, reverting the last change first if needed.
 - Keep Pod kind. Do not invent a new backend or image family; only use the canonical variants for this sweep if you must switch backends.
 - For vLLM variants, preserve the init script, PVC volumeMounts/volumes, and tensorizer flags exactly as-is. Only modify `vllm serve` flags.

@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -218,6 +219,8 @@ class ToolContext:
     # Keep one benchmark per agent loop so a single run directory maps to one config attempt.
     max_benchmarks: int = 1
     _benchmark_count: int = 0
+    max_web_tool_calls: int = int(os.environ.get("AGENT_MAX_WEB_TOOL_CALLS", "20"))
+    _web_tool_calls: int = 0
 
     tool_log: list[dict[str, Any]] = field(default_factory=list)
     log_path: Path | None = None
@@ -296,6 +299,44 @@ def _truncate(text: str, limit: int = 50_000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n\n... (truncated)"
+
+
+def _research_log_path(ctx: ToolContext) -> Path | None:
+    if not ctx.sweep_dir:
+        return None
+    return ctx.sweep_dir / "RESEARCH_LOG.md"
+
+
+def _append_research_log(ctx: ToolContext, tool_name: str, arguments: dict[str, Any], result: str) -> None:
+    """Persist sweep-local web research so later runs can reuse it."""
+    log_path = _research_log_path(ctx)
+    if not log_path:
+        return
+    try:
+        parts = []
+        if not log_path.exists():
+            parts.extend([
+                "# Sweep research log",
+                "",
+                "This file captures external research done during this sweep.",
+                "Use `RESEARCH_MEMORY.md` for the compact synthesized takeaways.",
+                "",
+            ])
+        query_or_url = arguments.get("query") or arguments.get("url") or ""
+        parts.extend([
+            f"## {datetime.now().isoformat()} | {tool_name}",
+            f"- Run: `{ctx.run_dir.name}`",
+            f"- Input: `{str(query_or_url)[:500]}`",
+            "",
+            "```text",
+            _truncate(result, 4000),
+            "```",
+            "",
+        ])
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(parts))
+    except Exception:
+        pass
 
 
 def _html_to_text(raw: str) -> str:
@@ -626,9 +667,23 @@ def execute_tool(name: str, arguments: dict[str, Any], ctx: ToolContext) -> str:
     start = time.time()
     try:
         if name == "search_web":
-            result = _tool_search_web(arguments["query"])
+            if ctx._web_tool_calls >= ctx.max_web_tool_calls:
+                result = (
+                    "Denied: web-tool budget reached for this run. "
+                    "Use sweep research memory plus local leaderboard/retros/logs unless this is a genuinely new issue."
+                )
+            else:
+                ctx._web_tool_calls += 1
+                result = _tool_search_web(arguments["query"])
         elif name == "fetch_url":
-            result = _tool_fetch_url(arguments["url"])
+            if ctx._web_tool_calls >= ctx.max_web_tool_calls:
+                result = (
+                    "Denied: web-tool budget reached for this run. "
+                    "Use sweep research memory plus local leaderboard/retros/logs unless this is a genuinely new issue."
+                )
+            else:
+                ctx._web_tool_calls += 1
+                result = _tool_fetch_url(arguments["url"])
         elif name == "read_file":
             result = _tool_read_file(arguments["path"], ctx)
         elif name == "write_file":
@@ -652,6 +707,9 @@ def execute_tool(name: str, arguments: dict[str, Any], ctx: ToolContext) -> str:
             result = f"Unknown tool: {name}"
     except Exception as e:
         result = f"Tool execution error: {e}"
+
+    if name in {"search_web", "fetch_url"} and not result.startswith("Denied:"):
+        _append_research_log(ctx, name, arguments, result)
 
     elapsed = time.time() - start
     ctx.tool_log.append({

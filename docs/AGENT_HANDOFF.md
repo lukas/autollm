@@ -61,6 +61,10 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `sweep-controller-rbac.yaml` | RBAC: ServiceAccount, Role, RoleBinding for controller to manage vLLM pods |
 | `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`). Each has `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
+| `docs/SWEEP_BEST_PRACTICES.md` | One-page synthesis of cross-sweep lessons for future optimization agents |
+| `results/sweep-NAME/AGENT_CONTEXT.md` | Generated compact sweep memory for prompts: top frontier, repeated failures, and harness-only patterns |
+| `results/sweep-NAME/RESEARCH_LOG.md` | Append-only log of external research (`search_web` / `fetch_url`) done during the sweep |
+| `results/sweep-NAME/RESEARCH_MEMORY.md` | Cached synthesized research memory that future runs should read before doing more web research |
 
 ---
 
@@ -77,6 +81,10 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - full strategy text
   - structured `Changed knobs vs baseline`
   - full arg summaries extracted from YAML using structured parsing, not fragile regex
+- Improve prompts now use a compact context window by default: top successful runs, the most recent failed runs, a short structured sweep-memory block, the newest `RETRO.md`, and a cached `FULL_RETRO.txt` synthesis instead of dumping the full sweep state every run.
+- `results/sweep-NAME/AGENT_CONTEXT.md` is regenerated alongside `leaderboard.txt` as a deterministic cache for future agents/humans. It summarizes the current frontier plus repeated failure classes and harness-only patterns.
+- `FULL_RETRO.txt` is now cached and only regenerated when the sweep meaningfully changes (for example a new best run or every few new retros), which cuts repeated prompt cost.
+- Web research is now sweep-local and durable: `search_web` / `fetch_url` append to `RESEARCH_LOG.md`, and `RESEARCH_MEMORY.md` is a cached synthesis of that history. Improve prompts include the research memory so later runs can reuse prior web work instead of re-searching.
 - Prompt guidance pushes the agent toward single-change experiments and allows `NO_CONFIG_CHANGE: ...` on retries when logs suggest a harness/watchdog issue rather than a config issue.
 
 ### Tool-Calling Agent
@@ -87,6 +95,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
 - `write_file` is sandboxed: only writes `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
 - Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
+- Web tools now keep sweep-local memory. Agents are expected to read sweep research memory first, then use web calls only to fill genuine gaps rather than rediscovering the same facts every run.
 
 ### Run Retros
 
@@ -204,6 +213,12 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 9. **Backend-variant sweeps should keep their backend fixed unless you intentionally want backend swaps.**
    If a sweep starts from an explicit backend variant like `kimi-sglang`, `ai_experiment.py` now filters the prompt's canonical templates down to that backend so an "SGLang sweep" does not silently benchmark a vLLM retry.
+
+10. **Repeated harness-only failures should stop retries early.**
+   `ai_experiment.py` now short-circuits some known non-config retry loops (for example reasoning-only sample-query responses or pod-wait watchdog cases without a fatal server crash) so the next run can try a new experiment instead of wasting agent turns on the same harness issue.
+
+11. **Unschedulable GPU pods are cluster-capacity failures, not repairable experiment failures.**
+   If a run fails with `Pod unschedulable` / `Insufficient nvidia.com/gpu`, treat that as an immediate cluster-capacity stop condition. Do not let the retry loop spend turns "repairing" the YAML; wait for capacity or free GPUs first.
 
 ---
 
