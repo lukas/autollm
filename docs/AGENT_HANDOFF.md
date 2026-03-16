@@ -36,6 +36,7 @@ make sweep-remote-teardown                 # delete controller pod
 - `make sync-results` uses tar+kubectl to pull results back. Syncs a specific sweep or all results.
 - `make sync-results` must tolerate files changing during active sweeps. `scripts/sweep_remote.sh` now uses `tar --ignore-failed-read --warning=no-file-changed` on the controller side so live `benchmark_live.txt` / `benchmarks.json` updates do not corrupt the sync stream.
 - `make sync-results SWEEP=...` is now incremental: it refreshes top-level sweep files (`OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, etc.), always syncs `baseline/`, pulls missing timestamped run dirs, and re-syncs the newest two run dirs. Keep the shell compatible with macOS Bash 3.2; avoid `mapfile` and associative arrays.
+- If the remote controller pod no longer exists, `make sync-results` now prints a friendly "nothing to sync" message and exits successfully instead of failing the Make target.
 - Remote sweep launcher scripts now run through a tiny wrapper that removes `/workspace/sweep-<name>.pid` on exit and writes `/workspace/sweep-<name>.exit_code`. `make sweep-status` also ignores zombie PIDs and cleans stale pid files, since finished background shells can otherwise remain as `<defunct>` under the controller pod.
 - The controller pod itself should stay on the reaper loop in `sweep-controller.yaml` rather than `sleep infinity`; otherwise orphaned background sweep shells become zombie processes under PID 1.
 

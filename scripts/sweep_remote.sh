@@ -465,7 +465,10 @@ action_sync() {
         esac
     done
 
-    pod_exists || die "Controller pod '$CONTROLLER_POD' not found. Nothing to sync."
+    if ! pod_exists; then
+        info "Controller pod '$CONTROLLER_POD' not found. Nothing to sync."
+        return 0
+    fi
 
     local local_results="$PROJECT_DIR/results"
     mkdir -p "$local_results"

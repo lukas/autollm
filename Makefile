@@ -7,6 +7,7 @@
 KUBECONFIG ?= $(CURDIR)/kubeconfig
 export KUBECONFIG
 export EXA_API_KEY
+.DEFAULT_GOAL := help
 
 # Default model directory under runllm/
 MODEL_DIR ?= qwen2.5-1.5b
@@ -18,7 +19,53 @@ kubeconfig:
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
+.PHONY: help sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
+
+help:
+	@echo "autollm make targets"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make kubeconfig            Generate autollm/kubeconfig from .env"
+	@echo "  make sync                  Install/update Python deps with uv"
+	@echo ""
+	@echo "Benchmarking:"
+	@echo "  make benchmark             Deploy model and run benchmark"
+	@echo "  make benchmark-run         Run harness against existing port-forward"
+	@echo "  make benchmark-run-quick   Quick harness-only run"
+	@echo "  make results-summary       Summarize benchmark results"
+	@echo "  make results-index         Rebuild results index"
+	@echo "  make dashboard             Start Streamlit dashboard"
+	@echo "  make query PROMPT=\"...\"    Send a query to the current model"
+	@echo ""
+	@echo "Sweeps:"
+	@echo "  make sweep SWEEP=name      Create a new sweep and baseline"
+	@echo "  make improve SWEEP=name    Run one or more improve iterations"
+	@echo "  make full-sweep SWEEP=name RUNS=N"
+	@echo "                             Create sweep, baseline, then improve N times"
+	@echo "  make leaderboard SWEEP=name"
+	@echo "                             Refresh sweep leaderboard"
+	@echo "  make sweep-pods SWEEP=name List pods associated with a sweep"
+	@echo "  make backfill-names        Fill in missing short names for older runs"
+	@echo ""
+	@echo "Remote sweeps:"
+	@echo "  make sweep-remote SWEEP=name RUNS=N"
+	@echo "                             Start a remote controller-backed sweep"
+	@echo "  make improve-remote SWEEP=name RUNS=N"
+	@echo "                             Continue a sweep on the remote controller"
+	@echo "  make sweep-set-runs SWEEP=name RUNS=N"
+	@echo "                             Change target runs for a remote sweep"
+	@echo "  make sync-results [SWEEP=name]"
+	@echo "                             Pull remote sweep results to local"
+	@echo "  make sweep-logs            Tail remote sweep logs"
+	@echo "  make sweep-status          Show remote controller and sweep status"
+	@echo "  make sweep-remote-teardown Delete the remote controller pod"
+	@echo ""
+	@echo "Other:"
+	@echo "  make experiment            Run standalone AI experiment"
+	@echo "  make experiment-inspect    Inspect or kill a stuck experiment"
+	@echo "  make tensorize MODEL_DIR=name"
+	@echo "                             Tensorize model weights to PVC"
+	@echo "  make test-sweep-setup      Run cheap local sweep setup test"
 
 ensure-kubeconfig:
 	@test -f $(CURDIR)/kubeconfig || $(MAKE) kubeconfig
