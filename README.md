@@ -38,16 +38,20 @@ AI_PROVIDER=openai AI_MODEL=gpt-5.4 make improve SWEEP=qwen-latency
 
 ```bash
 make sweep SWEEP=qwen-latency GOAL="minimize latency"
-make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
+make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
 make sweep SWEEP=qwen-ttft GOAL="minimize time to first token (TTFT)"
 make sweep SWEEP=qwen-latency GOAL="minimize latency" BENCHMARK=medium  # 200 req, ~5 min
+make sweep SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
+make sweep SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang GOAL="maximize throughput"
 ```
 
-The `GOAL` tells the AI agent what metric to optimize. `MODEL_DIR` selects which model config from `runllm/` to use (default: `qwen2.5-1.5b`). Both are saved in `sweep_metadata.json` and included in every agent prompt for this sweep.
+The `GOAL` tells the AI agent what metric to optimize. `MODEL` selects the model family for the sweep (default: `qwen2.5-1.5b`). The sweep metadata stores that family, the baseline deployment variant, and all deployment variants available to the agent for that family.
 
-This deploys vLLM with the chosen model's `vllm-config.yaml`, runs the benchmark, and saves results to the sweep's `baseline/` directory.
+This deploys the baseline variant for that family, runs the benchmark, and saves results to the sweep's `baseline/` directory.
 
-Kimi-specific note: `runllm/kimi/` currently uses HuggingFace safetensors cached on the shared PVC plus `--trust-remote-code`, not tensorizer. Startup is therefore slower than the tensorized Qwen paths, but baseline and improve runs now work end-to-end.
+Kimi-specific note: `runllm/kimi-vllm/` currently uses HuggingFace safetensors cached on the shared PVC plus `--trust-remote-code`, not tensorizer. Startup is therefore slower than the tensorized Qwen paths, but baseline and improve runs now work end-to-end.
+
+Backend-variant note: Kimi family sweeps now automatically expose both `kimi-vllm` and `kimi-sglang` to improve runs. Use `BASELINE_VARIANT=kimi-sglang` only when you want the baseline run to start on SGLang instead of the default vLLM variant.
 
 ### Step 2: Run AI-driven improvements
 
@@ -165,7 +169,8 @@ For long sweeps, run the agent inside the Kubernetes cluster so it survives lapt
 
 ```bash
 # Start remote sweep (creates a lightweight controller pod, syncs code, runs in background)
-make sweep-remote SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep-remote SWEEP=qwen3-235b-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep-remote SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=100 GOAL="maximize throughput"
 
 # Continue a local sweep remotely (syncs local results to controller, runs improve in-cluster)
 make improve-remote SWEEP=qwen-throughput-async RUNS=20
@@ -198,6 +203,7 @@ Remote sweep bookkeeping notes:
 |--------|-------------|
 | `make setup` | One-time bootstrap: install deps and generate kubeconfig if needed |
 | `make sweep SWEEP=name` | Create sweep + run baseline |
+| `make sweep SWEEP=name MODEL=kimi` | Create a Kimi family sweep with both vLLM and SGLang variants available |
 | `make improve SWEEP=name` | AI agent suggests improvements |
 | `make full-sweep SWEEP=name RUNS=N` | Create sweep + baseline + N improvement runs |
 | `make sweep-remote SWEEP=name RUNS=N` | Run full sweep on a K8s controller pod |
@@ -219,6 +225,8 @@ Remote sweep bookkeeping notes:
 | Variable | Description |
 |----------|-------------|
 | `KUBECONFIG` | Cluster access — copy to `autollm/kubeconfig`, export it, or generate with `make kubeconfig` |
+| `MODEL` | Sweep model family, e.g. `qwen2.5-1.5b`, `qwen3-235b`, or `kimi` |
+| `BASELINE_VARIANT` | Optional concrete runllm variant for the baseline run, e.g. `kimi-sglang` |
 | `ANTHROPIC_API_KEY` | Required for AI agent (default provider) |
 | `OPENAI_API_KEY` | For OpenAI provider |
 | `AI_PROVIDER` | `anthropic` (default) or `openai` |

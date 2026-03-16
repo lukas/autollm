@@ -3,7 +3,7 @@
 # Remote sweep controller: run sweeps on a Kubernetes pod.
 #
 # Usage:
-#   scripts/sweep_remote.sh start    --sweep NAME [--model-dir DIR] [--benchmark BENCH] [--runs N] [--goal GOAL] [--force]
+#   scripts/sweep_remote.sh start    --sweep NAME [--model FAMILY] [--baseline-variant DIR] [--model-variants A,B] [--benchmark BENCH] [--runs N] [--goal GOAL] [--force]
 #   scripts/sweep_remote.sh improve  --sweep NAME [--runs N] [--allow-model-change]
 #   scripts/sweep_remote.sh set-runs --sweep NAME --runs N
 #   scripts/sweep_remote.sh sync     [--sweep NAME]
@@ -244,12 +244,15 @@ exit \"\$rc\"
 # ── actions ──────────────────────────────────────────────────────────────────
 
 action_start() {
-    local sweep="" model_dir="qwen2.5-1.5b" benchmark="quick" runs="1" goal="" force=""
+    local sweep="" model="qwen2.5-1.5b" baseline_variant="" model_variants="" benchmark="quick" runs="1" goal="" force=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --sweep)      sweep="$2";     shift 2 ;;
-            --model-dir)  model_dir="$2"; shift 2 ;;
+            --model)      model="$2"; shift 2 ;;
+            --model-dir)  baseline_variant="$2"; shift 2 ;;
+            --baseline-variant) baseline_variant="$2"; shift 2 ;;
+            --model-variants) model_variants="$2"; shift 2 ;;
             --benchmark)  benchmark="$2"; shift 2 ;;
             --runs)       runs="$2";      shift 2 ;;
             --goal)       goal="$2";      shift 2 ;;
@@ -271,7 +274,9 @@ action_start() {
     local target_file="/workspace/sweep-${sweep}.target_runs"
 
     # Write the sweep script with a target-file loop (so RUNS can be bumped live)
-    local sweep_cmd="make sweep SWEEP=${sweep} MODEL_DIR=${model_dir} BENCHMARK=${benchmark}"
+    local sweep_cmd="make sweep SWEEP=${sweep} MODEL=${model} BENCHMARK=${benchmark}"
+    [ -n "$baseline_variant" ] && sweep_cmd+=" BASELINE_VARIANT=\"${baseline_variant}\""
+    [ -n "$model_variants" ] && sweep_cmd+=" MODEL_VARIANTS=\"${model_variants}\""
     [ -n "$goal" ]  && sweep_cmd+=" GOAL=\"${goal}\""
     [ -n "$force" ] && sweep_cmd+=" FORCE=1"
 

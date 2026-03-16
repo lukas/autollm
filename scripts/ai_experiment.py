@@ -859,15 +859,16 @@ def _load_backend_templates(runllm_root: Path, model_variants: list[str]) -> lis
     return templates
 
 
-def _render_backend_templates_section(templates: list[dict[str, str]]) -> str:
+def _render_backend_templates_section(templates: list[dict[str, str]], model_family: str = "") -> str:
     if len(templates) <= 1:
         return ""
+    family_label = f" for the `{model_family}` model family" if model_family else ""
     lines = [
-        "## Backend variants available for this sweep",
+        f"## Backend variants available for this sweep{family_label}",
         "",
-        "You may keep the current backend or switch to one of these canonical variants.",
+        "You may keep the current backend or switch to any of these canonical family variants.",
         "A backend switch counts as the ONE experiment change for the run, so do not bundle extra tuning with the switch.",
-        "If you switch backend, replace BOTH `vllm-config.yaml` and `Makefile` from the chosen variant template before benchmarking.",
+        "If you switch backend, you may copy BOTH `vllm-config.yaml` and `Makefile` from any of the variant templates below before benchmarking.",
         "",
     ]
     for template in templates:
@@ -2202,21 +2203,27 @@ def main() -> int:
             print(stop_status["reason"])
             return SWEEP_STOP_EXIT_CODE
 
-    # Determine which model subdir to use
-    model_dir = DEFAULT_MODEL_DIR
+    # Determine the model family and concrete baseline variant for this run.
+    model_family = DEFAULT_MODEL_DIR
+    baseline_variant = DEFAULT_MODEL_DIR
     model_variants: list[str] = []
+    allow_backend_switches = False
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
         try:
             _sm = json.loads((sweep_dir / "sweep_metadata.json").read_text())
-            model_dir = _sm.get("model_dir", DEFAULT_MODEL_DIR)
+            model_family = _sm.get("model_family", _sm.get("model_dir", DEFAULT_MODEL_DIR))
+            baseline_variant = _sm.get("baseline_variant", _sm.get("model_dir", DEFAULT_MODEL_DIR))
             model_variants = list(_sm.get("model_variants") or [])
+            allow_backend_switches = bool(_sm.get("allow_backend_switches", False))
         except Exception:
             pass
     if not model_variants:
-        model_variants = list_model_variants(RUNLLM, model_dir)
+        model_variants = list_model_variants(RUNLLM, model_family)
     if not model_variants:
-        model_variants = [model_dir]
-    runllm_model = RUNLLM / model_dir
+        model_variants = [baseline_variant]
+    if baseline_variant not in model_variants:
+        model_variants = [baseline_variant, *[variant for variant in model_variants if variant != baseline_variant]]
+    runllm_model = RUNLLM / baseline_variant
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = (sweep_dir / ts) if sweep_dir else (RUNS_DIR / f"exp_{ts}")
@@ -2246,9 +2253,9 @@ def main() -> int:
     vllm_content = _vllm_cfg.read_text()
     current_backend = infer_backend(vllm_content, makefile_content)
     backend_templates = _load_backend_templates(RUNLLM, model_variants)
-    if backend_from_model_dir(model_dir) != "vllm":
+    if backend_from_model_dir(baseline_variant) != "vllm" and not allow_backend_switches:
         backend_templates = [t for t in backend_templates if t["backend"] == current_backend]
-    backend_templates_section = _render_backend_templates_section(backend_templates)
+    backend_templates_section = _render_backend_templates_section(backend_templates, model_family)
     # Ensure experiment_dir always uses the new name
     (experiment_dir / "vllm-config.yaml").write_text(vllm_content)
     runs_for_context = sweep_dir or RUNS_DIR
@@ -2453,7 +2460,8 @@ Prefer local evidence from the sweep. Read the sweep research memory first. Only
         timestamp=ts,
         description="",
         backend=initial_backend,
-        model_dir=model_dir,
+        model_family=model_family,
+        baseline_variant=baseline_variant,
         model_variants=model_variants,
         experiment_dir=str(experiment_dir),
         benchmark=benchmark,
@@ -2709,7 +2717,8 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             timestamp=ts,
             description=description[:500],
             backend=run_backend,
-            model_dir=model_dir,
+            model_family=model_family,
+            baseline_variant=baseline_variant,
             model_variants=model_variants,
             experiment_dir=str(experiment_dir),
             benchmark=benchmark,

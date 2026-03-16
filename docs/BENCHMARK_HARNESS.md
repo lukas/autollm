@@ -100,8 +100,9 @@ make dashboard
 Use the sweep workflow to let the agent iterate on vLLM config changes:
 
 ```bash
-make sweep SWEEP=qwen-latency MODEL_DIR=qwen2.5-1.5b GOAL="minimize latency"
-make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
+make sweep SWEEP=qwen-latency MODEL=qwen2.5-1.5b GOAL="minimize latency"
+make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
+make sweep SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
 make improve SWEEP=qwen-latency
 make leaderboard SWEEP=qwen-latency
 ```
@@ -109,6 +110,7 @@ make leaderboard SWEEP=qwen-latency
 Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RUN_RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
 The sweep root also keeps a synthesized cross-run memory in `FULL_RETRO.md` and `FULL_RETRO.txt`, and each run directory gets a snapshot of that full retro as it existed when the run started.
 The agent's full back-and-forth and tool activity are recorded locally in `agent.log` files (both per-run and sweep-level); the harness does not currently depend on an external tracing service.
+Sweep setup is now family-first: `MODEL=kimi` automatically exposes both `kimi-vllm` and `kimi-sglang` to improve runs. Use `BASELINE_VARIANT=...` only if you want the baseline to start from a non-default deployment variant.
 
 Sweep-local research memory:
 - `RESEARCH_LOG.md` records external research (`search_web` / `fetch_url`) done during the sweep.
@@ -119,7 +121,8 @@ Sweep-local research memory:
 For long sweeps, run the full sweep remotely inside the cluster:
 
 ```bash
-make sweep-remote SWEEP=qwen3-throughput MODEL_DIR=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep-remote SWEEP=qwen3-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep-remote SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=100 GOAL="maximize throughput"
 make sweep-logs          # tail live output
 make sweep-status        # check running sweeps
 make sync-results SWEEP=qwen3-throughput  # pull results to local

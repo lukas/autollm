@@ -19,31 +19,86 @@ from datetime import datetime
 from pathlib import Path
 
 from benchmark_config import BENCHMARK_PRESETS
-from model_variants import list_model_variants
+from model_variants import (
+    backend_from_model_dir,
+    canonical_model_family,
+    default_variant_for_family,
+    list_model_families,
+    list_model_variants,
+)
 from sweep_state import effective_agent_model, write_sweep_overview
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNLLM_ROOT = PROJECT_ROOT / "runllm"
-DEFAULT_MODEL_DIR = "qwen2.5-1.5b"
+DEFAULT_MODEL = "qwen2.5-1.5b"
 
 
-def _list_model_dirs() -> list[str]:
-    """List available model subdirs under runllm/."""
-    if not RUNLLM_ROOT.exists():
-        return []
-    return sorted(
-        d.name for d in RUNLLM_ROOT.iterdir()
-        if d.is_dir() and (d / "vllm-config.yaml").exists()
-    )
+def _list_models() -> list[str]:
+    """List available model families under runllm/."""
+    return list_model_families(RUNLLM_ROOT)
+
+
+def _resolve_model_variants(runllm_root: Path, model_family: str, requested_variants: str | None = None) -> list[str]:
+    """Resolve the variant set tracked by the sweep."""
+    if not requested_variants:
+        return list_model_variants(runllm_root, model_family)
+
+    seen: set[str] = set()
+    variants: list[str] = []
+    for raw in requested_variants.split(","):
+        candidate = raw.strip()
+        if not candidate or candidate in seen:
+            continue
+        variant_dir = runllm_root / candidate
+        if not variant_dir.is_dir() or not (variant_dir / "vllm-config.yaml").exists():
+            raise ValueError(f"Model variant '{candidate}' not found under runllm/")
+        variants.append(candidate)
+        seen.add(candidate)
+
+    return variants
+
+
+def _resolve_baseline_variant(
+    runllm_root: Path,
+    model_name: str,
+    model_variants: list[str],
+    baseline_variant: str | None = None,
+) -> str:
+    """Resolve which concrete variant should be used for the baseline run."""
+    if baseline_variant:
+        variant = baseline_variant.strip()
+        variant_dir = runllm_root / variant
+        if not variant_dir.is_dir() or not (variant_dir / "vllm-config.yaml").exists():
+            raise ValueError(f"Baseline variant '{variant}' not found under runllm/")
+        return variant
+
+    explicit_variant = model_name.strip()
+    variant_dir = runllm_root / explicit_variant
+    if variant_dir.is_dir() and (variant_dir / "vllm-config.yaml").exists():
+        return explicit_variant
+
+    if model_variants:
+        return default_variant_for_family(runllm_root, model_name)
+    return explicit_variant
+
+
+def _allow_backend_switches(model_variants: list[str]) -> bool:
+    """Decide whether improve runs may switch across backend templates."""
+    return len({backend_from_model_dir(variant) for variant in model_variants}) > 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start a new sweep and run baseline")
     parser.add_argument("--sweep", "-s", required=True, help="Sweep name (e.g. qwen-1b-latency)")
     parser.add_argument(
-        "--model-dir", "-m",
-        default=DEFAULT_MODEL_DIR,
-        help=f"Model subdirectory under runllm/ (available: {', '.join(_list_model_dirs()) or '?'})",
+        "--model", "-m",
+        default=DEFAULT_MODEL,
+        help=f"Model family under runllm/ (available: {', '.join(_list_models()) or '?'})",
+    )
+    parser.add_argument("--model-dir", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--baseline-variant",
+        help="Concrete runllm variant to use for the baseline run, e.g. 'kimi-sglang'",
     )
     parser.add_argument(
         "--benchmark", "-b",
@@ -63,6 +118,10 @@ def main() -> int:
     parser.add_argument("--max-requests", type=int, help="Override max requests")
     parser.add_argument("--max-seconds", type=float, help="Override max seconds")
     parser.add_argument("--goal", help="Optimization goal for the AI agent (e.g. 'minimize latency', 'maximize throughput', 'minimize TTFT')")
+    parser.add_argument(
+        "--model-variants",
+        help="Comma-separated runllm variants allowed in this sweep, e.g. 'kimi-vllm,kimi-sglang'",
+    )
     args = parser.parse_args()
 
     name = args.sweep.strip().lower().replace(" ", "-")
@@ -70,12 +129,8 @@ def main() -> int:
         print("Sweep name required. Usage: make sweep SWEEP=my-sweep")
         return 1
 
-    model_dir = args.model_dir
-    model_path = RUNLLM_ROOT / model_dir
-    if not (model_path / "vllm-config.yaml").exists():
-        avail = _list_model_dirs()
-        print(f"Model dir '{model_dir}' not found (no vllm-config.yaml). Available: {', '.join(avail)}")
-        return 1
+    model_name = (args.model_dir or args.model).strip()
+    model_family = canonical_model_family(model_name)
 
     sweep_dir = PROJECT_ROOT / "results" / f"sweep-{name}"
     baseline_dir = sweep_dir / "baseline"
@@ -87,13 +142,26 @@ def main() -> int:
     sweep_dir.mkdir(parents=True, exist_ok=True)
     baseline_dir.mkdir(parents=True, exist_ok=True)
 
-    model_variants = list_model_variants(RUNLLM_ROOT, model_dir)
+    try:
+        model_variants = _resolve_model_variants(RUNLLM_ROOT, model_family, args.model_variants)
+        baseline_variant = _resolve_baseline_variant(RUNLLM_ROOT, model_name, model_variants, args.baseline_variant)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    model_path = RUNLLM_ROOT / baseline_variant
+    if not model_variants or not (model_path / "vllm-config.yaml").exists():
+        avail = _list_models()
+        print(f"Model '{model_name}' not found. Available families: {', '.join(avail)}")
+        return 1
+    allow_backend_switches = _allow_backend_switches(model_variants)
     agent_provider = os.environ.get("AI_PROVIDER", "anthropic").lower()
     agent_model = effective_agent_model(agent_provider, os.environ.get("AI_MODEL", ""))
     sweep_metadata = {
         "name": name,
-        "model_dir": model_dir,
+        "model_family": model_family,
+        "baseline_variant": baseline_variant,
         "model_variants": model_variants,
+        "allow_backend_switches": allow_backend_switches,
         "created_at": datetime.now().isoformat(),
         "benchmark": args.benchmark,
         "data": args.data,
@@ -109,9 +177,12 @@ def main() -> int:
     write_sweep_overview(sweep_dir, agent_provider=agent_provider, agent_model=agent_model)
 
     print(f"Sweep dir: {sweep_dir}")
-    print(f"Model: {model_dir} ({model_path / 'vllm-config.yaml'})")
+    print(f"Model family: {model_family}")
+    print(f"Baseline variant: {baseline_variant} ({model_path / 'vllm-config.yaml'})")
     if model_variants:
         print(f"Backend variants available to improve runs: {', '.join(model_variants)}")
+    if allow_backend_switches and len(model_variants) > 1:
+        print("Backend switching is enabled for this sweep.")
     print(f"Running baseline ({args.benchmark})...")
 
     vllm_config = str(model_path / "vllm-config.yaml")

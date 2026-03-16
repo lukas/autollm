@@ -1,6 +1,6 @@
 # Sweep Best Practices
 
-Practical guidance for future agents running `autollm` sweeps. This is based on the current `qwen`, `qwen3-235b`, `kimi`, and `kimi-sglang` sweep results.
+Practical guidance for future agents running `autollm` sweeps. This is based on the current `qwen`, `qwen3-235b`, `kimi-vllm`, and `kimi-sglang` sweep results.
 
 ## 1. Make comparisons apples-to-apples
 
@@ -71,7 +71,7 @@ Practical guidance for future agents running `autollm` sweeps. This is based on 
 
 - `qwen2.5-1.5b`: throughput responds well to careful scheduler/prefill tuning. This is the best family for tight local search.
 - `qwen3-235b`: broad experimentation found real wins, but many backend/compiler/MoE changes were harmful or unstable. Be conservative once you are near the top of the leaderboard.
-- `kimi` on vLLM: current `quick` harness is too low-load to expose many server-side improvements. Throughput conclusions there are weak unless the workload is made more demanding.
+- `kimi-vllm`: current `quick` harness is too low-load to expose many server-side improvements. Throughput conclusions there are weak unless the workload is made more demanding.
 - `kimi-sglang`: current large sweep evidence suggests parser-free, schema-safe configs are the valid comparison set. Treat the old parser-enabled large baseline with caution.
 
 ## 10. Recommended future-agent workflow

@@ -187,7 +187,7 @@ def write_sweep_overview(
 
     provider = agent_provider or metadata.get("last_agent_provider") or metadata.get("agent_provider") or "anthropic"
     model = agent_model or metadata.get("last_agent_model") or metadata.get("agent_model") or effective_agent_model(provider)
-    runllm_dirs = metadata.get("model_variants") or ([metadata.get("model_dir")] if metadata.get("model_dir") else [])
+    runllm_dirs = metadata.get("model_variants") or ([metadata.get("baseline_variant")] if metadata.get("baseline_variant") else [])
     runllm_dirs = [f"runllm/{entry}" for entry in runllm_dirs if entry]
 
     baseline_complete = (sweep_dir / "baseline" / "benchmarks.json").exists()
@@ -205,7 +205,8 @@ def write_sweep_overview(
         f"- Max seconds: `{benchmark['max_seconds']}`",
         f"- Agent provider: `{provider}`",
         f"- Agent model: `{model}`",
-        f"- Primary model dir: `{('runllm/' + metadata['model_dir']) if metadata.get('model_dir') else 'unknown'}`",
+        f"- Model family: `{metadata.get('model_family') or metadata.get('model_dir') or 'unknown'}`",
+        f"- Baseline variant: `{('runllm/' + metadata['baseline_variant']) if metadata.get('baseline_variant') else ('runllm/' + metadata['model_dir']) if metadata.get('model_dir') else 'unknown'}`",
         f"- Available runllm dirs: {', '.join(f'`{entry}`' for entry in runllm_dirs) if runllm_dirs else '`unknown`'}",
         f"- Baseline complete: `{baseline_complete}`",
         f"- Improvement runs: `{len(run_dirs)}`",

@@ -11,6 +11,7 @@ export EXA_API_KEY
 
 # Default model directory under runllm/
 MODEL_DIR ?= qwen2.5-1.5b
+MODEL ?= $(MODEL_DIR)
 
 BENCHMARK ?= medium
 DESCRIPTION ?=
@@ -36,6 +37,7 @@ help:
 	@echo ""
 	@echo "Sweeps:"
 	@echo "  make sweep SWEEP=name      Create a new sweep and baseline"
+	@echo "                             Use MODEL=<family>, e.g. MODEL=kimi"
 	@echo "  make improve SWEEP=name    Run one or more improve iterations"
 	@echo "  make full-sweep SWEEP=name RUNS=N"
 	@echo "                             Create sweep, baseline, then improve N times"
@@ -47,6 +49,7 @@ help:
 	@echo "Remote sweeps:"
 	@echo "  make sweep-remote SWEEP=name RUNS=N"
 	@echo "                             Start a remote controller-backed sweep"
+	@echo "                             Use MODEL=<family>; optional BASELINE_VARIANT=<runllm-dir>"
 	@echo "  make improve-remote SWEEP=name RUNS=N"
 	@echo "                             Continue a sweep on the remote controller"
 	@echo "  make sweep-set-runs SWEEP=name RUNS=N"
@@ -109,10 +112,12 @@ dashboard:
 # Start a new sweep: create results/sweep-[name]/, run baseline, save to baseline/
 # Incomplete baselines (no benchmarks.json) are re-run automatically. Add FORCE=1 to overwrite complete baseline.
 # Usage: make sweep SWEEP=my-sweep [BENCHMARK=quick] [FORCE=1]
-#        make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
+#        make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
+#        make sweep SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
+#        make sweep SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang
 sweep: BENCHMARK=quick
 sweep: ensure-kubeconfig
-	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
+	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --model "$(MODEL)" --benchmark "$(BENCHMARK)" $(if $(BASELINE_VARIANT),--baseline-variant "$(BASELINE_VARIANT)",) $(if $(MODEL_VARIANTS),--model-variants "$(MODEL_VARIANTS)",) $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
 
 # Full sweep: create sweep + run baseline, then run N improvement iterations
 # Usage: make full-sweep SWEEP=my-sweep RUNS=5
@@ -178,10 +183,14 @@ tensorize: ensure-kubeconfig
 # Start a sweep on a remote controller pod (agent + benchmarks run in-cluster).
 # The controller pod is created once and reused. Code is synced from local.
 # Usage: make sweep-remote SWEEP=my-sweep RUNS=10 GOAL="maximize throughput"
-#        make sweep-remote SWEEP=qwen3-235b MODEL_DIR=qwen3-235b BENCHMARK=medium-throughput RUNS=30
+#        make sweep-remote SWEEP=qwen3-235b MODEL=qwen3-235b BENCHMARK=medium-throughput RUNS=30
+#        make sweep-remote SWEEP=kimi-dual MODEL=kimi RUNS=30
+#        make sweep-remote SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang RUNS=30
 sweep-remote: ensure-kubeconfig
 	@scripts/sweep_remote.sh start \
-		--sweep "$(SWEEP)" --model-dir "$(MODEL_DIR)" --benchmark "$(BENCHMARK)" \
+		--sweep "$(SWEEP)" --model "$(MODEL)" --benchmark "$(BENCHMARK)" \
+		$(if $(BASELINE_VARIANT),--baseline-variant "$(BASELINE_VARIANT)",) \
+		$(if $(MODEL_VARIANTS),--model-variants "$(MODEL_VARIANTS)",) \
 		--runs "$(RUNS)" $(if $(GOAL),--goal "$(GOAL)",) $(if $(FORCE),--force,)
 
 # Continue a local sweep remotely: sync local results to controller pod, run improve in-cluster.

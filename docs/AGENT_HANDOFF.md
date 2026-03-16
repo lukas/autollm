@@ -161,13 +161,14 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 ### runllm Surface
 
-- `autollm/runllm/` contains per-model subdirectories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`).
+- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`).
 - Each model dir is self-contained with `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
 - Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig` (relative to the model dir).
 - `runllm/qwen2.5-1.5b-sglang/` is a sibling SGLang variant that intentionally keeps the same filenames and `VLLM_MODEL` Makefile variable for compatibility with the existing `runllm`/sweep directory contract.
-- Sweeps for `qwen2.5-1.5b` now store `model_variants` metadata so improve runs can switch between the canonical `vllm` and `sglang` templates as a first-class experiment choice. Backend switches should replace both `vllm-config.yaml` and `Makefile` from the chosen variant.
-- Sweeps store `model_dir` in `sweep_metadata.json` so `make improve` uses the right model config.
+- Sweeps now store `model_family`, `baseline_variant`, and `model_variants` in `sweep_metadata.json` so improve runs know the canonical family plus every deployment variant available to that sweep.
+- Family-first sweep creation is now the default contract. For example, `make sweep MODEL=kimi` automatically exposes both `kimi-vllm` and `kimi-sglang`; use `BASELINE_VARIANT=kimi-sglang` only when you want the baseline run to start on SGLang instead of the default vLLM variant.
+- Backend switches should replace both `vllm-config.yaml` and `Makefile` from the chosen canonical variant template.
 - Every sweep directory now keeps an `OVERVIEW.md` with started time, benchmark/data config, agent provider/model, tracked `runllm/` variants, run counts, and current failure streak / stop-policy status. Refresh it whenever sweep metadata or run outcomes change.
 
 ### Tensorizer / PVC Model Loading
@@ -216,7 +217,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
    Kimi-K2.5 may return `content: null` with non-empty `reasoning` or `reasoning_content` on short chat completions. Treat those as valid sample-query success in harness code; otherwise improve runs can redeploy forever even though the server is healthy.
 
 9. **Backend-variant sweeps should keep their backend fixed unless you intentionally want backend swaps.**
-   If a sweep starts from an explicit backend variant like `kimi-sglang`, `ai_experiment.py` now filters the prompt's canonical templates down to that backend so an "SGLang sweep" does not silently benchmark a vLLM retry.
+   Family sweeps now default to all canonical variants for that family, but if a sweep is pinned to just one backend variant (for example via `BASELINE_VARIANT=kimi-sglang` plus a single-variant `MODEL_VARIANTS` override), `ai_experiment.py` should keep the prompt templates on that backend only.
 
 10. **Repeated harness-only failures should stop retries early.**
    `ai_experiment.py` now short-circuits some known non-config retry loops (for example reasoning-only sample-query responses or pod-wait watchdog cases without a fatal server crash) so the next run can try a new experiment instead of wasting agent turns on the same harness issue.
