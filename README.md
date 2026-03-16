@@ -94,6 +94,7 @@ The agent has access to these tools during each run:
 
 The tool stack works with both Anthropic and OpenAI APIs. Max tool calls per run defaults to 50 (configurable via `AGENT_MAX_TURNS`).
 Web research calls default to 20 per run (configurable via `AGENT_MAX_WEB_TOOL_CALLS`), but prior research is cached per sweep so later runs can usually reuse what was already learned.
+Agent conversations and tool calls are recorded locally in per-run `agent.log` files plus the sweep-level `agent.log`; there is no built-in external tracing backend.
 
 ### Run retros
 
@@ -139,7 +140,7 @@ results/sweep-qwen-latency/
   RESEARCH_MEMORY.md       # cached synthesized research findings reused by later runs
   best-runllm -> .../runllm  # symlink to best config's runllm
   results.txt              # experiment log
-  agent.log                # full agent conversation history (all runs)
+  agent.log                # full local agent conversation history (all runs)
   20260311_120000/          # improvement run
     runllm/                 # modified runllm snapshot
     vllm_config.yaml        # vLLM config used

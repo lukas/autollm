@@ -105,6 +105,7 @@ make leaderboard SWEEP=qwen-latency
 ```
 
 Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
+The agent's full back-and-forth and tool activity are recorded locally in `agent.log` files (both per-run and sweep-level); the harness does not currently depend on an external tracing service.
 
 Sweep-local research memory:
 - `RESEARCH_LOG.md` records external research (`search_web` / `fetch_url`) done during the sweep.

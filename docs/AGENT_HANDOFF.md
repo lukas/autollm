@@ -93,6 +93,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - `run_agent()` in `agent_tools.py` implements the agentic loop for both Anthropic Messages API and OpenAI Responses API.
 - OpenAI improve runs now use the Responses API in `scripts/agent_tools.py`, so GPT-5-class models can do tool calling without falling back to older chat-completions-only models. User preference in this workspace is GPT-5.4/latest GPT or latest Anthropic only; do not silently downgrade to `gpt-4o`/`gpt-4o-mini`.
 - Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
+- Conversation/tool traces are stored locally in `agent.log` files; there is no required external tracing dependency in the current workflow.
 - `write_file` is sandboxed: only writes `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
 - Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
 - Web tools now keep sweep-local memory. Agents are expected to read sweep research memory first, then use web calls only to fill genuine gaps rather than rediscovering the same facts every run. The default per-run web-call budget is now 20 via `AGENT_MAX_WEB_TOOL_CALLS`.
