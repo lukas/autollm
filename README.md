@@ -62,6 +62,12 @@ Each run:
 4. If it crashes or stalls, retries up to 3 times with the agent diagnosing via logs/kubectl
 5. After every run (success or failure), the agent writes a `RETRO.md` capturing what changed, what happened, and lessons for future agents
 
+Sweep-local agent memory:
+- External research is now persisted per sweep in `RESEARCH_LOG.md`.
+- A compact cached synthesis is written to `RESEARCH_MEMORY.md` and included in later improve prompts.
+- The agent is expected to read that research memory before doing more web search, so web research can be more thorough without redoing the same searches every run.
+- If a run fails because the pod is unschedulable (for example `Insufficient nvidia.com/gpu`), the improve loop now treats that as a cluster-capacity stop condition instead of wasting retries "repairing" the YAML.
+
 Sweep safety rails:
 - The sweep stops automatically after 10 failed runs in a row.
 - The sweep also stops after 2 consecutive failures classified as unfixable, such as provider/tool credit exhaustion, auth failures, Exa quota failures, or repeated timeout failures.
@@ -87,6 +93,7 @@ The agent has access to these tools during each run:
 | `kubectl_logs` | Fetch pod logs from the cluster |
 
 The tool stack works with both Anthropic and OpenAI APIs. Max tool calls per run defaults to 50 (configurable via `AGENT_MAX_TURNS`).
+Web research calls default to 20 per run (configurable via `AGENT_MAX_WEB_TOOL_CALLS`), but prior research is cached per sweep so later runs can usually reuse what was already learned.
 
 ### Run retros
 
@@ -128,6 +135,8 @@ results/sweep-qwen-latency/
   OVERVIEW.md              # sweep summary: workload, agent model, runllm variants, streak status
   baseline/                # baseline run
   leaderboard.txt          # ranked runs + failed strategies
+  RESEARCH_LOG.md          # append-only log of sweep web research
+  RESEARCH_MEMORY.md       # cached synthesized research findings reused by later runs
   best-runllm -> .../runllm  # symlink to best config's runllm
   results.txt              # experiment log
   agent.log                # full agent conversation history (all runs)
@@ -165,7 +174,7 @@ make sweep-remote-teardown                     # delete controller pod (sync fir
 
 The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` are injected from your local `.env` and environment, so remote sweeps can be pinned to GPT the same way as local runs.
 
-`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
+`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
 
 Remote sweep bookkeeping notes:
 - `make sweep-status` now ignores zombie controller-side shell PIDs and cleans stale `.pid` files automatically, so finished sweeps no longer appear stuck in `RUNNING`.
@@ -209,5 +218,6 @@ Remote sweep bookkeeping notes:
 | `MAX_SECONDS` | Override max benchmark duration |
 | `EXA_API_KEY` | Exa API key for web search (falls back to DuckDuckGo if unset) |
 | `AGENT_MAX_TURNS` | Max tool calls per agent run (default: 50) |
+| `AGENT_MAX_WEB_TOOL_CALLS` | Max `search_web` / `fetch_url` calls per run (default: 20) |
 | `SWEEP_MAX_CONSECUTIVE_FAILURES` | Stop a sweep after this many failed runs in a row (default: 10) |
 | `SWEEP_MAX_CONSECUTIVE_UNFIXABLE_FAILURES` | Stop a sweep after this many unfixable failures in a row (default: 2) |

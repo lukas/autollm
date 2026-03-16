@@ -65,6 +65,8 @@ sync_single_sweep_incremental() {
         "sweep-${sweep}/OVERVIEW.md"
         "sweep-${sweep}/leaderboard.txt"
         "sweep-${sweep}/FULL_RETRO.txt"
+        "sweep-${sweep}/RESEARCH_LOG.md"
+        "sweep-${sweep}/RESEARCH_MEMORY.md"
         "sweep-${sweep}/results.txt"
         "sweep-${sweep}/agent.log"
         "sweep-${sweep}/meta-feedback.txt"

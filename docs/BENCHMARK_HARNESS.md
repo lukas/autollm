@@ -106,6 +106,12 @@ make leaderboard SWEEP=qwen-latency
 
 Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
 
+Sweep-local research memory:
+- `RESEARCH_LOG.md` records external research (`search_web` / `fetch_url`) done during the sweep.
+- `RESEARCH_MEMORY.md` is a cached synthesis of that log and is included in later improve prompts.
+- This lets the agent do more web research when useful without paying to rediscover the same facts every run.
+- If a deploy fails because the pod is unschedulable or GPUs are unavailable, the improve loop now treats that as a cluster-capacity failure and stops instead of spending retries on config repairs.
+
 For long sweeps, run the full sweep remotely inside the cluster:
 
 ```bash
@@ -119,10 +125,15 @@ Remote sweep lifecycle notes:
 - `make sweep-status` now treats zombie controller-side shell PIDs as finished work and removes stale pid files while reporting status.
 - Each background sweep runs through a small launcher wrapper that deletes `/workspace/sweep-<name>.pid` on exit and records `/workspace/sweep-<name>.exit_code`.
 - The controller pod spec now includes a simple reaper loop for orphaned child processes. If you already have a long-lived controller pod running, recreate it after your active sweeps finish to pick up that reaping behavior.
+- `make sync-results SWEEP=...` refreshes top-level sweep memory artifacts too, including `FULL_RETRO.txt` and `RESEARCH_MEMORY.md`, so local inspection stays aligned with the controller-side agent context.
 
 Both `make benchmark` and `make improve` collect lightweight run profiling automatically. The profiler samples vLLM's built-in Prometheus endpoint every few seconds during the benchmark and writes a compact summary plus raw JSONL timeseries. If `nvidia-smi` is available inside the pod, GPU utilization, memory use, temperature, and power draw are also sampled.
 
 **Agent handoff:** See [AGENT_HANDOFF.md](AGENT_HANDOFF.md) for a concise summary so another agent can pick up this work quickly.
+
+Useful env vars for agent behavior:
+- `AGENT_MAX_TURNS` controls total tool calls per improve run (default `50`).
+- `AGENT_MAX_WEB_TOOL_CALLS` controls `search_web` / `fetch_url` calls per improve run (default `20`).
 
 ## Tips
 
