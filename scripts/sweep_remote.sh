@@ -64,6 +64,7 @@ sync_single_sweep_incremental() {
         "sweep-${sweep}/sweep_metadata.json"
         "sweep-${sweep}/OVERVIEW.md"
         "sweep-${sweep}/leaderboard.txt"
+        "sweep-${sweep}/FULL_RETRO.md"
         "sweep-${sweep}/FULL_RETRO.txt"
         "sweep-${sweep}/RESEARCH_LOG.md"
         "sweep-${sweep}/RESEARCH_MEMORY.md"

@@ -91,7 +91,7 @@ make dashboard
 | `vllm_metrics_profile.json` | Compact profile summary: cache pressure, queue depth, throughput, GPU usage, diagnosis hints |
 | `run_metadata.json` | Timestamp, description |
 | `run.log` | Harness log + Guideline stdout/stderr |
-| `RETRO.md` | Agent-written retrospective (every sweep run) |
+| `RUN_RETRO.md` | Agent-written retrospective (every sweep run) |
 
 ## AI-Driven Optimization
 
@@ -104,7 +104,8 @@ make improve SWEEP=qwen-latency
 make leaderboard SWEEP=qwen-latency
 ```
 
-Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
+Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RUN_RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
+The sweep root also keeps a synthesized cross-run memory in `FULL_RETRO.md` and `FULL_RETRO.txt`, and each run directory gets a snapshot of that full retro as it existed when the run started.
 The agent's full back-and-forth and tool activity are recorded locally in `agent.log` files (both per-run and sweep-level); the harness does not currently depend on an external tracing service.
 
 Sweep-local research memory:
@@ -126,7 +127,7 @@ Remote sweep lifecycle notes:
 - `make sweep-status` now treats zombie controller-side shell PIDs as finished work and removes stale pid files while reporting status.
 - Each background sweep runs through a small launcher wrapper that deletes `/workspace/sweep-<name>.pid` on exit and records `/workspace/sweep-<name>.exit_code`.
 - The controller pod spec now includes a simple reaper loop for orphaned child processes. If you already have a long-lived controller pod running, recreate it after your active sweeps finish to pick up that reaping behavior.
-- `make sync-results SWEEP=...` refreshes top-level sweep memory artifacts too, including `FULL_RETRO.txt` and `RESEARCH_MEMORY.md`, so local inspection stays aligned with the controller-side agent context.
+- `make sync-results SWEEP=...` refreshes top-level sweep memory artifacts too, including `FULL_RETRO.md`, `FULL_RETRO.txt`, and `RESEARCH_MEMORY.md`, so local inspection stays aligned with the controller-side agent context.
 
 Both `make benchmark` and `make improve` collect lightweight run profiling automatically. The profiler samples vLLM's built-in Prometheus endpoint every few seconds during the benchmark and writes a compact summary plus raw JSONL timeseries. If `nvidia-smi` is available inside the pod, GPU utilization, memory use, temperature, and power draw are also sampled.
 

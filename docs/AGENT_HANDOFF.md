@@ -81,9 +81,9 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - full strategy text
   - structured `Changed knobs vs baseline`
   - full arg summaries extracted from YAML using structured parsing, not fragile regex
-- Improve prompts now use a compact context window by default: top successful runs, the most recent failed runs, a short structured sweep-memory block, the newest `RETRO.md`, and a cached `FULL_RETRO.txt` synthesis instead of dumping the full sweep state every run.
+- Improve prompts now use a compact context window by default: top successful runs, the most recent failed runs, a short structured sweep-memory block, the newest `RUN_RETRO.md`, and a cached `FULL_RETRO.md`/`FULL_RETRO.txt` synthesis instead of dumping the full sweep state every run.
 - `results/sweep-NAME/AGENT_CONTEXT.md` is regenerated alongside `leaderboard.txt` as a deterministic cache for future agents/humans. It summarizes the current frontier plus repeated failure classes and harness-only patterns.
-- `FULL_RETRO.txt` is now cached and only regenerated when the sweep meaningfully changes (for example a new best run or every few new retros), which cuts repeated prompt cost.
+- `FULL_RETRO.md` is the canonical sweep-level retro synthesis, with `FULL_RETRO.txt` kept as a compatibility mirror. The synthesis is cached and only regenerated when the sweep meaningfully changes (for example a new best run, new failure class, or updated retro content), which cuts repeated prompt cost.
 - Web research is now sweep-local and durable: `search_web` / `fetch_url` append to `RESEARCH_LOG.md`, and `RESEARCH_MEMORY.md` is a cached synthesis of that history. Improve prompts include the research memory so later runs can reuse prior web work instead of re-searching.
 - Prompt guidance pushes the agent toward single-change experiments and allows `NO_CONFIG_CHANGE: ...` on retries when logs suggest a harness/watchdog issue rather than a config issue.
 
@@ -100,12 +100,13 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 
 ### Run Retros
 
-- Every run (success or failure) writes a `RETRO.md` via `_write_run_retro()` in `ai_experiment.py`.
+- Every run (success or failure) writes a `RUN_RETRO.md` via `_write_run_retro()` in `ai_experiment.py`.
 - The retro agent gets up to 10 tool calls to inspect logs and gather evidence.
 - Retros are designed for consumption by future AI agents. They capture: exact knob changes, key metrics or errors, causal explanations, crashes from any phase, research findings, and non-obvious pitfalls.
-- Retros should be terse (3-10 lines) but complete.
-- If a single run directory contains multiple internal attempts, new retros are appended to `RETRO.md` with a markdown separator instead of overwriting the previous attempt.
-- New improve prompts include both the newest per-run `RETRO.md` in the sweep and the synthesized `FULL_RETRO.txt`, so the next agent sees the freshest local context plus the higher-level summary.
+- Run retros should be concise but evidence-rich, with exact values and benchmark/profile facts whenever available.
+- If a single run directory contains multiple internal attempts, new retros are appended to `RUN_RETRO.md` with a markdown separator instead of overwriting the previous attempt.
+- When a run starts, the current `FULL_RETRO.md` / `FULL_RETRO.txt` snapshot is copied into that run directory so you can reconstruct exactly what sweep memory the agent saw at that time.
+- New improve prompts include both the newest per-run `RUN_RETRO.md` in the sweep and the synthesized `FULL_RETRO.md`, so the next agent sees the freshest local context plus the higher-level summary.
 
 ### In-Cluster Benchmarking (K8s Jobs)
 

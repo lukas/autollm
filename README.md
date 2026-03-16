@@ -60,7 +60,7 @@ Each run:
 2. Agent uses tools (web search, file reading, kubectl, log inspection) to research and propose a change
 3. Agent writes the config via `write_file`, deploys, and benchmarks
 4. If it crashes or stalls, retries up to 3 times with the agent diagnosing via logs/kubectl
-5. After every run (success or failure), the agent writes a `RETRO.md` capturing what changed, what happened, and lessons for future agents
+5. After every run (success or failure), the agent writes a `RUN_RETRO.md` capturing what changed, what happened, and lessons for future agents
 
 Sweep-local agent memory:
 - External research is now persisted per sweep in `RESEARCH_LOG.md`.
@@ -98,13 +98,15 @@ Agent conversations and tool calls are recorded locally in per-run `agent.log` f
 
 ### Run retros
 
-Every run produces a `RETRO.md` in its run directory. Retros are written by the agent after benchmarking and are designed to be read by future agents. They capture:
+Every run produces a `RUN_RETRO.md` in its run directory. Retros are written by the agent after benchmarking and are designed to be read by future agents. They capture:
 - Exact knob changes and their values
 - Key metrics or the specific error
 - Causal explanation of why the change worked or failed
 - Crashes or errors from any phase (deploy, runtime, benchmark)
 - Research findings discovered during the run (version-specific behavior, undocumented defaults, flag interactions)
 - Non-obvious pitfalls for future experiments
+
+Each sweep also keeps a higher-level synthesis in both `FULL_RETRO.md` and `FULL_RETRO.txt` at the sweep root. When a new run starts, the current full-retro snapshot is copied into that run directory too, so you can see exactly what cross-run memory the agent had at that point in time.
 
 ### What the agent can tune
 
@@ -136,6 +138,8 @@ results/sweep-qwen-latency/
   OVERVIEW.md              # sweep summary: workload, agent model, runllm variants, streak status
   baseline/                # baseline run
   leaderboard.txt          # ranked runs + failed strategies
+  FULL_RETRO.md            # current sweep-wide retro synthesis (markdown)
+  FULL_RETRO.txt           # legacy mirror of the same sweep-wide retro
   RESEARCH_LOG.md          # append-only log of sweep web research
   RESEARCH_MEMORY.md       # cached synthesized research findings reused by later runs
   best-runllm -> .../runllm  # symlink to best config's runllm
@@ -145,7 +149,9 @@ results/sweep-qwen-latency/
     runllm/                 # modified runllm snapshot
     vllm_config.yaml        # vLLM config used
     benchmarks.json         # benchmark results
-    RETRO.md                # agent-written retrospective (every run)
+    FULL_RETRO.md           # full sweep retro snapshot as seen by this run
+    FULL_RETRO.txt          # legacy mirror of that snapshot
+    RUN_RETRO.md            # agent-written retrospective (every run)
     agent.log               # agent conversation for this run
     deploy.log, kubectl_logs.txt, run.log, ...
 ```
@@ -175,7 +181,7 @@ make sweep-remote-teardown                     # delete controller pod (sync fir
 
 The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` are injected from your local `.env` and environment, so remote sweeps can be pinned to GPT the same way as local runs.
 
-`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
+`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.md`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
 
 Remote sweep bookkeeping notes:
 - `make sweep-status` now ignores zombie controller-side shell PIDs and cleans stale `.pid` files automatically, so finished sweeps no longer appear stuck in `RUNNING`.

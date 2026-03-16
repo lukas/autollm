@@ -264,45 +264,100 @@ def _read_results_txt(results_path: Path | None = None) -> str:
     return path.read_text()[-8000:]  # last ~8k chars
 
 
+RUN_RETRO_FILENAME = "RUN_RETRO.md"
+LEGACY_RUN_RETRO_FILENAME = "RETRO.md"
+FULL_RETRO_MD_FILENAME = "FULL_RETRO.md"
+FULL_RETRO_TXT_FILENAME = "FULL_RETRO.txt"
+
+
+def _run_retro_paths(run_dir: Path) -> list[Path]:
+    return [run_dir / RUN_RETRO_FILENAME, run_dir / LEGACY_RUN_RETRO_FILENAME]
+
+
+def _preferred_run_retro_path(run_dir: Path) -> Path:
+    return run_dir / RUN_RETRO_FILENAME
+
+
+def _read_run_retro_text(run_dir: Path) -> str:
+    for retro_path in _run_retro_paths(run_dir):
+        if not retro_path.exists():
+            continue
+        try:
+            content = retro_path.read_text().strip()
+        except Exception:
+            continue
+        if content:
+            return content
+    return ""
+
+
+def _has_run_retro(run_dir: Path) -> bool:
+    return bool(_read_run_retro_text(run_dir))
+
+
+def _run_retro_source_stats(runs_base: Path | None) -> tuple[list[str], int]:
+    run_names: list[str] = []
+    source_chars = 0
+    for run_dir in _get_run_dirs(runs_base):
+        retro_text = _read_run_retro_text(run_dir)
+        if not retro_text:
+            continue
+        run_names.append(run_dir.name)
+        source_chars += len(retro_text)
+    return run_names, source_chars
+
+
+def _write_full_retro_artifacts(base_dir: Path, content: str) -> None:
+    normalized = content.strip()
+    if not normalized:
+        return
+    (base_dir / FULL_RETRO_MD_FILENAME).write_text(normalized + "\n")
+    (base_dir / FULL_RETRO_TXT_FILENAME).write_text(normalized + "\n")
+
+
+def _read_full_retro_artifact(base_dir: Path) -> str:
+    for filename in (FULL_RETRO_MD_FILENAME, FULL_RETRO_TXT_FILENAME):
+        path = base_dir / filename
+        if not path.exists():
+            continue
+        try:
+            content = path.read_text().strip()
+        except Exception:
+            continue
+        if content:
+            return content
+    return ""
+
+
 def _collect_all_retros(runs_base: Path | None) -> str:
-    """Collect all RETRO.md contents from run directories, newest first."""
+    """Collect all run retros from run directories, newest first."""
     if not runs_base or not runs_base.exists():
         return ""
     retros = []
     for d in sorted(runs_base.iterdir(), key=lambda x: x.name, reverse=True):
         if not d.is_dir():
             continue
-        retro_file = d / "RETRO.md"
-        if retro_file.exists():
-            try:
-                content = retro_file.read_text().strip()
-                if content:
-                    retros.append(f"\n--- Retro from {d.name} ---\n{content}")
-            except Exception:
-                pass
+        content = _read_run_retro_text(d)
+        if content:
+            retros.append(f"\n--- Run retro from {d.name} ---\n{content}")
     return "\n".join(retros) if retros else ""
 
 
 def _get_latest_retro(runs_base: Path | None) -> tuple[str, str]:
-    """Return (run_name, RETRO.md content) for the newest run that has one."""
+    """Return (run_name, run retro content) for the newest run that has one."""
     if not runs_base or not runs_base.exists():
         return "", ""
     for d in sorted(runs_base.iterdir(), key=lambda x: x.name, reverse=True):
         if not d.is_dir():
             continue
-        retro_file = d / "RETRO.md"
-        if retro_file.exists():
-            try:
-                content = retro_file.read_text().strip()
-                if content:
-                    return d.name, content
-            except Exception:
-                pass
+        content = _read_run_retro_text(d)
+        if content:
+            return d.name, content
     return "", ""
 
 
 def _generate_full_retro(sweep_dir: Path, call_fn) -> str:
-    """Synthesize all run retros into a single FULL_RETRO.txt for the sweep.
+    """Synthesize all run retros into a single FULL_RETRO for the sweep.
 
     Called before each improve run so the agent has a concise summary of
     everything learned so far.
@@ -312,15 +367,24 @@ def _generate_full_retro(sweep_dir: Path, call_fn) -> str:
         return ""
 
     prompt = f"""Below are retrospectives from individual vLLM optimization runs in this sweep.
-Synthesize them into a single concise document that a future AI agent will read before designing its next experiment.
+Write a high-quality synthesis that a future optimization agent will rely on before choosing its next experiment.
 
 Rules:
-- Deduplicate: if multiple retros say the same thing, state it once.
-- Organize by theme (e.g. "attention backends", "memory settings", "compilation", "decode vs prefill").
-- For each insight, include the specific knob values and metrics that support it.
-- Flag anything that crashed or produced errors, and how to avoid it.
-- End with a short "What to try next" section: 2-3 concrete, untested ideas ranked by expected impact.
-- Be terse. No filler. Target 20-40 lines.
+- Write in Markdown with these sections when you have evidence:
+  1. `# Full sweep retro`
+  2. `## Confirmed wins`
+  3. `## Confirmed losses / regressions`
+  4. `## Harness / infrastructure gotchas`
+  5. `## Backend or workload caveats`
+  6. `## What to try next`
+- Deduplicate aggressively. If multiple retros say the same thing, state it once and cite the strongest evidence.
+- Be evidence-first. For each important point, include the exact knob values, affected backend/workload if known, and the metric/error that supports the conclusion.
+- Separate strong conclusions from weak ones. Do not overclaim from one noisy run.
+- Call out contradictions or uncertainty explicitly.
+- Preserve actionable negative knowledge: crashes, invalid args, harness traps, cluster issues, and configurations that looked promising but regressed.
+- The `What to try next` section must contain 2-5 concrete, ranked ideas that are still untested or insufficiently tested.
+- Optimize for usefulness, not brevity alone. No filler, but do include enough detail that the next agent can act without reopening every run.
+- Target roughly 30-70 lines.
 
 Raw retros:
 {raw_retros}"""
@@ -474,8 +538,12 @@ def _best_run_name_for_objective(runs_base: Path | None) -> str:
     return best_name
 
 
-def _full_retro_cache_paths(sweep_dir: Path) -> tuple[Path, Path]:
-    return sweep_dir / "FULL_RETRO.txt", sweep_dir / "FULL_RETRO.meta.json"
+def _full_retro_cache_paths(sweep_dir: Path) -> tuple[Path, Path, Path]:
+    return (
+        sweep_dir / FULL_RETRO_MD_FILENAME,
+        sweep_dir / FULL_RETRO_TXT_FILENAME,
+        sweep_dir / "FULL_RETRO.meta.json",
+    )
 
 
 def _failure_category_signature(runs_base: Path | None) -> list[str]:
@@ -494,15 +562,16 @@ def _failure_category_signature(runs_base: Path | None) -> list[str]:
 
 
 def _should_refresh_full_retro(sweep_dir: Path) -> bool:
-    retro_path, meta_path = _full_retro_cache_paths(sweep_dir)
-    if not retro_path.exists() or not meta_path.exists():
+    retro_md_path, retro_txt_path, meta_path = _full_retro_cache_paths(sweep_dir)
+    if (not retro_md_path.exists() and not retro_txt_path.exists()) or not meta_path.exists():
         return True
     meta = _read_json_file(meta_path)
-    retro_runs = [d.name for d in _get_run_dirs(sweep_dir) if (d / "RETRO.md").exists()]
+    retro_runs, source_chars = _run_retro_source_stats(sweep_dir)
     run_count = len(retro_runs)
     latest_run = retro_runs[0] if retro_runs else ""
     best_run = _best_run_name_for_objective(sweep_dir)
     previous_count = int(meta.get("source_run_count", -1) or -1)
+    previous_chars = int(meta.get("source_chars", -1) or -1)
     failure_categories = _failure_category_signature(sweep_dir)
     if run_count <= 0:
         return False
@@ -511,6 +580,8 @@ def _should_refresh_full_retro(sweep_dir: Path) -> bool:
     if failure_categories != meta.get("failure_categories", []):
         return True
     if previous_count < 0:
+        return True
+    if previous_chars < 0 or source_chars != previous_chars:
         return True
     if run_count - previous_count >= FULL_RETRO_REFRESH_EVERY:
         return True
@@ -522,24 +593,24 @@ def _should_refresh_full_retro(sweep_dir: Path) -> bool:
 
 
 def _get_or_refresh_full_retro(sweep_dir: Path, call_fn) -> str:
-    retro_path, meta_path = _full_retro_cache_paths(sweep_dir)
-    if not _should_refresh_full_retro(sweep_dir) and retro_path.exists():
-        try:
-            return retro_path.read_text().strip()
-        except Exception:
-            pass
+    retro_md_path, retro_txt_path, meta_path = _full_retro_cache_paths(sweep_dir)
+    if not _should_refresh_full_retro(sweep_dir):
+        cached = _read_full_retro_artifact(sweep_dir)
+        if cached:
+            return cached
     full_retro = _generate_full_retro(sweep_dir, call_fn).strip()
     if not full_retro:
         return ""
-    retro_runs = [d.name for d in _get_run_dirs(sweep_dir) if (d / "RETRO.md").exists()]
+    retro_runs, source_chars = _run_retro_source_stats(sweep_dir)
     meta = {
         "source_run_count": len(retro_runs),
+        "source_chars": source_chars,
         "latest_run": retro_runs[0] if retro_runs else "",
         "best_run": _best_run_name_for_objective(sweep_dir),
         "failure_categories": _failure_category_signature(sweep_dir),
         "updated_at": datetime.now().isoformat(),
     }
-    retro_path.write_text(full_retro)
+    _write_full_retro_artifacts(sweep_dir, full_retro)
     meta_path.write_text(json.dumps(meta, indent=2))
     return full_retro
 
@@ -964,7 +1035,9 @@ def _get_experiment_leaderboard(
         if compact and len(failures) > len(shown_failures):
             lines.append(f"  ... {len(failures) - len(shown_failures)} more failed runs omitted")
 
-    lines.append(f"\nTo get details on any run, use: read_file('results/{runs_base.name}/<run>/RETRO.md') or read_logs('<run>', 'benchmark')")
+    lines.append(
+        f"\nTo get details on any run, use: read_file('results/{runs_base.name}/<run>/{RUN_RETRO_FILENAME}') or read_logs('<run>', 'benchmark')"
+    )
 
     return "\n".join(lines) if lines else "No experiments yet."
 
@@ -1176,13 +1249,9 @@ def _read_short_name(run_dir: Path) -> str:
 
 
 def _read_retro_summary(run_dir: Path) -> str:
-    """Extract a one-line failure summary from RETRO.md (Change + Result)."""
-    retro = run_dir / "RETRO.md"
-    if not retro.exists():
-        return ""
-    try:
-        text = retro.read_text(errors="replace")
-    except Exception:
+    """Extract a one-line failure summary from the run retro (Change + Result)."""
+    text = _read_run_retro_text(run_dir)
+    if not text:
         return ""
 
     def _clean(s: str) -> str:
@@ -1994,14 +2063,14 @@ def _write_run_retro(
     provider: str, model: str, sweep_dir: Path | None, sweep: str | None,
     benchmark: str, ts: str, call_fn,
 ) -> None:
-    """Write a short RETRO.md for every run — success or failure."""
+    """Write a high-signal RUN_RETRO.md for every run — success or failure."""
     outcome = "succeeded" if success else "failed"
     try:
         profile_rel = run_dir.relative_to(PROJECT_ROOT)
         profile_hint = f"read_file('{profile_rel}/vllm_metrics_profile.json')"
     except Exception:
         profile_hint = "read the local vllm_metrics_profile.json"
-    retro_prompt = f"""Write a RETRO.md for this vLLM optimization run that {outcome}.
+    retro_prompt = f"""Write a RUN_RETRO.md for this vLLM optimization run that {outcome}.
 
 **Strategy:** {description[:500]}
 **Result:** {result[:300]}
@@ -2012,7 +2081,7 @@ Use read_logs('{run_dir.name}', 'benchmark') to check the benchmark data if avai
 Use read_logs('{run_dir.name}', 'deploy') or read_logs('{run_dir.name}', 'kubectl') for deploy/runtime details.
 If profiling data exists, use {profile_hint} to inspect hardware/cache/queue signals.
 
-Write a RETRO.md (in a ```markdown block```). Be as brief as possible — no filler, no boilerplate.
+Write a `RUN_RETRO.md` (in a ```markdown block```).
 The audience is a future AI agent that will read this before designing the next experiment.
 Include ANYTHING that helps that agent avoid pitfalls or design a better run:
 
@@ -2039,7 +2108,11 @@ Include ANYTHING that helps that agent avoid pitfalls or design a better run:
    "this arg is silently ignored in vLLM 0.7.x",
    "benchmark timed out because pod took 4min to load model — increase wait")
 
-Skip sections that have nothing useful to say. Aim for 3-10 lines — terse but complete."""
+Formatting requirements:
+- Use Markdown headings in this exact order when relevant: `# Run retro`, `## Change`, `## Result`, `## Why it worked / failed`, `## Crashes / errors`, `## Research findings`, `## Hardware/profile evidence`, `## Pitfall or insight`.
+- Prefer concrete numbers and exact flag values over prose.
+- Do not write filler or generic advice. Every line should teach the next agent something specific.
+- Aim for roughly 8-18 lines. Concise, but not so compressed that evidence disappears."""
     try:
         retro_ctx = ToolContext(
             project_root=PROJECT_ROOT, experiment_dir=experiment_dir,
@@ -2048,7 +2121,7 @@ Skip sections that have nothing useful to say. Aim for 3-10 lines — terse but 
             log_path=run_dir / "retro_agent.log",
         )
         retro_result = run_agent(
-            "You write terse, high-signal retrospectives for vLLM optimization runs. A future AI agent will read this to plan better experiments. No filler. Use tools to get exact numbers.",
+            "You write careful, high-signal retrospectives for vLLM optimization runs. A future AI agent will read this to plan better experiments. Be precise, evidence-first, and concrete. Use tools to get exact numbers.",
             retro_prompt, provider, model, retro_ctx, max_turns=10,
         )
         retro_content = retro_result.text
@@ -2056,15 +2129,15 @@ Skip sections that have nothing useful to say. Aim for 3-10 lines — terse but 
         retro_content = f"# Retrospective\n\nFailed to generate: {e}"
     retro_md = _extract_code_block(retro_content, "markdown") or retro_content
     if retro_md:
-        retro_path = run_dir / "RETRO.md"
+        retro_path = _preferred_run_retro_path(run_dir)
         existing = retro_path.read_text() if retro_path.exists() else ""
         if existing.strip():
             combined = existing.rstrip() + "\n\n---\n\n" + retro_md.lstrip()
             retro_path.write_text(combined)
-            print(f"Appended RETRO.md in {run_dir}")
+            print(f"Appended {RUN_RETRO_FILENAME} in {run_dir}")
         else:
             retro_path.write_text(retro_md)
-            print(f"Saved RETRO.md to {run_dir}")
+            print(f"Saved {RUN_RETRO_FILENAME} to {run_dir}")
 
     short_name = _generate_short_name(description, result, call_fn)
     _save_short_name(run_dir, short_name)
@@ -2212,10 +2285,12 @@ def main() -> int:
                 f"{latest_retro[:1800]}\n"
             )
 
-    # Reuse cached FULL_RETRO.txt unless the sweep meaningfully changed.
+    # Reuse cached FULL_RETRO unless the sweep meaningfully changed.
     full_retro_section = ""
     if sweep_dir:
         full_retro = _get_or_refresh_full_retro(sweep_dir, call_fn)
+        if full_retro:
+            _write_full_retro_artifacts(run_dir, full_retro)
         if full_retro:
             full_retro_section = f"\n## Lessons learned from all previous runs\n\n{full_retro[:2400]}\n"
     elif runs_for_context and runs_for_context.exists():
@@ -2688,6 +2763,8 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
             provider=provider, model=model, sweep_dir=sweep_dir, sweep=sweep,
             benchmark=benchmark, ts=ts, call_fn=call_fn,
         )
+        if sweep_dir:
+            _get_or_refresh_full_retro(sweep_dir, call_fn)
 
         if success:
             if sweep_dir:
@@ -2716,7 +2793,7 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
         if stop_status["stop"]:
             print(stop_status["reason"])
             return SWEEP_STOP_EXIT_CODE
-    print(f"Results: Failed after {max_attempts} attempts. See {run_dir}/RETRO.md")
+    print(f"Results: Failed after {max_attempts} attempts. See {run_dir}/{RUN_RETRO_FILENAME}")
     return 1
 
 
