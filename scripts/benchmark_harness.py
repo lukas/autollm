@@ -231,7 +231,7 @@ def main() -> None:
         except Exception:
             _hc_gpu = 1
         if _hc_gpu >= 8:
-            _health_iters = 900  # 30 min for very large models (1T+)
+            _health_iters = 1350  # 45 min for very large models (Kimi-K2.5 safetensors ~35 min)
         elif _hc_gpu >= 4:
             _health_iters = 360  # 12 min for large models
         for i in range(_health_iters):
