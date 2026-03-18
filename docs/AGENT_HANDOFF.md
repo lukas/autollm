@@ -176,8 +176,8 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 ### Tensorizer / PVC Model Loading
 
-- Most large models use `--load-format tensorizer` with pre-serialized weights on a shared PVC (`tensorized-models`, 1Ti, `shared-vast`). The PVC mounts at `/mnt/tensorized/`. Serialized weights at `/mnt/tensorized/vllm/<org>/<model>/v1/`.
-- PVC definition: `runllm/tensorized-models-pvc.yaml`.
+- Most large models use `--load-format tensorizer` with pre-serialized weights on a shared PVC (`models`, 5Ti, `shared-vast`). The PVC mounts at `/mnt/models/`. Serialized weights at `/mnt/models/vllm/<org>/<model>/v1/`.
+- PVC definition: `runllm/models-pvc.yaml`.
 - To serialize: `make tensorize MODEL_DIR=qwen2.5-1.5b` (K8s Job; idempotent — skips if marker file already exists on PVC).
 - The nightly vllm image doesn't bundle tensorizer, so all configs use `command: ["/bin/bash", "-c"]` to `pip install tensorizer` before `vllm serve`.
 - All configs use `--served-model-name <HF-name>` (e.g. `Qwen/Qwen2.5-1.5B-Instruct`) so the API model name matches what Makefiles and query scripts expect, even though the actual `--model` path points to the PVC.
@@ -187,10 +187,10 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
   These patches can be removed once vllm PR#33235 is merged and the TensorizerLoader is fixed upstream.
 - **Loading speeds:** qwen2.5-1.5b: ~1.2s (2.5 GB/s). qwen3-235b: ~12s total (10 GB/s per GPU, 117.6 GB/rank). Compare to multi-minute HF downloads.
 - For TP-sharded models (TP>1), `--model-loader-extra-config '{"tensorizer_uri": ".../model-rank-%03d.tensors"}'` is required.
-- The PVC is `ReadWriteMany` — multiple pods across different nodes can mount it.
+- The PVC is `ReadWriteMany` (5Ti) — multiple pods across different nodes can mount it.
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
-- **Kimi exception:** Kimi-K2.5 currently does *not* use tensorizer in the working path. It serves from HF safetensors cached under `/mnt/tensorized/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack.
-- **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` serves Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/tensorized/hf-cache`.
+- **Kimi exception:** Kimi-K2.5 currently does *not* use tensorizer in the working path. It serves from HF safetensors cached under `/mnt/models/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack.
+- **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` serves Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`.
 
 ---
 
@@ -229,8 +229,8 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 11. **Unschedulable GPU pods are cluster-capacity failures, not repairable experiment failures.**
    If a run fails with `Pod unschedulable` / `Insufficient nvidia.com/gpu`, treat that as an immediate cluster-capacity stop condition. Do not let the retry loop spend turns "repairing" the YAML; wait for capacity or free GPUs first.
 
-12. **Every runllm variant must mount the `tensorized-models` PVC for model caching.**
-   Without a PVC, HuggingFace models are re-downloaded from scratch on every pod restart — hundreds of GB for large models like Kimi-K2.5. For vLLM variants, use `--download-dir /mnt/tensorized/hf-cache`. For SGLang variants, set the `HF_HOME` env var to `/mnt/tensorized/hf-cache`. Always add the `tensorized-models` PVC volume and volumeMount. This applies to both main models and draft/speculative models. When creating a new `runllm/` variant, copy the volume config from an existing variant rather than starting without it.
+12. **Every runllm variant must mount the `models` PVC for model caching.**
+   Without a PVC, HuggingFace models are re-downloaded from scratch on every pod restart — hundreds of GB for large models like Kimi-K2.5. For vLLM variants, use `--download-dir /mnt/models/hf-cache`. For SGLang variants, set the `HF_HOME` env var to `/mnt/models/hf-cache`. Always add the `models` PVC volume and volumeMount. This applies to both main models and draft/speculative models. When creating a new `runllm/` variant, copy the volume config from an existing variant rather than starting without it.
 
 ---
 
