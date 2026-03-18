@@ -137,6 +137,10 @@ Each sweep also keeps a higher-level synthesis in both `FULL_RETRO.md` and `FULL
 
 `--max-requests` has no hard limit — set `MAX_REQUESTS=2000` for even longer runs.
 
+**Throughput metrics:** The leaderboard reports two throughput numbers:
+- **Throughput** — total tokens (input + output) per second, from guidellm's `tokens_per_second`
+- **Output** — output-only tokens per second, from guidellm's `output_tokens_per_second`
+
 ### Sweep directory structure
 
 ```

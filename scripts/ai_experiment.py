@@ -155,6 +155,7 @@ def _fmt_summary(m: dict) -> str:
     lat = _metric(m, "request_latency")
     ttft = _metric(m, "time_to_first_token_ms")
     tok = _metric(m, "tokens_per_second")
+    out_tok = _metric(m, "output_tokens_per_second")
     rps = _metric(m, "requests_per_second")
     parts = []
     if lat is not None:
@@ -163,6 +164,8 @@ def _fmt_summary(m: dict) -> str:
         parts.append(f"TTFT: {ttft:.0f}ms")
     if tok is not None:
         parts.append(f"Throughput: {tok:.0f} tok/s")
+    if out_tok is not None:
+        parts.append(f"Output: {out_tok:.0f} tok/s")
     if rps is not None:
         parts.append(f"Req/s: {rps:.1f}")
     return " | ".join(parts) if parts else "—"

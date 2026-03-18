@@ -50,7 +50,7 @@ make benchmark BENCHMARK=quick DESCRIPTION="quick check"
 
 Each run is saved to `results/runs/YYYYMMDD_HHMMSS/`:
 
-- **summary.html** — Latency, TTFT, ITL, throughput
+- **summary.html** — Latency, TTFT, ITL, throughput (total and output-only)
 - **benchmarks.html** — Guideline full report
 - **pod_config.yaml** — Pod config at run time
 - **pod_status.txt** — Pod state
