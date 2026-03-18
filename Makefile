@@ -16,7 +16,7 @@ MODEL ?= $(MODEL_DIR)
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: help setup sync benchmark benchmark-run benchmark-run-quick sweep full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
+.PHONY: help setup sync benchmark benchmark-run benchmark-run-quick baseline sweep sweep-local full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
 
 help:
 	@echo "autollm make targets"
@@ -36,20 +36,19 @@ help:
 	@echo "  make query PROMPT=\"...\"    Send a query to the current model"
 	@echo ""
 	@echo "Sweeps:"
-	@echo "  make sweep SWEEP=name      Create a new sweep and baseline"
+	@echo "  make sweep SWEEP=name RUNS=N"
+	@echo "                             Recommended path: remote baseline + improve runs"
 	@echo "                             Use MODEL=<family>, e.g. MODEL=kimi"
+	@echo "  make sweep-local SWEEP=name RUNS=N"
+	@echo "                             Local baseline + improve runs"
+	@echo "  make baseline SWEEP=name   Baseline only; create sweep metadata and run baseline"
 	@echo "  make improve SWEEP=name    Run one or more improve iterations"
-	@echo "  make full-sweep SWEEP=name RUNS=N"
-	@echo "                             Create sweep, baseline, then improve N times"
 	@echo "  make leaderboard SWEEP=name"
 	@echo "                             Refresh sweep leaderboard"
 	@echo "  make sweep-pods SWEEP=name List pods associated with a sweep"
 	@echo "  make backfill-names        Fill in missing short names for older runs"
 	@echo ""
 	@echo "Remote sweeps:"
-	@echo "  make sweep-remote SWEEP=name RUNS=N"
-	@echo "                             Start a remote controller-backed sweep"
-	@echo "                             Use MODEL=<family>; optional BASELINE_VARIANT=<runllm-dir>"
 	@echo "  make improve-remote SWEEP=name RUNS=N"
 	@echo "                             Continue a sweep on the remote controller"
 	@echo "  make sweep-set-runs SWEEP=name RUNS=N"
@@ -111,19 +110,22 @@ dashboard:
 
 # Start a new sweep: create results/sweep-[name]/, run baseline, save to baseline/
 # Incomplete baselines (no benchmarks.json) are re-run automatically. Add FORCE=1 to overwrite complete baseline.
-# Usage: make sweep SWEEP=my-sweep [BENCHMARK=quick] [FORCE=1]
-#        make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
-#        make sweep SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
-#        make sweep SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang
-sweep: BENCHMARK=quick
-sweep: ensure-kubeconfig
+# Usage: make baseline SWEEP=my-sweep [BENCHMARK=quick] [FORCE=1]
+#        make baseline SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
+#        make baseline SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
+#        make baseline SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang
+baseline: BENCHMARK=quick
+baseline: ensure-kubeconfig
 	@env -u VIRTUAL_ENV uv run python scripts/start_sweep.py --sweep "$(SWEEP)" --model "$(MODEL)" --benchmark "$(BENCHMARK)" $(if $(BASELINE_VARIANT),--baseline-variant "$(BASELINE_VARIANT)",) $(if $(MODEL_VARIANTS),--model-variants "$(MODEL_VARIANTS)",) $(if $(FORCE),--force,) $(if $(DATA),--data "$(DATA)",) $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),) $(if $(GOAL),--goal "$(GOAL)",)
 
-# Full sweep: create sweep + run baseline, then run N improvement iterations
-# Usage: make full-sweep SWEEP=my-sweep RUNS=5
-#        make full-sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b RUNS=10 GOAL="maximize throughput"
-full-sweep: sweep
+# Full local sweep: create sweep + run baseline, then run N improvement iterations
+# Usage: make sweep-local SWEEP=my-sweep RUNS=5
+#        make sweep-local SWEEP=qwen3-235b-throughput MODEL=qwen3-235b RUNS=10 GOAL="maximize throughput"
+sweep-local: baseline
 	@$(MAKE) improve SWEEP="$(SWEEP)" RUNS="$(RUNS)" $(if $(ALLOW_MODEL_CHANGE),ALLOW_MODEL_CHANGE=1,)
+
+# Backward-compatible alias for the older local full-sweep name.
+full-sweep: sweep-local
 
 # Refresh leaderboard in sweep dir (also written automatically during improve runs)
 # Usage: make leaderboard SWEEP=my-sweep
@@ -180,18 +182,21 @@ tensorize: ensure-kubeconfig
 	$(MAKE) -C runllm/$(MODEL_DIR) tensorize
 
 # ── Remote sweep (runs on a K8s controller pod) ──────────────────────────────
-# Start a sweep on a remote controller pod (agent + benchmarks run in-cluster).
+# Start a full sweep on a remote controller pod (agent + benchmarks run in-cluster).
 # The controller pod is created once and reused. Code is synced from local.
-# Usage: make sweep-remote SWEEP=my-sweep RUNS=10 GOAL="maximize throughput"
-#        make sweep-remote SWEEP=qwen3-235b MODEL=qwen3-235b BENCHMARK=medium-throughput RUNS=30
-#        make sweep-remote SWEEP=kimi-dual MODEL=kimi RUNS=30
-#        make sweep-remote SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang RUNS=30
-sweep-remote: ensure-kubeconfig
+# Usage: make sweep SWEEP=my-sweep RUNS=10 GOAL="maximize throughput"
+#        make sweep SWEEP=qwen3-235b MODEL=qwen3-235b BENCHMARK=medium-throughput RUNS=30
+#        make sweep SWEEP=kimi-dual MODEL=kimi RUNS=30
+#        make sweep SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang RUNS=30
+sweep: ensure-kubeconfig
 	@scripts/sweep_remote.sh start \
 		--sweep "$(SWEEP)" --model "$(MODEL)" --benchmark "$(BENCHMARK)" \
 		$(if $(BASELINE_VARIANT),--baseline-variant "$(BASELINE_VARIANT)",) \
 		$(if $(MODEL_VARIANTS),--model-variants "$(MODEL_VARIANTS)",) \
 		--runs "$(RUNS)" $(if $(GOAL),--goal "$(GOAL)",) $(if $(FORCE),--force,)
+
+# Backward-compatible alias for the older remote sweep name.
+sweep-remote: sweep
 
 # Continue a local sweep remotely: sync local results to controller pod, run improve in-cluster.
 # Reuses existing controller pod if one is running. If the sweep is already running, just reports status.

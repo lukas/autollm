@@ -9,14 +9,17 @@
 The main path is the sweep workflow, not the older dashboard optimizer:
 
 ```bash
-make sweep SWEEP=qwen-latency MODEL_DIR=qwen2.5-1.5b GOAL="minimize latency"
-make sweep SWEEP=qwen3-235b-throughput MODEL_DIR=qwen3-235b GOAL="maximize throughput"
-make improve SWEEP=qwen-latency
+make sweep SWEEP=qwen-latency RUNS=10 MODEL=qwen2.5-1.5b GOAL="minimize latency"
+make sweep SWEEP=qwen3-235b-throughput RUNS=20 MODEL=qwen3-235b GOAL="maximize throughput"
+make sync-results SWEEP=qwen-latency
+make improve-remote SWEEP=qwen-latency RUNS=10
 make leaderboard SWEEP=qwen-latency
 make sweep-pods SWEEP=qwen-latency
 ```
 
-- `make sweep` creates `results/sweep-NAME/`, runs a baseline, writes `sweep_metadata.json`, creates `best-runllm`, and writes `leaderboard.txt`.
+- `make sweep` is now the primary controller-backed full-sweep command. It creates the remote sweep, runs the baseline there, then performs `RUNS` improve iterations in-cluster.
+- `make baseline` is the explicit baseline-only step when you want to create local sweep metadata and run just the baseline.
+- `make sweep-local` is the local baseline + improve wrapper. `make improve` remains the local continue-an-existing-sweep command.
 - `make improve` runs `scripts/ai_experiment.py`, which copies the current best `runllm`, prompts the LLM, deploys a unique pod, runs a sample query, benchmarks it, and updates the sweep artifacts.
 - `make leaderboard` refreshes `results/sweep-NAME/leaderboard.txt`.
 - `make sweep-pods` lists currently running pods labeled for a sweep.
@@ -24,20 +27,20 @@ make sweep-pods SWEEP=qwen-latency
 ### Remote sweep (agent runs in-cluster)
 
 ```bash
-make sweep-remote SWEEP=qwen-throughput-async MODEL_DIR=qwen2.5-1.5b BENCHMARK=medium-throughput RUNS=30 GOAL="maximize throughput"
+make sweep SWEEP=qwen-throughput-async MODEL=qwen2.5-1.5b BENCHMARK=medium-throughput RUNS=30 GOAL="maximize throughput"
 make sweep-logs                            # tail live output
 make sweep-status                          # check running sweeps
 make sync-results SWEEP=qwen-throughput-async  # copy results to local machine
 make sweep-remote-teardown                 # delete controller pod
 ```
 
-- `make sweep-remote` creates a lightweight controller pod (`autollm-controller`) in the cluster, syncs local code to it, and starts the sweep in the background. The controller uses a ServiceAccount with RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` come from `.env` or the local environment.
+- `make sweep` creates a lightweight controller pod (`autollm-controller`) in the cluster, syncs local code to it, and starts the sweep in the background. The controller uses a ServiceAccount with RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` come from `.env` or the local environment.
 - The sweep runs autonomously inside the pod (survives laptop disconnect). Results stay on the controller.
 - `make sync-results` uses tar+kubectl to pull results back. Syncs a specific sweep or all results.
 - `make sync-results` must tolerate files changing during active sweeps. `scripts/sweep_remote.sh` now uses `tar --ignore-failed-read --warning=no-file-changed` on the controller side so live `benchmark_live.txt` / `benchmarks.json` updates do not corrupt the sync stream.
 - `make sync-results SWEEP=...` is now incremental: it refreshes top-level sweep files (`OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, etc.), always syncs `baseline/`, pulls missing timestamped run dirs, and re-syncs the newest two run dirs. Keep the shell compatible with macOS Bash 3.2; avoid `mapfile` and associative arrays.
 - If the remote controller pod no longer exists, `make sync-results` now prints a friendly "nothing to sync" message and exits successfully instead of failing the Make target.
-- `make setup` is now the explicit bootstrap step for a fresh checkout (`uv sync` + conditional kubeconfig generation). Common dev targets like `make benchmark`, `make sweep`, `make improve`, and `make experiment` no longer auto-run `uv sync` first.
+- `make setup` is now the explicit bootstrap step for a fresh checkout (`uv sync` + conditional kubeconfig generation). Common dev targets like `make benchmark`, `make baseline`, `make sweep`, `make improve`, and `make experiment` no longer auto-run `uv sync` first.
 - Remote sweep launcher scripts now run through a tiny wrapper that removes `/workspace/sweep-<name>.pid` on exit and writes `/workspace/sweep-<name>.exit_code`. `make sweep-status` also ignores zombie PIDs and cleans stale pid files, since finished background shells can otherwise remain as `<defunct>` under the controller pod.
 - The controller pod itself should stay on the reaper loop in `sweep-controller.yaml` rather than `sleep infinity`; otherwise orphaned background sweep shells become zombie processes under PID 1.
 
@@ -61,7 +64,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `scripts/sweep_remote.sh` | Remote sweep orchestration: create controller pod, sync code, start sweep, sync results |
 | `sweep-controller.yaml` | Controller pod spec (python:3.13-slim + kubectl + uv, ServiceAccount for pod management) |
 | `sweep-controller-rbac.yaml` | RBAC: ServiceAccount, Role, RoleBinding for controller to manage vLLM pods |
-| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi/`). Each has `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
+| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`). Each has `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
 | `docs/SWEEP_BEST_PRACTICES.md` | One-page synthesis of cross-sweep lessons for future optimization agents |
 | `results/sweep-NAME/AGENT_CONTEXT.md` | Generated compact sweep memory for prompts: top frontier, repeated failures, and harness-only patterns |

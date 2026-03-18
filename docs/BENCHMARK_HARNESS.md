@@ -100,12 +100,15 @@ make dashboard
 Use the sweep workflow to let the agent iterate on vLLM config changes:
 
 ```bash
-make sweep SWEEP=qwen-latency MODEL=qwen2.5-1.5b GOAL="minimize latency"
-make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
-make sweep SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
-make improve SWEEP=qwen-latency
+make sweep SWEEP=qwen-latency RUNS=10 MODEL=qwen2.5-1.5b GOAL="minimize latency"
+make sweep SWEEP=qwen3-235b-throughput RUNS=20 MODEL=qwen3-235b GOAL="maximize throughput"
+make sweep SWEEP=kimi-dual RUNS=20 MODEL=kimi GOAL="maximize throughput"
+make sync-results SWEEP=qwen-latency
+make improve-remote SWEEP=qwen-latency RUNS=10
 make leaderboard SWEEP=qwen-latency
 ```
+
+`make sweep` is now the primary remote full-sweep path: it starts the controller-backed sweep, runs the baseline there, and continues for `RUNS` improve iterations unless the sweep stop policy trips. Use `make sweep-local` for a local full sweep or `make baseline` when you only want the baseline setup step.
 
 Each improve run copies the current best model config, uses tools to research and propose an experiment, deploys it, benchmarks it, and writes a `RUN_RETRO.md` with lessons learned. Sweep artifacts are saved under `results/sweep-NAME/`.
 The sweep root also keeps a synthesized cross-run memory in `FULL_RETRO.md` and `FULL_RETRO.txt`, and each run directory gets a snapshot of that full retro as it existed when the run started.
@@ -121,8 +124,8 @@ Sweep-local research memory:
 For long sweeps, run the full sweep remotely inside the cluster:
 
 ```bash
-make sweep-remote SWEEP=qwen3-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
-make sweep-remote SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep SWEEP=qwen3-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=100 GOAL="maximize throughput"
 make sweep-logs          # tail live output
 make sweep-status        # check running sweeps
 make sync-results SWEEP=qwen3-throughput  # pull results to local

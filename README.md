@@ -22,47 +22,47 @@ make kubeconfig                 # generates kubeconfig
 # ANTHROPIC_API_KEY=sk-...   # default provider
 # OPENAI_API_KEY=sk-...      # for AI_PROVIDER=openai
 
-# 3. Start a sweep (deploys vLLM, runs baseline benchmark):
-make sweep SWEEP=qwen-latency GOAL="minimize latency"
+# 3. Start the recommended remote full sweep:
+make sweep SWEEP=qwen-latency RUNS=10 GOAL="minimize latency"
 
-# 4. Let the AI agent optimize:
-make improve SWEEP=qwen-latency
+# 4. Pull the latest results locally:
+make sync-results SWEEP=qwen-latency
 
 # Or use GPT:
-AI_PROVIDER=openai AI_MODEL=gpt-5.4 make improve SWEEP=qwen-latency
+AI_PROVIDER=openai AI_MODEL=gpt-5.4 make sweep SWEEP=qwen-latency RUNS=10 GOAL="minimize latency"
 ```
 
 ## Workflow: sweep + improve
 
-### Step 1: Create a sweep with a baseline
+### Step 1: Run a full sweep
 
 ```bash
-make sweep SWEEP=qwen-latency GOAL="minimize latency"
-make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b GOAL="maximize throughput"
-make sweep SWEEP=qwen-ttft GOAL="minimize time to first token (TTFT)"
-make sweep SWEEP=qwen-latency GOAL="minimize latency" BENCHMARK=medium  # 200 req, ~5 min
-make sweep SWEEP=kimi-dual MODEL=kimi GOAL="maximize throughput"
-make sweep SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang GOAL="maximize throughput"
+make sweep SWEEP=qwen-latency RUNS=10 GOAL="minimize latency"
+make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=20 GOAL="maximize throughput"
+make sweep SWEEP=qwen-ttft RUNS=10 GOAL="minimize time to first token (TTFT)"
+make sweep SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=20 GOAL="maximize throughput"
+make sweep SWEEP=kimi-dual MODEL=kimi BASELINE_VARIANT=kimi-sglang BENCHMARK=large RUNS=20 GOAL="maximize throughput"
 ```
 
-The `GOAL` tells the AI agent what metric to optimize. `MODEL` selects the model family for the sweep (default: `qwen2.5-1.5b`). The sweep metadata stores that family, the baseline deployment variant, and all deployment variants available to the agent for that family.
+`make sweep` is now the primary controller-backed workflow: it creates the sweep remotely, runs the baseline there, then performs `RUNS` improve iterations in-cluster. `MODEL` selects the model family for the sweep (default: `qwen2.5-1.5b`). The sweep metadata stores that family, the baseline deployment variant, and all deployment variants available to the agent for that family.
 
-This deploys the baseline variant for that family, runs the benchmark, and saves results to the sweep's `baseline/` directory.
+This deploys the baseline variant for that family, runs the benchmark, and saves results under the sweep's remote `baseline/` directory until you sync them locally.
 
 Kimi-specific note: `runllm/kimi-vllm/` currently uses HuggingFace safetensors cached on the shared PVC plus `--trust-remote-code`, not tensorizer. Startup is therefore slower than the tensorized Qwen paths, but baseline and improve runs now work end-to-end.
 
 Backend-variant note: Kimi family sweeps now automatically expose both `kimi-vllm` and `kimi-sglang` to improve runs. Use `BASELINE_VARIANT=kimi-sglang` only when you want the baseline run to start on SGLang instead of the default vLLM variant.
 
-### Step 2: Run AI-driven improvements
+### Step 2: Pull results or continue a sweep
 
 ```bash
-make improve SWEEP=qwen-latency                        # single improvement run
-make improve SWEEP=qwen-latency RUNS=10                # run 10 iterations back-to-back
-make improve SWEEP=qwen-latency RUNS=5 ALLOW_MODEL_CHANGE=1  # 5 runs, allow quantized models
-AI_PROVIDER=openai AI_MODEL=gpt-5.4 make improve SWEEP=qwen-latency RUNS=10
+make sync-results SWEEP=qwen-latency                   # pull one remote sweep locally
+make improve-remote SWEEP=qwen-latency RUNS=10         # continue an existing remote sweep
+make improve SWEEP=qwen-latency RUNS=10                # continue an existing local sweep
+make sweep-local SWEEP=qwen-latency RUNS=5 GOAL="minimize latency"  # local baseline + improve
+make baseline SWEEP=qwen-latency GOAL="minimize latency"            # baseline only
 ```
 
-Each run:
+Each improve run:
 1. Shows the agent the current best config + leaderboard + retros from past runs
 2. Agent uses tools (web search, file reading, kubectl, log inspection) to research and propose a change
 3. Agent writes the config via `write_file`, deploys, and benchmarks
@@ -80,7 +80,7 @@ Sweep safety rails:
 - The sweep also stops after 2 consecutive failures classified as unfixable, such as provider/tool credit exhaustion, auth failures, Exa quota failures, or repeated timeout failures.
 - Each sweep directory maintains an `OVERVIEW.md` with the started time, benchmark/data config, agent provider/model, tracked `runllm/` directories, current run counts, and failure-streak status.
 
-Run `make improve` repeatedly to iterate. The agent always builds on the best config so far.
+Run `make improve` or `make improve-remote` to keep iterating on an existing sweep. The agent always builds on the best config so far.
 
 ### Agent tool stack
 
@@ -169,8 +169,8 @@ For long sweeps, run the agent inside the Kubernetes cluster so it survives lapt
 
 ```bash
 # Start remote sweep (creates a lightweight controller pod, syncs code, runs in background)
-make sweep-remote SWEEP=qwen3-235b-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
-make sweep-remote SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep SWEEP=qwen3-235b-throughput MODEL=qwen3-235b BENCHMARK=large RUNS=100 GOAL="maximize throughput"
+make sweep SWEEP=kimi-dual MODEL=kimi BENCHMARK=large RUNS=100 GOAL="maximize throughput"
 
 # Continue a local sweep remotely (syncs local results to controller, runs improve in-cluster)
 make improve-remote SWEEP=qwen-throughput-async RUNS=20
@@ -202,11 +202,11 @@ Remote sweep bookkeeping notes:
 | Target | Description |
 |--------|-------------|
 | `make setup` | One-time bootstrap: install deps and generate kubeconfig if needed |
-| `make sweep SWEEP=name` | Create sweep + run baseline |
-| `make sweep SWEEP=name MODEL=kimi` | Create a Kimi family sweep with both vLLM and SGLang variants available |
+| `make sweep SWEEP=name RUNS=N` | Recommended path: remote baseline + N improve runs |
+| `make sweep-local SWEEP=name RUNS=N` | Local baseline + N improve runs |
+| `make baseline SWEEP=name` | Create sweep metadata and run the baseline only |
+| `make sweep SWEEP=name MODEL=kimi` | Remote Kimi family sweep with both vLLM and SGLang variants available |
 | `make improve SWEEP=name` | AI agent suggests improvements |
-| `make full-sweep SWEEP=name RUNS=N` | Create sweep + baseline + N improvement runs |
-| `make sweep-remote SWEEP=name RUNS=N` | Run full sweep on a K8s controller pod |
 | `make improve-remote SWEEP=name RUNS=N` | Continue a local sweep remotely (sync results + improve) |
 | `make sync-results SWEEP=name` | Incrementally sync one remote sweep to local |
 | `make sweep-logs` | Tail live remote sweep output |

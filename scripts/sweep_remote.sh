@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # Remote sweep controller: run sweeps on a Kubernetes pod.
+# Usually invoked via `make sweep` or `make improve-remote`.
 #
 # Usage:
 #   scripts/sweep_remote.sh start    --sweep NAME [--model FAMILY] [--baseline-variant DIR] [--model-variants A,B] [--benchmark BENCH] [--runs N] [--goal GOAL] [--force]
@@ -54,8 +55,15 @@ sync_single_sweep_incremental() {
     local local_results="$PROJECT_DIR/results"
     local local_sweep="$local_results/sweep-${sweep}"
 
-    kubectl exec "$CONTROLLER_POD" -- test -d "$remote_sweep" \
-        || die "Remote sweep not found on controller: sweep-${sweep}"
+    if ! kubectl exec "$CONTROLLER_POD" -- test -d "$remote_sweep" 2>/dev/null; then
+        if ! kubectl exec "$CONTROLLER_POD" -- test -d "$remote_root" 2>/dev/null; then
+            info "No results directory on controller yet — sweep-${sweep} may still be starting up."
+            info "Check status with: make sweep-status"
+            return 0
+        fi
+        echo "  ERROR: Remote sweep not found on controller: sweep-${sweep}" >&2
+        return 1
+    fi
 
     mkdir -p "$local_sweep"
     info "Syncing sweep-${sweep} results from controller..."
@@ -80,7 +88,7 @@ sync_single_sweep_incremental() {
     remote_runs_text=$(
         kubectl exec "$CONTROLLER_POD" -- bash -lc \
             "cd '$remote_sweep' && ls -1d 20[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | sort"
-    )
+    ) || true
     if [ -n "$remote_runs_text" ]; then
         while IFS= read -r run; do
             [ -n "$run" ] && remote_runs+=("$run")
@@ -121,7 +129,10 @@ EOF
         done
     fi
 
-    sync_tar_entries "$remote_root" "$local_results" "${entries[@]}"
+    if ! sync_tar_entries "$remote_root" "$local_results" "${entries[@]}"; then
+        echo "  ERROR: Failed to sync sweep-${sweep} (tar transfer error, possibly corrupted archive)" >&2
+        return 1
+    fi
     info "Results synced to $local_results (top-level files + ${#selected_runs[@]} run dirs)"
 }
 
@@ -274,7 +285,7 @@ action_start() {
     local target_file="/workspace/sweep-${sweep}.target_runs"
 
     # Write the sweep script with a target-file loop (so RUNS can be bumped live)
-    local sweep_cmd="make sweep SWEEP=${sweep} MODEL=${model} BENCHMARK=${benchmark}"
+    local sweep_cmd="make baseline SWEEP=${sweep} MODEL=${model} BENCHMARK=${benchmark}"
     [ -n "$baseline_variant" ] && sweep_cmd+=" BASELINE_VARIANT=\"${baseline_variant}\""
     [ -n "$model_variants" ] && sweep_cmd+=" MODEL_VARIANTS=\"${model_variants}\""
     [ -n "$goal" ]  && sweep_cmd+=" GOAL=\"${goal}\""
@@ -482,24 +493,42 @@ action_sync() {
         sync_single_sweep_incremental "$sweep"
     else
         info "Syncing ALL sweeps from controller..."
+
+        if ! kubectl exec "$CONTROLLER_POD" -- test -d "$REMOTE_DIR/results" 2>/dev/null; then
+            info "No results directory on controller yet. The sweep may still be starting up."
+            info "Check status with: make sweep-status"
+            return 0
+        fi
+
         local -a sweeps=()
         local sweeps_text=""
         sweeps_text=$(
             kubectl exec "$CONTROLLER_POD" -- bash -lc \
                 "cd '$REMOTE_DIR/results' && ls -1d sweep-* 2>/dev/null | sed 's/^sweep-//' | sort"
         )
-        if [ -n "$sweeps_text" ]; then
-            while IFS= read -r sweep_name; do
-                [ -n "$sweep_name" ] && sweeps+=("$sweep_name")
-            done <<EOF
+        if [ -z "$sweeps_text" ]; then
+            info "Results directory exists but no sweep results found yet."
+            info "Check status with: make sweep-status"
+            return 0
+        fi
+        while IFS= read -r sweep_name; do
+            [ -n "$sweep_name" ] && sweeps+=("$sweep_name")
+        done <<EOF
 $sweeps_text
 EOF
-        fi
         local sweep_name=""
+        local -a failed_sweeps=()
         for sweep_name in "${sweeps[@]}"; do
             [ -z "$sweep_name" ] && continue
-            sync_single_sweep_incremental "$sweep_name"
+            if ! sync_single_sweep_incremental "$sweep_name"; then
+                echo "  WARNING: Failed to sync sweep-${sweep_name}, continuing..." >&2
+                failed_sweeps+=("$sweep_name")
+            fi
         done
+        if [ "${#failed_sweeps[@]}" -gt 0 ]; then
+            echo ""
+            info "${#failed_sweeps[@]} sweep(s) failed to sync: ${failed_sweeps[*]}"
+        fi
     fi
 }
 

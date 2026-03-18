@@ -6,6 +6,7 @@ from pathlib import Path
 
 BACKEND_SUFFIXES: dict[str, str] = {
     "-vllm": "vllm",
+    "-sglang-eagle": "sglang",
     "-sglang": "sglang",
 }
 
