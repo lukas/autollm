@@ -99,29 +99,32 @@ EOF
 
     local -a selected_runs=()
     local run=""
-    for run in "${remote_runs[@]}"; do
-        [ -z "$run" ] && continue
-        if [ ! -d "$local_sweep/$run" ]; then
-            selected_runs+=("$run")
-        fi
-    done
-
     local total_runs="${#remote_runs[@]}"
-    local newest_count=2
-    local start_idx=0
-    if [ "$total_runs" -gt "$newest_count" ]; then
-        start_idx=$((total_runs - newest_count))
-    fi
-    local idx=0
-    for ((idx=start_idx; idx<total_runs; idx++)); do
-        run="${remote_runs[$idx]}"
-        [ -z "$run" ] && continue
-        if [ "${#selected_runs[@]}" -eq 0 ]; then
-            selected_runs+=("$run")
-        elif ! append_unique "$run" "${selected_runs[@]}"; then
-            selected_runs+=("$run")
+
+    if [ "$total_runs" -gt 0 ]; then
+        for run in "${remote_runs[@]}"; do
+            [ -z "$run" ] && continue
+            if [ ! -d "$local_sweep/$run" ]; then
+                selected_runs+=("$run")
+            fi
+        done
+
+        local newest_count=2
+        local start_idx=0
+        if [ "$total_runs" -gt "$newest_count" ]; then
+            start_idx=$((total_runs - newest_count))
         fi
-    done
+        local idx=0
+        for ((idx=start_idx; idx<total_runs; idx++)); do
+            run="${remote_runs[$idx]}"
+            [ -z "$run" ] && continue
+            if [ "${#selected_runs[@]}" -eq 0 ]; then
+                selected_runs+=("$run")
+            elif ! append_unique "$run" "${selected_runs[@]}"; then
+                selected_runs+=("$run")
+            fi
+        done
+    fi
 
     if [ "${#selected_runs[@]}" -gt 0 ]; then
         for run in "${selected_runs[@]}"; do

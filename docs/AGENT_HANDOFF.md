@@ -164,13 +164,13 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 ### runllm Surface
 
-- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`).
+- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`, `kimi-sglang-eagle/`).
 - Each model dir is self-contained with `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
 - Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig` (relative to the model dir).
 - `runllm/qwen2.5-1.5b-sglang/` is a sibling SGLang variant that intentionally keeps the same filenames and `VLLM_MODEL` Makefile variable for compatibility with the existing `runllm`/sweep directory contract.
 - Sweeps now store `model_family`, `baseline_variant`, and `model_variants` in `sweep_metadata.json` so improve runs know the canonical family plus every deployment variant available to that sweep.
-- Family-first sweep creation is now the default contract. For example, `make sweep MODEL=kimi` automatically exposes both `kimi-vllm` and `kimi-sglang`; use `BASELINE_VARIANT=kimi-sglang` only when you want the baseline run to start on SGLang instead of the default vLLM variant.
+- Family-first sweep creation is now the default contract. For example, `make sweep MODEL=kimi` automatically exposes `kimi-vllm`, `kimi-sglang`, and `kimi-sglang-eagle`; use `BASELINE_VARIANT=kimi-sglang-eagle` to start the baseline on the EAGLE-3 speculative decoding variant.
 - Backend switches should replace both `vllm-config.yaml` and `Makefile` from the chosen canonical variant template.
 - Every sweep directory now keeps an `OVERVIEW.md` with started time, benchmark/data config, agent provider/model, tracked `runllm/` variants, run counts, and current failure streak / stop-policy status. Refresh it whenever sweep metadata or run outcomes change.
 
@@ -190,6 +190,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - The PVC is `ReadWriteMany` — multiple pods across different nodes can mount it.
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
 - **Kimi exception:** Kimi-K2.5 currently does *not* use tensorizer in the working path. It serves from HF safetensors cached under `/mnt/tensorized/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack.
+- **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` serves Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/tensorized/hf-cache`.
 
 ---
 
@@ -227,6 +228,9 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 11. **Unschedulable GPU pods are cluster-capacity failures, not repairable experiment failures.**
    If a run fails with `Pod unschedulable` / `Insufficient nvidia.com/gpu`, treat that as an immediate cluster-capacity stop condition. Do not let the retry loop spend turns "repairing" the YAML; wait for capacity or free GPUs first.
+
+12. **Every runllm variant must mount the `tensorized-models` PVC for model caching.**
+   Without a PVC, HuggingFace models are re-downloaded from scratch on every pod restart — hundreds of GB for large models like Kimi-K2.5. For vLLM variants, use `--download-dir /mnt/tensorized/hf-cache`. For SGLang variants, set the `HF_HOME` env var to `/mnt/tensorized/hf-cache`. Always add the `tensorized-models` PVC volume and volumeMount. This applies to both main models and draft/speculative models. When creating a new `runllm/` variant, copy the volume config from an existing variant rather than starting without it.
 
 ---
 
