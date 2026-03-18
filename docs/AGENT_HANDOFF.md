@@ -64,7 +64,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `scripts/sweep_remote.sh` | Remote sweep orchestration: create controller pod, sync code, start sweep, sync results |
 | `sweep-controller.yaml` | Controller pod spec (python:3.13-slim + kubectl + uv, ServiceAccount for pod management) |
 | `sweep-controller-rbac.yaml` | RBAC: ServiceAccount, Role, RoleBinding for controller to manage vLLM pods |
-| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`). Each has `pod.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
+| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-trt/`). Each has `pod.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
 | `docs/SWEEP_BEST_PRACTICES.md` | One-page synthesis of cross-sweep lessons for future optimization agents |
 | `results/sweep-NAME/AGENT_CONTEXT.md` | Generated compact sweep memory for prompts: top frontier, repeated failures, and harness-only patterns |
@@ -193,6 +193,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - **Kimi SGLang tensorizer:** `kimi-sglang-tensorizer/` is an experimental variant that adds tensorizer support to SGLang. The SGLang source at `autollm/sglang/` is patched with a `TensorizerModelLoader` (in `model_loader/loader.py`) that supports direct GPU deserialization via `load_into_module()`. Requires a one-time serialization step (`make tensorize` in the variant dir) and a custom Docker image (`lbiewald/sglang-tensorizer:latest`, built from `autollm/sglang/Dockerfile.tensorizer`). Serialized weights go to `/mnt/models/sglang/moonshotai/Kimi-K2.5/v1/model-rank-NNN.tensors`. The serialization hook uses `SGLANG_TENSORIZE_OUTPUT_DIR` / `SGLANG_TENSORIZE_AND_EXIT` env vars in `model_runner.py`.
 - **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` is configured for Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`. **Status (March 2026):** EAGLE-3 is not yet supported for `KimiK25ForConditionalGeneration` in SGLang v0.5.9. The pod crashes with `set_eagle3_layers_to_capture` AttributeError. This variant is kept for when SGLang adds support.
 - **Multithreaded safetensors loading:** SGLang variants use `--load-format safetensors --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}'` to load weights in parallel. This reduced Kimi-K2.5 loading from ~35 min to ~4 min on the NFS-backed `models` PVC. Available since SGLang v0.5.8+.
+- **Kimi TensorRT-LLM variant:** `kimi-trt/` serves Kimi-K2.5 via `trtllm-serve` with `--backend pytorch` and 8× GPU tensor parallelism. Model weights are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`. First startup may be slower due to engine optimization. Not yet tested end-to-end.
 
 ---
 

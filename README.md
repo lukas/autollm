@@ -125,15 +125,15 @@ Each sweep also keeps a higher-level synthesis in both `FULL_RETRO.md` and `FULL
 
 ### Benchmark presets
 
-| Preset | Profile | Requests | Time limit | Rate | Data | Use case |
-|--------|---------|----------|------------|------|------|----------|
-| `quick` | synchronous | 5 | 30s | — | 64+64 tokens | Fast iteration (~30s) |
-| `sync` | synchronous | 20 | 60s | — | 64+64 tokens | Moderate (~1 min) |
-| `sweep` | sweep | — | 60s | — | 256+128 tokens | Multi-profile |
-| `medium` | synchronous | 200 | 300s | — | 256+128 tokens | Thorough (~2–5 min) |
-| `medium-throughput` | concurrent | 200 | 300s | 64 | 256+128 tokens | Throughput-focused (~3 min) |
-| `large` | concurrent | 500 | 600s | 64 | 256+128 tokens | Thorough throughput (~10 min) |
-| `long` | synchronous | 1000 | 600s | — | 256+128 tokens | Comprehensive (~10 min) |
+| Preset | Profile | Requests | Time limit | Data | Use case |
+|--------|---------|----------|------------|------|----------|
+| `quick` | synchronous | 5 | 30s | 256+128 tokens | Fast iteration (~30s) |
+| `sync` | synchronous | 20 | 60s | 256+128 tokens | Moderate (~1 min) |
+| `sweep` | synchronous | 200 | 60s | 256+128 tokens | Quick sweep (~1 min) |
+| `medium` | synchronous | 200 | 300s | 256+128 tokens | Thorough (~2–5 min) |
+| `medium-throughput` | synchronous | 200 | 300s | 256+128 tokens | Same as medium |
+| `large` | synchronous | 200 | 300s | 256+128 tokens | Same as medium |
+| `long` | synchronous | 1000 | 600s | 256+128 tokens | Comprehensive (~10 min) |
 
 `--max-requests` has no hard limit — set `MAX_REQUESTS=2000` for even longer runs.
 

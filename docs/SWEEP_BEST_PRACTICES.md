@@ -4,10 +4,9 @@ Practical guidance for future agents running `autollm` sweeps. This is based on 
 
 ## 1. Make comparisons apples-to-apples
 
-- Do not compare runs across different benchmark presets. `quick` synchronous `64/64` results and `large` concurrent `256/128` results answer different questions.
+- Do not compare runs across different benchmark presets. Different presets use different request counts and time limits.
 - Before claiming an improvement, verify the sweep's `OVERVIEW.md` matches the comparison target on:
   - benchmark preset
-  - profile (`synchronous` vs `concurrent`)
   - prompt/output token sizes
   - request/time limits
 - Treat `TTFT: 0ms` as suspect on Kimi-family runs. The throughput/latency numbers may still be usable, but TTFT instrumentation is not always trustworthy there.
