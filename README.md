@@ -91,7 +91,7 @@ The agent has access to these tools during each run:
 | `search_web` | Web search via Exa API (falls back to DuckDuckGo) |
 | `fetch_url` | Fetch and extract content from a URL |
 | `read_file` | Read project files (results/, runllm/, docs/, scripts/) |
-| `write_file` | Write `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory only |
+| `write_file` | Write `pod.yaml` or `Makefile` to the isolated per-run experiment directory only |
 | `list_files` | List files in a project directory |
 | `run_shell` | Run a shell command (read-only, no destructive ops) |
 | `run_benchmark` | Deploy the written config and run the benchmark |
@@ -154,7 +154,7 @@ results/sweep-qwen-latency/
   agent.log                # full local agent conversation history (all runs)
   20260311_120000/          # improvement run
     runllm/                 # modified runllm snapshot
-    vllm_config.yaml        # vLLM config used
+    pod_config.yaml         # Pod config used
     benchmarks.json         # benchmark results
     FULL_RETRO.md           # full sweep retro snapshot as seen by this run
     FULL_RETRO.txt          # legacy mirror of that snapshot

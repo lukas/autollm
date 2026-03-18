@@ -6,7 +6,7 @@ Each run is saved to results/runs/YYYYMMDD_HHMMSS/. Requires vLLM port-forward.
 
 Usage:
   python scripts/benchmark_harness.py [--description "My change"]
-  VLLM_CONFIG=runllm/qwen2.5-1.5b/vllm-config.yaml make benchmark-run
+  POD_CONFIG=runllm/qwen2.5-1.5b/pod.yaml make benchmark-run
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ from vllm_profiling import VLLMProfiler, write_vllm_snapshot
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
 RUNLLM_ROOT = PROJECT_ROOT / "runllm"
-_DEFAULT_VLLM = RUNLLM_ROOT / "qwen2.5-1.5b" / "vllm-config.yaml"
-VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
-RUNLLM_DIR = VLLM_YAML.parent  # model subdir containing Makefile
+_DEFAULT_POD = RUNLLM_ROOT / "qwen2.5-1.5b" / "pod.yaml"
+POD_YAML = Path(os.environ.get("POD_CONFIG", str(_DEFAULT_POD))).resolve()
+RUNLLM_DIR = POD_YAML.parent  # model subdir containing Makefile
 BENCHMARK_LIVE_FILE = PROJECT_ROOT / "results" / "benchmark_live.txt"
 
 
@@ -50,8 +50,8 @@ def _pod_name_from_yaml(yaml_path: Path) -> str:
     return "vllm"
 
 
-VLLM_POD = os.environ.get("VLLM_POD") or _pod_name_from_yaml(VLLM_YAML)
-BACKEND = infer_backend(VLLM_YAML.read_text() if VLLM_YAML.exists() else "")
+VLLM_POD = os.environ.get("VLLM_POD") or _pod_name_from_yaml(POD_YAML)
+BACKEND = infer_backend(POD_YAML.read_text() if POD_YAML.exists() else "")
 
 
 def main() -> None:
@@ -121,12 +121,12 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Capture vLLM config
-    if VLLM_YAML.exists():
-        shutil.copy(VLLM_YAML, run_dir / "vllm_config.yaml")
-        _log(run_dir, "run.log", f"Captured vLLM config from {VLLM_YAML}")
+    if POD_YAML.exists():
+        shutil.copy(POD_YAML, run_dir / "pod_config.yaml")
+        _log(run_dir, "run.log", f"Captured vLLM config from {POD_YAML}")
     else:
         _log(
-            run_dir, "run.log", f"VLLM config not found: {VLLM_YAML} (set VLLM_CONFIG)"
+            run_dir, "run.log", f"VLLM config not found: {POD_YAML} (set POD_CONFIG)"
         )
 
     # 2. Capture pod status (best-effort)
@@ -166,7 +166,7 @@ def main() -> None:
         "backend": BACKEND,
         "benchmark": args.benchmark if not args.fast else "quick",
         "benchmark_config": cfg,
-        "vllm_config": str(VLLM_YAML),
+        "pod_config": str(POD_YAML),
     }
     (run_dir / "run_metadata.json").write_text(
         __import__("json").dumps(metadata, indent=2)
@@ -224,7 +224,7 @@ def main() -> None:
         try:
             import yaml as _yaml
             _hc_gpu = int(
-                _yaml.safe_load(VLLM_YAML.read_text())
+                _yaml.safe_load(POD_YAML.read_text())
                 .get("spec", {}).get("containers", [{}])[0]
                 .get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 1)
             )
@@ -273,7 +273,7 @@ def main() -> None:
         pod_name=VLLM_POD,
         run_dir=run_dir,
         env=os.environ.copy(),
-        yaml_path=VLLM_YAML,
+        yaml_path=POD_YAML,
         interval_sec=float(os.environ.get("VLLM_PROFILE_INTERVAL_SEC", "5")),
         log_fn=lambda msg: _log(run_dir, "run.log", msg),
     )
@@ -322,7 +322,7 @@ def main() -> None:
 
     print(f"Run saved to {run_dir}")
     print(f"  summary:   {run_dir}/summary.html")
-    print(f"  config:   {run_dir}/vllm_config.yaml")
+    print(f"  config:   {run_dir}/pod_config.yaml")
     if not skip_index:
         print(f"  index:    {RUNS_DIR}/index.html")
 
@@ -444,7 +444,7 @@ def _run_guideline(run_dir: Path, *, config: dict) -> int:
             import yaml as _y
 
             _gpu_count = int(
-                _y.safe_load(VLLM_YAML.read_text())
+                _y.safe_load(POD_YAML.read_text())
                 .get("spec", {})
                 .get("containers", [{}])[0]
                 .get("resources", {})
@@ -593,8 +593,8 @@ def generate_runs_index() -> None:
             else ""
         )
         config_link = (
-            f"{run_dir.name}/vllm_config.yaml"
-            if (run_dir / "vllm_config.yaml").exists()
+            f"{run_dir.name}/pod_config.yaml"
+            if (run_dir / "pod_config.yaml").exists()
             else ""
         )
 
@@ -681,8 +681,8 @@ if __name__ == "__main__":
             f = src / name
             if f.exists():
                 shutil.copy(f, run_dir / name)
-        if VLLM_YAML.exists():
-            shutil.copy(VLLM_YAML, run_dir / "vllm_config.yaml")
+        if POD_YAML.exists():
+            shutil.copy(POD_YAML, run_dir / "pod_config.yaml")
         (run_dir / "run_metadata.json").write_text(
             __import__("json").dumps(
                 {

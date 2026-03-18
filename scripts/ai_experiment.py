@@ -107,7 +107,7 @@ Pick ONE simple change most likely to improve performance, then test it.
 1. Read the leaderboard and lessons learned (in the prompt).
 2. Pick one untried change. Do NOT bundle multiple changes.
 3. Read the sweep research memory in the prompt first. Use read_file/read_logs to inspect past runs. Use search_web/fetch_url only if that local memory does not already answer the question.
-4. Write the config: write_file('vllm-config.yaml', <complete pod YAML>).
+4. Write the config: write_file('pod.yaml', <complete pod YAML>).
 5. Optionally: run_benchmark(<description>) to deploy and test.
 
 ## Run policy
@@ -117,7 +117,7 @@ Pick ONE simple change most likely to improve performance, then test it.
 - Prefer local evidence over web search. Assume repeated failures and prior research are already documented unless the prompt/logs show a genuinely new issue.
 
 ## File safety
-- write_file writes ONLY to the isolated per-run directory. You can only write 'vllm-config.yaml' and 'Makefile'.
+- write_file writes ONLY to the isolated per-run directory. You can only write 'pod.yaml' and 'Makefile'.
 - read_file can read from results/, runllm/, docs/, scripts/.
 
 ## Rules — DO NOT violate
@@ -841,7 +841,7 @@ def _load_backend_templates(runllm_root: Path, model_variants: list[str]) -> lis
     templates: list[dict[str, str]] = []
     for model_dir in model_variants:
         variant_dir = runllm_root / model_dir
-        cfg_path = variant_dir / "vllm-config.yaml"
+        cfg_path = variant_dir / "pod.yaml"
         makefile_path = variant_dir / "Makefile"
         if not cfg_path.exists() or not makefile_path.exists():
             continue
@@ -868,7 +868,7 @@ def _render_backend_templates_section(templates: list[dict[str, str]], model_fam
         "",
         "You may keep the current backend or switch to any of these canonical family variants.",
         "A backend switch counts as the ONE experiment change for the run, so do not bundle extra tuning with the switch.",
-        "If you switch backend, you may copy BOTH `vllm-config.yaml` and `Makefile` from any of the variant templates below before benchmarking.",
+        "If you switch backend, you may copy BOTH `pod.yaml` and `Makefile` from any of the variant templates below before benchmarking.",
         "",
     ]
     for template in templates:
@@ -883,7 +883,7 @@ def _backend_label_for_run(run_dir: Path, meta: dict | None = None) -> str:
     if meta and meta.get("backend"):
         return str(meta["backend"])
     config_text = ""
-    for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
+    for cfg in ("pod_config.yaml", "runllm/pod.yaml", "runllm/vllm-qwen.yaml"):
         fp = run_dir / cfg
         if fp.exists():
             config_text = fp.read_text()
@@ -910,7 +910,7 @@ def _get_experiment_leaderboard(
     sweep_name = runs_base.name.replace("sweep-", "")
     objective = sweep_objective(sweep_name)
     reference_config_text = None
-    for cfg in ("baseline/vllm_config.yaml", "baseline/runllm/vllm-config.yaml", "baseline/runllm/vllm-qwen.yaml"):
+    for cfg in ("baseline/pod_config.yaml", "baseline/runllm/pod.yaml", "baseline/runllm/vllm-qwen.yaml"):
         fp = runs_base / cfg
         if fp.exists():
             reference_config_text = fp.read_text()
@@ -941,7 +941,7 @@ def _get_experiment_leaderboard(
                         "retro": _read_retro_summary(d),
                         "result": f"insufficient benchmark traffic: only {n_completed} requests completed",
                         "changes": _summarize_config_changes(
-                            next((fp.read_text() for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml")
+                            next((fp.read_text() for cfg in ("pod_config.yaml", "runllm/pod.yaml", "runllm/vllm-qwen.yaml")
                                   if (fp := d / cfg).exists()), ""),
                             reference_config_text,
                         ),
@@ -952,7 +952,7 @@ def _get_experiment_leaderboard(
                 metrics = _fmt_summary(m)
                 if metrics and metrics != "—":
                     config_text = ""
-                    for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
+                    for cfg in ("pod_config.yaml", "runllm/pod.yaml", "runllm/vllm-qwen.yaml"):
                         fp = d / cfg
                         if fp.exists():
                             config_text = fp.read_text()
@@ -975,7 +975,7 @@ def _get_experiment_leaderboard(
         # Failed or no metrics
         result = ""
         config_text = ""
-        for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
+        for cfg in ("pod_config.yaml", "runllm/pod.yaml", "runllm/vllm-qwen.yaml"):
             fp = d / cfg
             if fp.exists():
                 config_text = fp.read_text()
@@ -1176,7 +1176,7 @@ def _get_best_config_yaml(runs_base: Path) -> str | None:
             except Exception:
                 pass
     if best_dir:
-        for cfg in ("vllm_config.yaml", "runllm/vllm-config.yaml", "runllm/vllm-qwen.yaml"):
+        for cfg in ("pod_config.yaml", "runllm/pod.yaml", "runllm/vllm-qwen.yaml"):
             fp = best_dir / cfg
             if fp.exists():
                 return fp.read_text()[:2000]
@@ -1710,10 +1710,10 @@ def _deploy_and_benchmark(
     """Deploy from experiment_dir, run benchmark, stream logs to run_dir, track queries, abort if stuck.
     Uses a unique pod name and local port so multiple runs can execute in parallel."""
     start = time.time()
-    vllm_yaml = experiment_dir / "vllm-config.yaml"
+    vllm_yaml = experiment_dir / "pod.yaml"
     deploy_hard_timeout = _effective_deploy_hard_timeout(vllm_yaml)
     env = os.environ.copy()
-    env["VLLM_CONFIG"] = str(vllm_yaml)
+    env["POD_CONFIG"] = str(vllm_yaml)
     env["KUBECONFIG"] = os.environ.get("KUBECONFIG", "")
     logs_proc = None
     profiler: VLLMProfiler | None = None
@@ -2238,7 +2238,7 @@ def main() -> int:
         try:
             if best_link.exists():
                 resolved = best_link.resolve() if best_link.is_symlink() else best_link
-                if resolved.exists() and ((resolved / "vllm-config.yaml").exists() or (resolved / "vllm-qwen.yaml").exists()):
+                if resolved.exists() and ((resolved / "pod.yaml").exists() or (resolved / "vllm-qwen.yaml").exists()):
                     base_runllm = resolved
         except OSError:
             pass
@@ -2247,7 +2247,7 @@ def main() -> int:
     shutil.copytree(base_runllm, experiment_dir, ignore=shutil.ignore_patterns(".git"))
 
     makefile_content = (base_runllm / "Makefile").read_text()
-    _vllm_cfg = base_runllm / "vllm-config.yaml"
+    _vllm_cfg = base_runllm / "pod.yaml"
     if not _vllm_cfg.exists():
         _vllm_cfg = base_runllm / "vllm-qwen.yaml"  # legacy runs
     vllm_content = _vllm_cfg.read_text()
@@ -2257,7 +2257,7 @@ def main() -> int:
         backend_templates = [t for t in backend_templates if t["backend"] == current_backend]
     backend_templates_section = _render_backend_templates_section(backend_templates, model_family)
     # Ensure experiment_dir always uses the new name
-    (experiment_dir / "vllm-config.yaml").write_text(vllm_content)
+    (experiment_dir / "pod.yaml").write_text(vllm_content)
     runs_for_context = sweep_dir or RUNS_DIR
     leaderboard = _get_experiment_leaderboard(
         runs_for_context,
@@ -2369,7 +2369,7 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
             + ". Do NOT invent a new backend or custom image."
         )
         backend_constraint_lines.append(
-            "- If you switch backend, copy both `vllm-config.yaml` and `Makefile` from the chosen canonical variant first. "
+            "- If you switch backend, copy both `pod.yaml` and `Makefile` from the chosen canonical variant first. "
             "A backend switch is the single experiment change for the run."
         )
     else:
@@ -2437,7 +2437,7 @@ Pick ONE untried change (check leaderboard) backed by evidence. Change exactly o
 This run should test exactly one experiment hypothesis. If that hypothesis benchmarks successfully, stop even if it regresses.
 Prefer local evidence from the sweep. Read the sweep research memory first. Only use `search_web`/`fetch_url` when that memory plus the logs/retros do not already cover the question.
 1. State: `knob: old -> new` and why (2-3 sentences)
-2. write_file('vllm-config.yaml', <complete YAML>)
+2. write_file('pod.yaml', <complete YAML>)
 {"3. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
 3. Optionally run_benchmark(<description>) to deploy and test."""
 
@@ -2533,7 +2533,7 @@ Prefer local evidence from the sweep. Read the sweep research memory first. Only
                         return SWEEP_STOP_EXIT_CODE
                 return 1
 
-            vllm_cur = (experiment_dir / "vllm-config.yaml").read_text()
+            vllm_cur = (experiment_dir / "pod.yaml").read_text()
             user_prompt = f"""Attempt {attempt} FAILED: {result_msg}
 
 The run directory is '{run_dir.name}'. Use tools to investigate:
@@ -2541,7 +2541,7 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 - read_logs('{run_dir.name}', 'kubectl') for kubectl logs
 - kubectl_get('pods') to check pod status
 
-**Failed vllm-config.yaml:**
+**Failed pod.yaml:**
 ```yaml
 {vllm_cur[:2500]}
 ```
@@ -2558,7 +2558,7 @@ The run directory is '{run_dir.name}'. Use tools to investigate:
 - For SGLang variants, preserve the canonical `sglang serve` launcher shape and keep `/health` plus `/v1/chat/completions` compatible with the harness.
 - No `--disable-log-requests` (doesn't exist for vLLM here). No `--disable-log-stats` (logs/metrics needed for diagnosis). No `VLLM_ATTENTION_BACKEND` if absent.
 
-When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
+When ready, call write_file('pod.yaml', <complete fixed YAML>)."""
             print(f"Retry {attempt + 1}/{max_attempts}: agent investigating failure with tools...")
         else:
             user_prompt = prompt
@@ -2668,7 +2668,7 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
                             print(stop_status["reason"])
                             return SWEEP_STOP_EXIT_CODE
                     return 1
-                yaml_content = (experiment_dir / "vllm-config.yaml").read_text()
+                yaml_content = (experiment_dir / "pod.yaml").read_text()
                 description = f"No config change: {no_config_change_reason}"
             elif yaml_content:
                 description = agent_result.description or _extract_description(agent_result.text)
@@ -2706,8 +2706,8 @@ When ready, call write_file('vllm-config.yaml', <complete fixed YAML>)."""
         last_description = description
 
         if not agent_result.config_written:
-            (experiment_dir / "vllm-config.yaml").write_text(yaml_content)
-            shutil.copy(experiment_dir / "vllm-config.yaml", run_dir / "vllm_config.yaml")
+            (experiment_dir / "pod.yaml").write_text(yaml_content)
+            shutil.copy(experiment_dir / "pod.yaml", run_dir / "pod_config.yaml")
             makefile_new = _extract_makefile(agent_result.text) or (experiment_dir / "Makefile").read_text()
             (experiment_dir / "Makefile").write_text(makefile_new)
 

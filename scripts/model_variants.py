@@ -41,7 +41,7 @@ def list_model_variants(runllm_root: Path, model_name: str) -> list[str]:
         if candidate in seen:
             continue
         variant_dir = runllm_root / candidate
-        if variant_dir.is_dir() and (variant_dir / "vllm-config.yaml").exists():
+        if variant_dir.is_dir() and (variant_dir / "pod.yaml").exists():
             variants.append(candidate)
             seen.add(candidate)
     return variants
@@ -53,7 +53,7 @@ def list_model_families(runllm_root: Path) -> list[str]:
     if not runllm_root.exists():
         return []
     for entry in runllm_root.iterdir():
-        if entry.is_dir() and (entry / "vllm-config.yaml").exists():
+        if entry.is_dir() and (entry / "pod.yaml").exists():
             families.add(canonical_model_family(entry.name))
     return sorted(families)
 
@@ -76,7 +76,7 @@ def infer_backend_from_runllm_dir(runllm_dir: Path) -> str:
     """Infer backend from a runllm directory snapshot."""
     config_text = ""
     makefile_text = ""
-    cfg_path = runllm_dir / "vllm-config.yaml"
+    cfg_path = runllm_dir / "pod.yaml"
     if cfg_path.exists():
         config_text = cfg_path.read_text()
     makefile_path = runllm_dir / "Makefile"

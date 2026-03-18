@@ -30,8 +30,8 @@ def main() -> int:
         print("FAIL: Makefile missing delete-pod target")
         return 1
 
-    if "vllm-config.yaml" not in text:
-        print("FAIL: Makefile should default to vllm-config.yaml")
+    if "pod.yaml" not in text:
+        print("FAIL: Makefile should default to pod.yaml")
         return 1
 
     # 2. Dry-run apply - verify delete runs before kubectl apply

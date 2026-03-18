@@ -83,15 +83,15 @@ query:
 #        make benchmark BENCHMARK=sweep DESCRIPTION="baseline"
 # Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req)
 benchmark: ensure-kubeconfig
-	@VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
+	@POD_CONFIG=runllm/$(MODEL_DIR)/pod.yaml python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
 
 # Harness: saves to results/runs/YYYYMMDD_HHMMSS/ (requires port-forward)
 benchmark-run:
 	@echo "Requires: cd runllm/$(MODEL_DIR) && make forward"
-	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
+	POD_CONFIG=runllm/$(MODEL_DIR)/pod.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)"
 
 benchmark-run-quick:
-	VLLM_CONFIG=runllm/$(MODEL_DIR)/vllm-config.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
+	POD_CONFIG=runllm/$(MODEL_DIR)/pod.yaml python3 scripts/benchmark_harness.py --description "$(DESCRIPTION)" --skip-port-forward
 
 # Results
 results-summary:

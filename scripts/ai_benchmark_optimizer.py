@@ -2,11 +2,11 @@
 """
 AI-driven vLLM optimization: run baseline, get AI suggestion, apply, benchmark, compare.
 
-Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY. Uses VLLM_CONFIG (default: runllm/qwen2.5-1.5b/vllm-config.yaml).
+Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY. Uses POD_CONFIG (default: runllm/qwen2.5-1.5b/pod.yaml).
 
 Usage:
   ANTHROPIC_API_KEY=xxx make ai-benchmark-optimize
-  VLLM_CONFIG=runllm/qwen2.5-1.5b/vllm-config.yaml make ai-optimize
+  POD_CONFIG=runllm/qwen2.5-1.5b/pod.yaml make ai-optimize
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "qwen2.5-1.5b" / "vllm-config.yaml"
-VLLM_YAML = Path(os.environ.get("VLLM_CONFIG", str(_DEFAULT_VLLM))).resolve()
+_DEFAULT_VLLM = PROJECT_ROOT / "runllm" / "qwen2.5-1.5b" / "pod.yaml"
+VLLM_YAML = Path(os.environ.get("POD_CONFIG", str(_DEFAULT_VLLM))).resolve()
 RESULTS_DIR = PROJECT_ROOT / "results"
 RUNS_DIR = RESULTS_DIR / "runs"
 STATE_FILE = RESULTS_DIR / "ai_optimizer_state.json"
@@ -204,7 +204,7 @@ def main() -> None:
         print("AI_PROVIDER must be 'anthropic' or 'openai'"); sys.exit(1)
 
     if not VLLM_YAML.exists():
-        print(f"VLLM config not found: {VLLM_YAML}. Set VLLM_CONFIG or ensure runllm/<model>/vllm-config.yaml exists.")
+        print(f"VLLM config not found: {VLLM_YAML}. Set POD_CONFIG or ensure runllm/<model>/pod.yaml exists.")
         sys.exit(1)
 
     config = VLLM_YAML.read_text()
@@ -228,7 +228,7 @@ def main() -> None:
     _write_state(state)
     print("Running baseline benchmark...", flush=True)
     env = os.environ.copy()
-    env["VLLM_CONFIG"] = str(VLLM_YAML)
+    env["POD_CONFIG"] = str(VLLM_YAML)
     baseline_cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "benchmark_harness.py"), "--description", "baseline"]
     if fast_benchmark:
         baseline_cmd.append("--fast")

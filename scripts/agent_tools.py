@@ -72,7 +72,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "write_file",
         "description": (
             "Write a file to the run-specific experiment directory (results/sweep-NAME/TIMESTAMP/runllm/). "
-            "Only 'vllm-config.yaml' and 'Makefile' are allowed. This NEVER writes to the project root "
+            "Only 'pod.yaml' and 'Makefile' are allowed. This NEVER writes to the project root "
             "or the shared runllm/ — only to the isolated per-run copy."
         ),
         "parameters": {
@@ -80,7 +80,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Filename to write: 'vllm-config.yaml' or 'Makefile'",
+                    "description": "Filename to write: 'pod.yaml' or 'Makefile'",
                 },
                 "content": {"type": "string", "description": "Full file content to write"},
             },
@@ -123,7 +123,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "run_benchmark",
         "description": (
             "Deploy the current experiment config and run the benchmark suite. "
-            "You MUST call write_file('vllm-config.yaml', ...) first. "
+            "You MUST call write_file('pod.yaml', ...) first. "
             "Long-running (~2 min). Returns benchmark metrics or error details."
         ),
         "parameters": {
@@ -185,7 +185,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "pod_name": {"type": "string", "description": "Pod name from vllm-config.yaml metadata.name"},
+                "pod_name": {"type": "string", "description": "Pod name from pod.yaml metadata.name"},
                 "tail": {"type": "integer", "description": "Lines from end (default 200)"},
                 "container": {"type": "string", "description": "Container name (optional)"},
             },
@@ -351,7 +351,7 @@ def _html_to_text(raw: str) -> str:
 
 
 ALLOWED_READ_PREFIXES = ("results/", "runllm/", "docs/", "scripts/")
-ALLOWED_WRITE_FILES = {"vllm-config.yaml", "Makefile"}
+ALLOWED_WRITE_FILES = {"pod.yaml", "Makefile"}
 SHELL_BLOCKLIST = re.compile(
     r"\b(rm\s+-rf|rm\s+-r|mkfs|dd\s+if|reboot|shutdown|kill\s+-9|pkill|chmod\s+777)\b", re.I
 )
@@ -521,11 +521,11 @@ def _tool_write_file(path: str, content: str, ctx: ToolContext) -> str:
     target = ctx.experiment_dir / basename
     try:
         target.write_text(content)
-        if basename == "vllm-config.yaml":
+        if basename == "pod.yaml":
             ctx.config_written = True
             ctx.config_content = content
             import shutil
-            shutil.copy(target, ctx.run_dir / "vllm_config.yaml")
+            shutil.copy(target, ctx.run_dir / "pod_config.yaml")
         return f"Wrote {basename} ({len(content)} bytes) to {rel}/{basename}"
     except Exception as e:
         return f"Write error: {e}"
@@ -576,7 +576,7 @@ def _tool_run_shell(command: str, ctx: ToolContext) -> str:
 
 def _tool_run_benchmark(description: str, ctx: ToolContext) -> str:
     if not ctx.config_written:
-        return "Error: write vllm-config.yaml first (call write_file)."
+        return "Error: write pod.yaml first (call write_file)."
     if ctx._benchmark_count >= ctx.max_benchmarks:
         return f"Error: max {ctx.max_benchmarks} benchmarks per agent loop reached."
     if ctx.deploy_and_benchmark is None:

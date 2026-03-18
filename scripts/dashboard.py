@@ -491,9 +491,11 @@ def render_run_detail(run_dir: Path):
             st.info("No agent.log found for this run.")
 
     with tab_config:
-        config_path = run_dir / "vllm_config.yaml"
+        config_path = run_dir / "pod_config.yaml"
         if not config_path.exists():
-            config_path = run_dir / "runllm" / "vllm-config.yaml"
+            config_path = run_dir / "vllm_config.yaml"
+        if not config_path.exists():
+            config_path = run_dir / "runllm" / "pod.yaml"
         if not config_path.exists():
             config_path = run_dir / "runllm" / "vllm-qwen.yaml"
         if config_path.exists():

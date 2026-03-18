@@ -50,7 +50,7 @@ def _resolve_model_variants(runllm_root: Path, model_family: str, requested_vari
         if not candidate or candidate in seen:
             continue
         variant_dir = runllm_root / candidate
-        if not variant_dir.is_dir() or not (variant_dir / "vllm-config.yaml").exists():
+        if not variant_dir.is_dir() or not (variant_dir / "pod.yaml").exists():
             raise ValueError(f"Model variant '{candidate}' not found under runllm/")
         variants.append(candidate)
         seen.add(candidate)
@@ -68,13 +68,13 @@ def _resolve_baseline_variant(
     if baseline_variant:
         variant = baseline_variant.strip()
         variant_dir = runllm_root / variant
-        if not variant_dir.is_dir() or not (variant_dir / "vllm-config.yaml").exists():
+        if not variant_dir.is_dir() or not (variant_dir / "pod.yaml").exists():
             raise ValueError(f"Baseline variant '{variant}' not found under runllm/")
         return variant
 
     explicit_variant = model_name.strip()
     variant_dir = runllm_root / explicit_variant
-    if variant_dir.is_dir() and (variant_dir / "vllm-config.yaml").exists():
+    if variant_dir.is_dir() and (variant_dir / "pod.yaml").exists():
         return explicit_variant
 
     if model_variants:
@@ -149,7 +149,7 @@ def main() -> int:
         print(str(exc))
         return 1
     model_path = RUNLLM_ROOT / baseline_variant
-    if not model_variants or not (model_path / "vllm-config.yaml").exists():
+    if not model_variants or not (model_path / "pod.yaml").exists():
         avail = _list_models()
         print(f"Model '{model_name}' not found. Available families: {', '.join(avail)}")
         return 1
@@ -185,10 +185,10 @@ def main() -> int:
         print("Backend switching is enabled for this sweep.")
     print(f"Running baseline ({args.benchmark})...")
 
-    vllm_config = str(model_path / "vllm-config.yaml")
+    pod_config = str(model_path / "pod.yaml")
     harness = PROJECT_ROOT / "scripts" / "benchmark_harness.py"
     env = os.environ.copy()
-    env["VLLM_CONFIG"] = vllm_config
+    env["POD_CONFIG"] = pod_config
     cmd = [
         sys.executable,
         str(harness),

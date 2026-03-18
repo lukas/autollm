@@ -16,7 +16,7 @@ The test harness runs Guideline benchmarks against your vLLM setup, saves every 
 
 ### 1. Make a change to vLLM
 
-Edit the model config in `runllm/<model>/vllm-config.yaml` (e.g., change args, tensor-parallel-size):
+Edit the model config in `runllm/<model>/pod.yaml` (e.g., change args, tensor-parallel-size):
 
 ```yaml
 # Example: try a different setting
@@ -52,7 +52,7 @@ Each run is saved to `results/runs/YYYYMMDD_HHMMSS/`:
 
 - **summary.html** — Latency, TTFT, ITL, throughput
 - **benchmarks.html** — Guideline full report
-- **vllm_config.yaml** — vLLM config at run time
+- **pod_config.yaml** — Pod config at run time
 - **pod_status.txt** — Pod state
 - **run.log** — Benchmark log
 
@@ -83,7 +83,7 @@ make dashboard
 | `benchmarks.csv` | Tabular metrics |
 | `benchmarks.html` | Guideline interactive report |
 | `summary.html` | Simple metrics table (latency, TTFT, ITL, throughput) |
-| `vllm_config.yaml` | Copy of `vllm-config.yaml` at run time |
+| `pod_config.yaml` | Copy of `pod.yaml` at run time |
 | `pod_status.txt` | `kubectl describe pod` output |
 | `hardware_context.json` | Pod placement plus resource requests/limits captured for profiling |
 | `vllm_metrics.txt` | Final raw scrape of vLLM Prometheus `/metrics` |
@@ -150,5 +150,5 @@ Useful env vars for agent behavior:
 
 - **Label runs:** Always use `DESCRIPTION=` so you can tell runs apart in the index
 - **Port-forward:** Use `benchmark-run` or `benchmark-run-quick` when iterating against an already-running pod
-- **Compare configs:** Open `vllm_config.yaml` from different runs to diff vLLM settings
+- **Compare configs:** Open `pod_config.yaml` from different runs to diff server settings
 - **Profile bottlenecks:** Check `vllm_metrics_profile.json` first. It highlights queue buildup, KV cache pressure, preemption growth, and whether GPU utilization stayed low.

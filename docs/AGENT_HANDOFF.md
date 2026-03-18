@@ -64,7 +64,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `scripts/sweep_remote.sh` | Remote sweep orchestration: create controller pod, sync code, start sweep, sync results |
 | `sweep-controller.yaml` | Controller pod spec (python:3.13-slim + kubectl + uv, ServiceAccount for pod management) |
 | `sweep-controller-rbac.yaml` | RBAC: ServiceAccount, Role, RoleBinding for controller to manage vLLM pods |
-| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`). Each has `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
+| `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`). Each has `pod.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
 | `docs/SWEEP_BEST_PRACTICES.md` | One-page synthesis of cross-sweep lessons for future optimization agents |
 | `results/sweep-NAME/AGENT_CONTEXT.md` | Generated compact sweep memory for prompts: top frontier, repeated failures, and harness-only patterns |
@@ -99,7 +99,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - OpenAI improve runs now use the Responses API in `scripts/agent_tools.py`, so GPT-5-class models can do tool calling without falling back to older chat-completions-only models. User preference in this workspace is GPT-5.4/latest GPT or latest Anthropic only; do not silently downgrade to `gpt-4o`/`gpt-4o-mini`.
 - Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
 - Conversation/tool traces are stored locally in `agent.log` files; there is no required external tracing dependency in the current workflow.
-- `write_file` is sandboxed: only writes `vllm-config.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
+- `write_file` is sandboxed: only writes `pod.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
 - Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
 - Web tools now keep sweep-local memory. Agents are expected to read sweep research memory first, then use web calls only to fill genuine gaps rather than rediscovering the same facts every run. The default per-run web-call budget is now 20 via `AGENT_MAX_WEB_TOOL_CALLS`.
 
@@ -164,14 +164,14 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 ### runllm Surface
 
-- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`, `kimi-sglang-eagle/`).
-- Each model dir is self-contained with `vllm-config.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
+- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`, `kimi-sglang-eagle/`, `kimi-sglang-tensorizer/`).
+- Each model dir is self-contained with `pod.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
 - Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig` (relative to the model dir).
 - `runllm/qwen2.5-1.5b-sglang/` is a sibling SGLang variant that intentionally keeps the same filenames and `VLLM_MODEL` Makefile variable for compatibility with the existing `runllm`/sweep directory contract.
 - Sweeps now store `model_family`, `baseline_variant`, and `model_variants` in `sweep_metadata.json` so improve runs know the canonical family plus every deployment variant available to that sweep.
 - Family-first sweep creation is now the default contract. For example, `make sweep MODEL=kimi` automatically exposes `kimi-vllm`, `kimi-sglang`, and `kimi-sglang-eagle`; use `BASELINE_VARIANT=kimi-sglang-eagle` to start the baseline on the EAGLE-3 speculative decoding variant.
-- Backend switches should replace both `vllm-config.yaml` and `Makefile` from the chosen canonical variant template.
+- Backend switches should replace both `pod.yaml` and `Makefile` from the chosen canonical variant template.
 - Every sweep directory now keeps an `OVERVIEW.md` with started time, benchmark/data config, agent provider/model, tracked `runllm/` variants, run counts, and current failure streak / stop-policy status. Refresh it whenever sweep metadata or run outcomes change.
 
 ### Tensorizer / PVC Model Loading
@@ -189,7 +189,8 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - For TP-sharded models (TP>1), `--model-loader-extra-config '{"tensorizer_uri": ".../model-rank-%03d.tensors"}'` is required.
 - The PVC is `ReadWriteMany` (5Ti) — multiple pods across different nodes can mount it.
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
-- **Kimi exception:** Kimi-K2.5 currently does *not* use tensorizer in the working path. It serves from HF safetensors cached under `/mnt/models/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack.
+- **Kimi vLLM exception:** Kimi-K2.5 on vLLM currently does *not* use tensorizer. It serves from HF safetensors cached under `/mnt/models/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack on vLLM.
+- **Kimi SGLang tensorizer:** `kimi-sglang-tensorizer/` is an experimental variant that adds tensorizer support to SGLang. The SGLang source at `autollm/sglang/` is patched with a `TensorizerModelLoader` (in `model_loader/loader.py`) that supports direct GPU deserialization via `load_into_module()`. Requires a one-time serialization step (`make tensorize` in the variant dir) and a custom Docker image (`lbiewald/sglang-tensorizer:latest`, built from `autollm/sglang/Dockerfile.tensorizer`). Serialized weights go to `/mnt/models/sglang/moonshotai/Kimi-K2.5/v1/model-rank-NNN.tensors`. The serialization hook uses `SGLANG_TENSORIZE_OUTPUT_DIR` / `SGLANG_TENSORIZE_AND_EXIT` env vars in `model_runner.py`.
 - **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` serves Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`.
 
 ---
