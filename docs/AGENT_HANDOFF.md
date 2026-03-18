@@ -38,7 +38,7 @@ make sweep-remote-teardown                 # delete controller pod
 - The sweep runs autonomously inside the pod (survives laptop disconnect). Results stay on the controller.
 - `make sync-results` uses tar+kubectl to pull results back. Syncs a specific sweep or all results.
 - `make sync-results` must tolerate files changing during active sweeps. `scripts/sweep_remote.sh` now uses `tar --ignore-failed-read --warning=no-file-changed` on the controller side so live `benchmark_live.txt` / `benchmarks.json` updates do not corrupt the sync stream.
-- `make sync-results SWEEP=...` is now incremental: it refreshes top-level sweep files (`OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, etc.), always syncs `baseline/`, pulls missing timestamped run dirs, and re-syncs the newest two run dirs. Keep the shell compatible with macOS Bash 3.2; avoid `mapfile` and associative arrays.
+- `make sync-results SWEEP=...` is now incremental: it refreshes top-level sweep files (`OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.md`, `RESEARCH_MEMORY.md`, etc.), always syncs `baseline/`, pulls missing timestamped run dirs, and re-syncs the newest two run dirs. Keep the shell compatible with macOS Bash 3.2; avoid `mapfile` and associative arrays.
 - If the remote controller pod no longer exists, `make sync-results` now prints a friendly "nothing to sync" message and exits successfully instead of failing the Make target.
 - `make setup` is now the explicit bootstrap step for a fresh checkout (`uv sync` + conditional kubeconfig generation). Common dev targets like `make benchmark`, `make baseline`, `make sweep`, `make improve`, and `make experiment` no longer auto-run `uv sync` first.
 - Remote sweep launcher scripts now run through a tiny wrapper that removes `/workspace/sweep-<name>.pid` on exit and writes `/workspace/sweep-<name>.exit_code`. `make sweep-status` also ignores zombie PIDs and cleans stale pid files, since finished background shells can otherwise remain as `<defunct>` under the controller pod.
@@ -86,9 +86,9 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - full strategy text
   - structured `Changed knobs vs baseline`
   - full arg summaries extracted from YAML using structured parsing, not fragile regex
-- Improve prompts now use a compact context window by default: top successful runs, the most recent failed runs, a short structured sweep-memory block, the newest `RUN_RETRO.md`, and a cached `FULL_RETRO.md`/`FULL_RETRO.txt` synthesis instead of dumping the full sweep state every run.
+- Improve prompts now use a compact context window by default: top successful runs, the most recent failed runs, a short structured sweep-memory block, the newest `RUN_RETRO.md`, and a cached `FULL_RETRO.md` synthesis instead of dumping the full sweep state every run.
 - `results/sweep-NAME/AGENT_CONTEXT.md` is regenerated alongside `leaderboard.txt` as a deterministic cache for future agents/humans. It summarizes the current frontier plus repeated failure classes and harness-only patterns.
-- `FULL_RETRO.md` is the canonical sweep-level retro synthesis, with `FULL_RETRO.txt` kept as a compatibility mirror. The synthesis is cached and only regenerated when the sweep meaningfully changes (for example a new best run, new failure class, or updated retro content), which cuts repeated prompt cost.
+- `FULL_RETRO.md` is the canonical sweep-level retro synthesis. The synthesis is cached and only regenerated when the sweep meaningfully changes (for example a new best run, new failure class, or updated retro content), which cuts repeated prompt cost.
 - Web research is now sweep-local and durable: `search_web` / `fetch_url` append to `RESEARCH_LOG.md`, and `RESEARCH_MEMORY.md` is a cached synthesis of that history. Improve prompts include the research memory so later runs can reuse prior web work instead of re-searching.
 - Prompt guidance pushes the agent toward single-change experiments and allows `NO_CONFIG_CHANGE: ...` on retries when logs suggest a harness/watchdog issue rather than a config issue.
 
@@ -110,7 +110,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - Retros are designed for consumption by future AI agents. They capture: exact knob changes, key metrics or errors, causal explanations, crashes from any phase, research findings, and non-obvious pitfalls.
 - Run retros should be concise but evidence-rich, with exact values and benchmark/profile facts whenever available.
 - If a single run directory contains multiple internal attempts, new retros are appended to `RUN_RETRO.md` with a markdown separator instead of overwriting the previous attempt.
-- When a run starts, the current `FULL_RETRO.md` / `FULL_RETRO.txt` snapshot is copied into that run directory so you can reconstruct exactly what sweep memory the agent saw at that time.
+- When a run starts, the current `FULL_RETRO.md` snapshot is copied into that run directory so you can reconstruct exactly what sweep memory the agent saw at that time.
 - New improve prompts include both the newest per-run `RUN_RETRO.md` in the sweep and the synthesized `FULL_RETRO.md`, so the next agent sees the freshest local context plus the higher-level summary.
 
 ### In-Cluster Benchmarking (K8s Jobs)

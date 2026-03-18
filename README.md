@@ -113,7 +113,7 @@ Every run produces a `RUN_RETRO.md` in its run directory. Retros are written by 
 - Research findings discovered during the run (version-specific behavior, undocumented defaults, flag interactions)
 - Non-obvious pitfalls for future experiments
 
-Each sweep also keeps a higher-level synthesis in both `FULL_RETRO.md` and `FULL_RETRO.txt` at the sweep root. When a new run starts, the current full-retro snapshot is copied into that run directory too, so you can see exactly what cross-run memory the agent had at that point in time.
+Each sweep also keeps a higher-level synthesis in `FULL_RETRO.md` at the sweep root. When a new run starts, the current full-retro snapshot is copied into that run directory too, so you can see exactly what cross-run memory the agent had at that point in time.
 
 ### What the agent can tune
 
@@ -149,8 +149,7 @@ results/sweep-qwen-latency/
   OVERVIEW.md              # sweep summary: workload, agent model, runllm variants, streak status
   baseline/                # baseline run
   leaderboard.txt          # ranked runs + failed strategies
-  FULL_RETRO.md            # current sweep-wide retro synthesis (markdown)
-  FULL_RETRO.txt           # legacy mirror of the same sweep-wide retro
+  FULL_RETRO.md            # current sweep-wide retro synthesis
   RESEARCH_LOG.md          # append-only log of sweep web research
   RESEARCH_MEMORY.md       # cached synthesized research findings reused by later runs
   best-runllm -> .../runllm  # symlink to best config's runllm
@@ -161,7 +160,6 @@ results/sweep-qwen-latency/
     pod_config.yaml         # Pod config used
     benchmarks.json         # benchmark results
     FULL_RETRO.md           # full sweep retro snapshot as seen by this run
-    FULL_RETRO.txt          # legacy mirror of that snapshot
     RUN_RETRO.md            # agent-written retrospective (every run)
     agent.log               # agent conversation for this run
     deploy.log, kubectl_logs.txt, run.log, ...
@@ -193,7 +191,7 @@ make sweep-remote-teardown                     # delete controller pod (sync fir
 
 The controller pod (`autollm-controller`) runs on a CPU node with a ServiceAccount that has RBAC permissions to manage vLLM pods. API keys plus `AI_PROVIDER` / `AI_MODEL` are injected from your local `.env` and environment, so remote sweeps can be pinned to GPT the same way as local runs.
 
-`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.md`, `FULL_RETRO.txt`, `RESEARCH_MEMORY.md`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
+`make sync-results SWEEP=...` is incremental: it always refreshes top-level sweep files such as `OVERVIEW.md`, `leaderboard.txt`, `FULL_RETRO.md`, `RESEARCH_MEMORY.md`, and `results.txt`, pulls any run directories that do not exist locally yet, and re-syncs the newest two run directories so active runs keep updating without re-copying the whole sweep every time. Sync also tolerates files changing while a live sweep is still writing logs or benchmark outputs.
 If the controller pod is already gone, `make sync-results` now prints a friendly "nothing to sync" message and exits successfully.
 
 Remote sweep bookkeeping notes:

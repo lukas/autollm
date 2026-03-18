@@ -270,7 +270,6 @@ def _read_results_txt(results_path: Path | None = None) -> str:
 RUN_RETRO_FILENAME = "RUN_RETRO.md"
 LEGACY_RUN_RETRO_FILENAME = "RETRO.md"
 FULL_RETRO_MD_FILENAME = "FULL_RETRO.md"
-FULL_RETRO_TXT_FILENAME = "FULL_RETRO.txt"
 
 
 def _run_retro_paths(run_dir: Path) -> list[Path]:
@@ -315,21 +314,17 @@ def _write_full_retro_artifacts(base_dir: Path, content: str) -> None:
     if not normalized:
         return
     (base_dir / FULL_RETRO_MD_FILENAME).write_text(normalized + "\n")
-    (base_dir / FULL_RETRO_TXT_FILENAME).write_text(normalized + "\n")
 
 
 def _read_full_retro_artifact(base_dir: Path) -> str:
-    for filename in (FULL_RETRO_MD_FILENAME, FULL_RETRO_TXT_FILENAME):
-        path = base_dir / filename
-        if not path.exists():
-            continue
-        try:
-            content = path.read_text().strip()
-        except Exception:
-            continue
-        if content:
-            return content
-    return ""
+    path = base_dir / FULL_RETRO_MD_FILENAME
+    if not path.exists():
+        return ""
+    try:
+        content = path.read_text().strip()
+    except Exception:
+        return ""
+    return content if content else ""
 
 
 def _collect_all_retros(runs_base: Path | None) -> str:
@@ -541,10 +536,9 @@ def _best_run_name_for_objective(runs_base: Path | None) -> str:
     return best_name
 
 
-def _full_retro_cache_paths(sweep_dir: Path) -> tuple[Path, Path, Path]:
+def _full_retro_cache_paths(sweep_dir: Path) -> tuple[Path, Path]:
     return (
         sweep_dir / FULL_RETRO_MD_FILENAME,
-        sweep_dir / FULL_RETRO_TXT_FILENAME,
         sweep_dir / "FULL_RETRO.meta.json",
     )
 
@@ -565,8 +559,8 @@ def _failure_category_signature(runs_base: Path | None) -> list[str]:
 
 
 def _should_refresh_full_retro(sweep_dir: Path) -> bool:
-    retro_md_path, retro_txt_path, meta_path = _full_retro_cache_paths(sweep_dir)
-    if (not retro_md_path.exists() and not retro_txt_path.exists()) or not meta_path.exists():
+    retro_md_path, meta_path = _full_retro_cache_paths(sweep_dir)
+    if not retro_md_path.exists() or not meta_path.exists():
         return True
     meta = _read_json_file(meta_path)
     retro_runs, source_chars = _run_retro_source_stats(sweep_dir)
@@ -596,7 +590,7 @@ def _should_refresh_full_retro(sweep_dir: Path) -> bool:
 
 
 def _get_or_refresh_full_retro(sweep_dir: Path, call_fn) -> str:
-    retro_md_path, retro_txt_path, meta_path = _full_retro_cache_paths(sweep_dir)
+    retro_md_path, meta_path = _full_retro_cache_paths(sweep_dir)
     if not _should_refresh_full_retro(sweep_dir):
         cached = _read_full_retro_artifact(sweep_dir)
         if cached:

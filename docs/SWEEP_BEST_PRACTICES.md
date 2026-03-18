@@ -77,6 +77,6 @@ Practical guidance for future agents running `autollm` sweeps. This is based on 
 
 1. Verify the benchmark is the right one and comparisons are apples-to-apples.
 2. Confirm the current best config is semantically correct with the exact sample query path used by the harness.
-3. Read the latest `FULL_RETRO.txt`, then inspect the winner's `vllm_metrics_profile.json`.
+3. Read the latest `FULL_RETRO.md`, then inspect the winner's `vllm_metrics_profile.json`.
 4. Choose one high-leverage knob adjacent to the current winner; avoid broad pivots unless the evidence says the current axis is exhausted.
 5. If the measured gain is small, rerun or validate against variance before declaring victory.
