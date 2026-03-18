@@ -191,7 +191,8 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
 - **Kimi vLLM exception:** Kimi-K2.5 on vLLM currently does *not* use tensorizer. It serves from HF safetensors cached under `/mnt/models/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack on vLLM.
 - **Kimi SGLang tensorizer:** `kimi-sglang-tensorizer/` is an experimental variant that adds tensorizer support to SGLang. The SGLang source at `autollm/sglang/` is patched with a `TensorizerModelLoader` (in `model_loader/loader.py`) that supports direct GPU deserialization via `load_into_module()`. Requires a one-time serialization step (`make tensorize` in the variant dir) and a custom Docker image (`lbiewald/sglang-tensorizer:latest`, built from `autollm/sglang/Dockerfile.tensorizer`). Serialized weights go to `/mnt/models/sglang/moonshotai/Kimi-K2.5/v1/model-rank-NNN.tensors`. The serialization hook uses `SGLANG_TENSORIZE_OUTPUT_DIR` / `SGLANG_TENSORIZE_AND_EXIT` env vars in `model_runner.py`.
-- **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` serves Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`.
+- **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` is configured for Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`. **Status (March 2026):** EAGLE-3 is not yet supported for `KimiK25ForConditionalGeneration` in SGLang v0.5.9. The pod crashes with `set_eagle3_layers_to_capture` AttributeError. This variant is kept for when SGLang adds support.
+- **Multithreaded safetensors loading:** SGLang variants use `--load-format safetensors --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}'` to load weights in parallel. This reduced Kimi-K2.5 loading from ~35 min to ~4 min on the NFS-backed `models` PVC. Available since SGLang v0.5.8+.
 
 ---
 
@@ -230,7 +231,10 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 11. **Unschedulable GPU pods are cluster-capacity failures, not repairable experiment failures.**
    If a run fails with `Pod unschedulable` / `Insufficient nvidia.com/gpu`, treat that as an immediate cluster-capacity stop condition. Do not let the retry loop spend turns "repairing" the YAML; wait for capacity or free GPUs first.
 
-12. **Every runllm variant must mount the `models` PVC for model caching.**
+12. **EAGLE-3 speculative decoding does not work with Kimi-K2.5 on SGLang v0.5.9.**
+   The `KimiK25ForConditionalGeneration` model class lacks `set_eagle3_layers_to_capture()`, which EAGLE3 requires for hidden state capture. The `kimi-sglang-eagle/` variant is kept for future compatibility. EAGLE3 works for Llama and Qwen models. Check SGLang releases for Kimi EAGLE3 support before re-enabling.
+
+13. **Every runllm variant must mount the `models` PVC for model caching.**
    Without a PVC, HuggingFace models are re-downloaded from scratch on every pod restart — hundreds of GB for large models like Kimi-K2.5. For vLLM variants, use `--download-dir /mnt/models/hf-cache`. For SGLang variants, set the `HF_HOME` env var to `/mnt/models/hf-cache`. Always add the `models` PVC volume and volumeMount. This applies to both main models and draft/speculative models. When creating a new `runllm/` variant, copy the volume config from an existing variant rather than starting without it.
 
 ---
