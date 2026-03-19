@@ -167,6 +167,9 @@ Each sweep also keeps a higher-level synthesis in `FULL_RETRO.md` at the sweep r
 | `medium-throughput` | synchronous | 200 | 300s | 256+128 tokens | Same as medium |
 | `large` | synchronous | 200 | 300s | 256+128 tokens | Same as medium |
 | `long` | synchronous | 1000 | 600s | 256+128 tokens | Comprehensive (~10 min) |
+| `concurrent` | concurrent (16) | 200 | 300s | 256+128 tokens | Multi-user latency |
+| `concurrent-large` | concurrent (16) | 500 | 600s | 1000+1000 tokens | Realistic multi-user |
+| `throughput` | throughput (max) | 500 | 600s | 1000+1000 tokens | Max throughput stress test |
 
 `--max-requests` has no hard limit — set `MAX_REQUESTS=2000` for even longer runs.
 

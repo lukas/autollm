@@ -56,6 +56,27 @@ BENCHMARK_PRESETS: dict[str, dict[str, str | None]] = {
         "rate": None,
         "data": "prompt_tokens=256,output_tokens=128",
     },
+    "concurrent": {
+        "profile": "concurrent",
+        "max_requests": "200",
+        "max_seconds": "300",
+        "rate": "16",
+        "data": "prompt_tokens=256,output_tokens=128",
+    },
+    "concurrent-large": {
+        "profile": "concurrent",
+        "max_requests": "500",
+        "max_seconds": "600",
+        "rate": "16",
+        "data": "prompt_tokens=1000,output_tokens=1000",
+    },
+    "throughput": {
+        "profile": "throughput",
+        "max_requests": "500",
+        "max_seconds": "600",
+        "rate": None,
+        "data": "prompt_tokens=1000,output_tokens=1000",
+    },
 }
 
 BENCHMARK_MAX_REQUESTS = {

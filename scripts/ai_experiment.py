@@ -2433,6 +2433,9 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
             "- For any SGLang variant, keep the canonical `sglang serve` launcher structure and image family. "
             "Do not replace it with a custom wrapper or a different serving stack unless the experiment is switching back to another canonical variant.",
             "- For any SGLang variant, keep the served model name aligned with `VLLM_MODEL` in the Makefile.",
+            "- **NEVER remove `--enable-metrics`.** This flag exposes SGLang's `/metrics` Prometheus endpoint "
+            "(KV cache utilization, queue depth, preemptions, decode/prefill stats). It has negligible overhead "
+            "and the profiler depends on it for diagnosing bottlenecks.",
         ])
     backend_quirk_lines = [
         "- Diagnose from evidence (leaderboard, logs), not assumptions. Many successful `POST /v1/chat/completions` in logs = benchmark progress, likely a harness/watchdog issue not a config failure.",
@@ -2445,9 +2448,13 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
             "- If you try speculative decoding on vLLM, use ngram only and use dot-notation CLI args (`--speculative-config.method ngram`, etc.), not JSON blob syntax.",
         ])
     if sglang_templates:
-        backend_quirk_lines.append(
-            "- SGLang serves the same OpenAI-compatible chat endpoint used by the harness. If you switch to SGLang, benchmark compatibility depends on preserving `/health` and `/v1/chat/completions`."
-        )
+        backend_quirk_lines.extend([
+            "- SGLang serves the same OpenAI-compatible chat endpoint used by the harness. If you switch to SGLang, benchmark compatibility depends on preserving `/health` and `/v1/chat/completions`.",
+            "- **SGLang `/metrics` endpoint:** When `--enable-metrics` is present, SGLang exposes Prometheus metrics at `/metrics`. "
+            "After each benchmark, read the profiler output (`vllm_metrics_profile.json` or `vllm_metrics_summary.json`) to check "
+            "KV cache utilization, queue depth, preemption counts, and decode/prefill batch sizes. Use these numbers to guide your next experiment — "
+            "e.g. low KV cache usage means `--mem-fraction-static` can be raised; high queue depth means the scheduler is the bottleneck.",
+        ])
     backend_constraints_section = "\n- ".join(backend_constraint_lines)
     backend_quirks_section = "\n- ".join(backend_quirk_lines)
 
