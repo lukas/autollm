@@ -32,6 +32,39 @@ make sync-results SWEEP=qwen-latency
 AI_PROVIDER=openai AI_MODEL=gpt-5.4 make sweep SWEEP=qwen-latency RUNS=10 GOAL="minimize latency"
 ```
 
+## Quick reference
+
+```bash
+# Start a new sweep (runs remotely in-cluster, survives laptop disconnect)
+make sweep SWEEP=kimi-sglang-large MODEL=kimi BASELINE_VARIANT=kimi-sglang BENCHMARK=large RUNS=10 GOAL="maximize throughput"
+
+# Check what's running
+make sweep-status
+
+# Tail live output
+make sweep-logs
+
+# Pull latest results to your laptop
+make sync-results SWEEP=kimi-sglang-large
+
+# Add more runs to a running sweep (takes effect on the next iteration)
+scripts/sweep_remote.sh set-runs --sweep kimi-sglang-large --runs 100
+
+# Stop a sweep (find PID from sweep-status, then kill it)
+make sweep-status                                          # note the PID
+kubectl exec autollm-controller -- kill <PID>
+
+# Continue a stopped sweep with more runs
+make improve-remote SWEEP=kimi-sglang-large RUNS=20
+
+# Refresh the local leaderboard from synced results
+make leaderboard SWEEP=kimi-sglang-large
+
+# Tear down the controller pod when done (sync results first!)
+make sync-results
+make sweep-remote-teardown
+```
+
 ## Workflow: sweep + improve
 
 ### Step 1: Run a full sweep

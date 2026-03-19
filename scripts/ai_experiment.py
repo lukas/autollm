@@ -160,7 +160,7 @@ def _fmt_summary(m: dict) -> str:
     parts = []
     if lat is not None:
         parts.append(f"Latency: {lat*1000:.0f}ms")
-    if ttft is not None:
+    if ttft is not None and ttft > 0:
         parts.append(f"TTFT: {ttft:.0f}ms")
     if tok is not None:
         parts.append(f"Throughput: {tok:.0f} tok/s")
@@ -185,7 +185,7 @@ def _fmt_detail_lines(m: dict, run_dir: Path) -> list[str]:
     pct_parts = []
     if lat_p50 is not None and lat_p95 is not None:
         pct_parts.append(f"Latency p50={lat_p50*1000:.0f}ms p95={lat_p95*1000:.0f}ms")
-    if ttft_p50 is not None and ttft_p95 is not None:
+    if ttft_p50 is not None and ttft_p95 is not None and (ttft_p50 > 0 or ttft_p95 > 0):
         pct_parts.append(f"TTFT p50={ttft_p50:.0f}ms p95={ttft_p95:.0f}ms")
     pct_parts.append(f"Completed={completed}")
     if errored:
@@ -730,17 +730,54 @@ def _extract_vllm_args(config_text: str) -> str:
     image = str(container.get("image", "")).strip()
     args_list = []
     args = container.get("args") or []
+    has_structured = False
     idx = 0
     while idx < len(args):
         item = str(args[idx]).strip()
         if item.startswith("--"):
+            has_structured = True
             if idx + 1 < len(args) and not str(args[idx + 1]).strip().startswith("--"):
                 args_list.append(f"{item} {str(args[idx + 1]).strip()}")
                 idx += 2
                 continue
             args_list.append(item)
         idx += 1
+    if not has_structured:
+        parsed = {}
+        for arg in args:
+            parsed.update(_parse_cli_flags_from_shell(str(arg)))
+        for key in sorted(parsed):
+            flag = key.removeprefix("arg:")
+            val = parsed[key]
+            args_list.append(f"{flag} {val}" if val is not True else flag)
     return f"image={image}  args: {', '.join(args_list)}" if args_list else f"image={image}"
+
+
+def _parse_cli_flags_from_shell(script: str) -> dict[str, str | bool]:
+    """Parse --flag value pairs from a shell script string (handles backslash continuations)."""
+    joined = script.replace("\\\n", " ")
+    flags: dict[str, str | bool] = {}
+    for m in re.finditer(r'(--[\w][\w.-]*)\s+(?=\S)', joined):
+        key = m.group(1)
+        rest = joined[m.end():]
+        if rest.startswith("'"):
+            vm = re.match(r"'([^']*)'", rest)
+            val = vm.group(1) if vm else rest.split()[0]
+        elif rest.startswith('"'):
+            vm = re.match(r'"([^"]*)"', rest)
+            val = vm.group(1) if vm else rest.split()[0]
+        else:
+            val = rest.split()[0]
+        if val.startswith("--"):
+            flags[f"arg:{key}"] = True
+        else:
+            flags[f"arg:{key}"] = val
+    for m in re.finditer(r'(--[\w][\w.-]*)(?=\s*(?:\\?\n|$|\s+--))', joined):
+        key = m.group(1)
+        fk = f"arg:{key}"
+        if fk not in flags:
+            flags[fk] = True
+    return flags
 
 
 def _extract_config_state(config_text: str) -> dict[str, str | bool]:
@@ -759,16 +796,28 @@ def _extract_config_state(config_text: str) -> dict[str, str | bool]:
         state["image"] = str(image).strip()
 
     args = container.get("args") or []
+    has_structured_args = False
     idx = 0
     while idx < len(args):
         key = str(args[idx]).strip()
         if key.startswith("--"):
+            has_structured_args = True
             state[f"arg:{key}"] = True
             if idx + 1 < len(args) and not str(args[idx + 1]).strip().startswith("--"):
                 state[f"arg:{key}"] = str(args[idx + 1]).strip()
                 idx += 2
                 continue
         idx += 1
+
+    if not has_structured_args:
+        for arg in args:
+            shell_flags = _parse_cli_flags_from_shell(str(arg))
+            if shell_flags:
+                state.update(shell_flags)
+        command = container.get("command") or []
+        for cmd_part in command:
+            if isinstance(cmd_part, str) and "--" in cmd_part:
+                state.update(_parse_cli_flags_from_shell(cmd_part))
 
     for env_var in container.get("env") or []:
         name = str(env_var.get("name", "")).strip()
