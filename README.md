@@ -124,7 +124,7 @@ The agent has access to these tools during each run:
 | `search_web` | Web search via Exa API (falls back to DuckDuckGo) |
 | `fetch_url` | Fetch and extract content from a URL |
 | `read_file` | Read project files (results/, runllm/, docs/, scripts/) |
-| `write_file` | Write `pod.yaml` or `Makefile` to the isolated per-run experiment directory only |
+| `write_file` | Write `pod.yaml`, `Makefile`, or custom code files (`.py`, `.sh`, etc.) to the per-run experiment directory. Custom code files are auto-mounted into the pod at `/workspace/patches/` via ConfigMap |
 | `list_files` | List files in a project directory |
 | `run_shell` | Run a shell command (read-only, no destructive ops) |
 | `run_benchmark` | Deploy the written config and run the benchmark |
@@ -132,7 +132,7 @@ The agent has access to these tools during each run:
 | `kubectl_get` | Run `kubectl get` queries against the cluster |
 | `kubectl_logs` | Fetch pod logs from the cluster |
 
-The tool stack works with both Anthropic and OpenAI APIs. Max tool calls per run defaults to 50 (configurable via `AGENT_MAX_TURNS`).
+The tool stack works with both Anthropic and OpenAI APIs. Max tool calls per run defaults to 50 (configurable via `AGENT_MAX_TURNS`). When the agent writes custom code files, the budget is automatically boosted by 100 (configurable via `AGENT_CUSTOM_CODE_BUDGET_BOOST`) to allow iterative code development.
 Web research calls default to 20 per run (configurable via `AGENT_MAX_WEB_TOOL_CALLS`), but prior research is cached per sweep so later runs can usually reuse what was already learned.
 Agent conversations and tool calls are recorded locally in per-run `agent.log` files plus the sweep-level `agent.log`; there is no built-in external tracing backend.
 
@@ -170,6 +170,7 @@ Each sweep also keeps a higher-level synthesis in `FULL_RETRO.md` at the sweep r
 | `concurrent` | concurrent (16) | 200 | 300s | 256+128 tokens | Multi-user latency |
 | `concurrent-large` | concurrent (16) | 500 | 600s | 1000+1000 tokens | Realistic multi-user |
 | `throughput` | throughput (max) | 500 | 600s | 1000+1000 tokens | Max throughput stress test |
+| `diverse` | synchronous | 500 | 600s | `benchmarks/diverse/dataset.jsonl` | Real-world queries with varied lengths |
 
 `--max-requests` has no hard limit — set `MAX_REQUESTS=2000` for even longer runs.
 
@@ -276,6 +277,7 @@ Remote sweep bookkeeping notes:
 | `MAX_SECONDS` | Override max benchmark duration |
 | `EXA_API_KEY` | Exa API key for web search (falls back to DuckDuckGo if unset) |
 | `AGENT_MAX_TURNS` | Max tool calls per agent run (default: 50) |
+| `AGENT_CUSTOM_CODE_BUDGET_BOOST` | Extra tool calls when custom code is written (default: 100) |
 | `AGENT_MAX_WEB_TOOL_CALLS` | Max `search_web` / `fetch_url` calls per run (default: 20) |
 | `SWEEP_MAX_CONSECUTIVE_FAILURES` | Stop a sweep after this many failed runs in a row (default: 10) |
 | `SWEEP_MAX_CONSECUTIVE_UNFIXABLE_FAILURES` | Stop a sweep after this many unfixable failures in a row (default: 2) |

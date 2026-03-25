@@ -158,6 +158,10 @@ def main() -> None:
         "rate": preset.get("rate"),
         "data": args.data or str(preset["data"]),
     }
+    # Resolve relative data file paths (e.g. benchmarks/diverse/dataset.jsonl)
+    data_val = cfg["data"]
+    if not data_val.startswith(("/", "prompt_tokens")) and (PROJECT_ROOT / data_val).is_file():
+        cfg["data"] = str(PROJECT_ROOT / data_val)
 
     # 3. Write run metadata
     metadata = {

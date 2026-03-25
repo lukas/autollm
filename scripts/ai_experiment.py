@@ -101,14 +101,15 @@ PROMPT_RESEARCH_MEMORY_CHAR_LIMIT = int(os.environ.get("PROMPT_RESEARCH_MEMORY_C
 
 TOOL_SYSTEM_PROMPT = """\
 You are an LLM serving optimizer agent on Kubernetes (H200 GPU, CoreWeave).
-Pick ONE simple change most likely to improve performance, then test it.
+Pick ONE change most likely to improve performance, then test it.
 
 ## Workflow
 1. Read the leaderboard and lessons learned (in the prompt).
 2. Pick one untried change. Do NOT bundle multiple changes.
 3. Read the sweep research memory in the prompt first. Use read_file/read_logs to inspect past runs. Use search_web/fetch_url only if that local memory does not already answer the question.
 4. Write the config: write_file('pod.yaml', <complete pod YAML>).
-5. Optionally: run_benchmark(<description>) to deploy and test.
+5. Optionally write custom code: write_file('my_patch.py', <Python code>) — see Custom Code below.
+6. Optionally: run_benchmark(<description>) to deploy and test.
 
 ## Run policy
 - One run = one experiment. After you benchmark a config, stop. Do NOT pivot to a second experiment in the same run.
@@ -116,8 +117,26 @@ Pick ONE simple change most likely to improve performance, then test it.
 - Do NOT turn a retry into a fresh optimization pass. Let the next run/agent try the next experiment.
 - Prefer local evidence over web search. Assume repeated failures and prior research are already documented unless the prompt/logs show a genuinely new issue.
 
+## Custom code files
+You can write custom Python, shell, or other code files that get mounted into the pod:
+- write_file('custom_spec_decode.py', ...) — writes a .py file to the experiment directory.
+- Any file with extension .py, .sh, .json, .patch, .cfg, .toml, .txt is automatically mounted
+  into the pod at /workspace/patches/<filename> via a Kubernetes ConfigMap.
+- Your pod.yaml startup script should copy or apply these files. For example:
+  ```
+  cp /workspace/patches/custom_decoder.py /sgl-workspace/sglang/python/sglang/srt/speculative/custom_decoder.py
+  python /workspace/patches/apply_patch.py
+  ```
+- Custom code files PERSIST across runs: the next run inherits all files from the best run.
+  You can read inherited files with read_file, modify them, or add new ones.
+- When writing custom code, your tool-call budget is automatically increased to give you
+  room for iterative development and debugging.
+- Use this for optimizations that go beyond config tuning: custom speculative decoders,
+  monkey-patches to scheduling logic, custom attention kernels, etc.
+
 ## File safety
-- write_file writes ONLY to the isolated per-run directory. You can only write 'pod.yaml' and 'Makefile'.
+- write_file writes ONLY to the isolated per-run directory. You can write 'pod.yaml', 'Makefile',
+  and custom code files (.py, .sh, .json, .patch, .cfg, .toml, .txt).
 - read_file can read from results/, runllm/, docs/, scripts/.
 
 ## Rules — DO NOT violate
@@ -128,7 +147,7 @@ Pick ONE simple change most likely to improve performance, then test it.
 
 ## Output format
 Before writing config, state your strategy in 3-5 lines:
-- What: `knob: old -> new`
+- What: `knob: old -> new` (or: custom code description)
 - Why: 1-2 sentences grounded in evidence
 - Expected effect: which metric improves and by roughly how much
 
@@ -1750,6 +1769,89 @@ def _capture_pod_status(run_dir: Path, env: dict, pod_name: str, status_file: Pa
     return summary, fatal_error
 
 
+PATCHES_MOUNT_PATH = "/workspace/patches"
+PATCHES_CONFIGMAP_EXTENSIONS = {".py", ".sh", ".json", ".patch", ".cfg", ".toml", ".txt"}
+
+
+def _collect_custom_code_files(experiment_dir: Path) -> dict[str, str]:
+    """Collect custom code files from experiment_dir that should be mounted into the pod."""
+    files: dict[str, str] = {}
+    for f in experiment_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in PATCHES_CONFIGMAP_EXTENSIONS:
+            if f.name in ("pod.yaml", "Makefile"):
+                continue
+            try:
+                files[f.name] = f.read_text()
+            except Exception:
+                pass
+    return files
+
+
+def _create_patches_configmap(
+    configmap_name: str, files: dict[str, str], env: dict[str, str],
+) -> bool:
+    """Create a K8s ConfigMap from custom code files. Returns True on success."""
+    cm = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": configmap_name},
+        "data": files,
+    }
+    cm_yaml = yaml.dump(cm, default_flow_style=False)
+    try:
+        subprocess.run(
+            ["kubectl", "delete", "configmap", configmap_name, "--ignore-not-found=true"],
+            capture_output=True, timeout=15, env=env,
+        )
+        r = subprocess.run(
+            ["kubectl", "apply", "-f", "-"],
+            input=cm_yaml, capture_output=True, text=True, timeout=30, env=env,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _delete_patches_configmap(configmap_name: str, env: dict[str, str]) -> None:
+    """Best-effort cleanup of the patches ConfigMap."""
+    try:
+        subprocess.run(
+            ["kubectl", "delete", "configmap", configmap_name, "--ignore-not-found=true"],
+            capture_output=True, timeout=15, env=env,
+        )
+    except Exception:
+        pass
+
+
+def _inject_configmap_into_pod_yaml(yaml_path: Path, configmap_name: str) -> None:
+    """Add a ConfigMap volume + volumeMount to the pod spec so custom code files
+    are available at /workspace/patches/ inside every container."""
+    doc = yaml.safe_load(yaml_path.read_text())
+    spec = doc.get("spec", {})
+
+    volumes = spec.setdefault("volumes", [])
+    vol_name = "patches"
+    existing = [v for v in volumes if v.get("name") == vol_name]
+    if existing:
+        existing[0]["configMap"] = {"name": configmap_name}
+    else:
+        volumes.append({
+            "name": vol_name,
+            "configMap": {"name": configmap_name},
+        })
+
+    for container in spec.get("containers", []):
+        mounts = container.setdefault("volumeMounts", [])
+        if not any(m.get("name") == vol_name for m in mounts):
+            mounts.append({
+                "name": vol_name,
+                "mountPath": PATCHES_MOUNT_PATH,
+                "readOnly": True,
+            })
+
+    yaml_path.write_text(yaml.dump(doc, default_flow_style=False))
+
+
 def _deploy_and_benchmark(
     experiment_dir: Path, benchmark: str, run_dir: Path, ts: str, sweep: str | None = None
 ) -> tuple[bool, str]:
@@ -1778,6 +1880,16 @@ def _deploy_and_benchmark(
     _rewrite_pod_name(vllm_yaml, pod_name, sweep=sweep)
     _log_run(run_dir, f"Pod: {pod_name}")
     _log_run(run_dir, f"Deploy hard timeout: {deploy_hard_timeout}s")
+
+    # Auto-mount custom code files via ConfigMap
+    configmap_name: str | None = None
+    custom_code_files = _collect_custom_code_files(experiment_dir)
+    if custom_code_files:
+        configmap_name = f"{pod_name}-patches"
+        _log_run(run_dir, f"Custom code files: {list(custom_code_files.keys())} -> ConfigMap {configmap_name}")
+        if not _create_patches_configmap(configmap_name, custom_code_files, env):
+            return False, f"Failed to create ConfigMap {configmap_name} for custom code files"
+        _inject_configmap_into_pod_yaml(vllm_yaml, configmap_name)
 
     # Register for cleanup on Ctrl+C / crash
     _active_pods.append(pod_name)
@@ -1829,6 +1941,8 @@ def _deploy_and_benchmark(
                 ["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true", "--force", "--grace-period=0"],
                 capture_output=True, timeout=30, env=env,
             )
+        if configmap_name:
+            _delete_patches_configmap(configmap_name, env)
         if pod_name in _active_pods:
             _active_pods.remove(pod_name)
         if msg:
@@ -2458,6 +2572,26 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
     backend_constraints_section = "\n- ".join(backend_constraint_lines)
     backend_quirks_section = "\n- ".join(backend_quirk_lines)
 
+    # Detect inherited custom code files from previous best run
+    from agent_tools import ALLOWED_WRITE_EXTENSIONS, ALLOWED_WRITE_FILES as _AWF
+    inherited_code_files = [
+        f.name for f in experiment_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in ALLOWED_WRITE_EXTENSIONS and f.name not in _AWF
+    ] if experiment_dir.exists() else []
+    custom_code_section = ""
+    if inherited_code_files:
+        file_list = ", ".join(f"`{f}`" for f in inherited_code_files)
+        custom_code_section = f"""
+## Inherited custom code files
+
+The following custom code files are inherited from the best previous run and will
+be mounted at `/workspace/patches/` inside the pod: {file_list}
+You can read them with `read_file('results/sweep-NAME/TIMESTAMP/runllm/<filename>')`,
+modify them with `write_file('<filename>', ...)`, or add new ones.
+These files persist: the next run will inherit your changes if this run becomes the new best.
+
+"""
+
     prompt = f"""You are optimizing LLM inference on Kubernetes (H200 GPU, CoreWeave).
 
 **Hardware:** {hardware_desc}
@@ -2474,7 +2608,7 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 ## Experiment leaderboard
 
 {leaderboard}
-{known_issues_section}{research_memory_section}{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}
+{known_issues_section}{research_memory_section}{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}{custom_code_section}
 ## Hard constraints (DO NOT violate)
 
 - {backend_constraints_section}
@@ -2486,13 +2620,14 @@ Do NOT change to a completely different model family—stay within Qwen2.5.
 {high_leverage_knobs_section}
 ## Your task
 
-Pick ONE untried change (check leaderboard) backed by evidence. Change exactly one knob.
+Pick ONE untried change (check leaderboard) backed by evidence. Change exactly one knob or write custom code.
 This run should test exactly one experiment hypothesis. If that hypothesis benchmarks successfully, stop even if it regresses.
 Prefer local evidence from the sweep. Read the sweep research memory first. Only use `search_web`/`fetch_url` when that memory plus the logs/retros do not already cover the question.
-1. State: `knob: old -> new` and why (2-3 sentences)
+1. State: `knob: old -> new` (or custom code description) and why (2-3 sentences)
 2. write_file('pod.yaml', <complete YAML>)
 {"3. If you changed the model, also write_file('Makefile', ...) with updated VLLM_MODEL." if allow_model_change else ""}
-3. Optionally run_benchmark(<description>) to deploy and test."""
+3. Optionally write custom code files that will be mounted at /workspace/patches/.
+4. Optionally run_benchmark(<description>) to deploy and test."""
 
     if sweep_dir and (sweep_dir / "sweep_metadata.json").exists():
         try:

@@ -23,7 +23,16 @@ from benchmark_config import parse_completed_count
 
 BENCH_IMAGE = os.environ.get("GUIDELLM_BENCH_IMAGE", "python:3.12-slim")
 NODE_POOL = "lukas-4h200-pool"
-_PIP_INSTALL = "pip install -q 'guidellm[recommended]>=0.5.3' && "
+_VENV_PATH = "/mnt/models/.cache/guidellm-venv"
+_PIP_INSTALL = (
+    f"if [ -x {_VENV_PATH}/bin/guidellm ]; then"
+    f"  export PATH={_VENV_PATH}/bin:$PATH;"
+    f" else"
+    f"  python -m venv {_VENV_PATH} &&"
+    f"  {_VENV_PATH}/bin/pip install -q 'guidellm[recommended]>=0.5.3' &&"
+    f"  export PATH={_VENV_PATH}/bin:$PATH;"
+    f" fi && "
+)
 _RESULTS_MARKER_START = "===BENCHMARKS_JSON_START==="
 _RESULTS_MARKER_END = "===BENCHMARKS_JSON_END==="
 
@@ -45,6 +54,12 @@ def _build_job_manifest(
     """Build a K8s Job manifest dict for a guidellm benchmark."""
     needs_install = "guidellm" not in BENCH_IMAGE
     install_prefix = _PIP_INSTALL if needs_install else ""
+
+    data_val = config.get("data", "")
+    if data_val.startswith("benchmarks/"):
+        config = {**config, "data": f"/mnt/models/{data_val}"}
+        data_val = config["data"]
+    needs_pvc = data_val.startswith("/mnt/models")
 
     cmd_parts = [
         f"{install_prefix}mkdir -p /tmp/results",
@@ -77,6 +92,29 @@ def _build_job_manifest(
     )
     cmd = " && ".join(cmd_parts)
 
+    container = {
+        "name": "bench",
+        "image": BENCH_IMAGE,
+        "command": ["/bin/bash", "-c"],
+        "args": [cmd],
+        "resources": {
+            "requests": {"cpu": "2", "memory": "4Gi"},
+            "limits": {"cpu": "4", "memory": "8Gi"},
+        },
+    }
+
+    pod_spec: dict = {
+        "restartPolicy": "Never",
+        "nodeSelector": {
+            "compute.coreweave.com/node-pool": NODE_POOL,
+        },
+        "containers": [container],
+    }
+    needs_pvc = needs_pvc or needs_install
+    if needs_pvc:
+        container["volumeMounts"] = [{"name": "models", "mountPath": "/mnt/models"}]
+        pod_spec["volumes"] = [{"name": "models", "persistentVolumeClaim": {"claimName": "models"}}]
+
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -84,24 +122,7 @@ def _build_job_manifest(
         "spec": {
             "backoffLimit": 0,
             "ttlSecondsAfterFinished": 600,
-            "template": {
-                "spec": {
-                    "restartPolicy": "Never",
-                    "nodeSelector": {
-                        "compute.coreweave.com/node-pool": NODE_POOL,
-                    },
-                    "containers": [{
-                        "name": "bench",
-                        "image": BENCH_IMAGE,
-                        "command": ["/bin/bash", "-c"],
-                        "args": [cmd],
-                        "resources": {
-                            "requests": {"cpu": "2", "memory": "4Gi"},
-                            "limits": {"cpu": "4", "memory": "8Gi"},
-                        },
-                    }],
-                },
-            },
+            "template": {"spec": pod_spec},
         },
     }
 

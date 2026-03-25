@@ -525,6 +525,54 @@ q("long_form_complex", "Design a comprehensive API strategy for a large enterpri
 q("long_form_complex", "Analyze the science of happiness and well-being. Cover: the hedonic treadmill, Maslow's hierarchy, self-determination theory, flow states (Csikszentmihalyi), the PERMA model (Seligman), the role of social connections, the relationship between income and happiness, cultural differences in conceptions of happiness, and evidence-based interventions for improving well-being.")
 
 
+# ── Additional queries to reach 500 ──────────────────────────────────────────
+q("coding", "Write a Python function that implements the Levenshtein (edit) distance algorithm between two strings.")
+q("coding", "Create a SQL migration script that adds a column to a large table without locking it (PostgreSQL).")
+q("coding", "Write a Python function that generates a random maze using recursive backtracking and prints it as ASCII art.")
+q("coding", "Implement a simple pub/sub message broker in Python using only the standard library.")
+q("coding", "Write a JavaScript function that throttles another function to execute at most once every N milliseconds.")
+q("coding", "Create a Python function that parses and evaluates boolean expressions like 'TRUE AND (FALSE OR TRUE)'.")
+q("coding", "Write a shell script that creates a complete project scaffold: directory structure, gitignore, README, and Makefile.")
+q("coding", "Implement a bloom filter in Python and explain when it's useful.")
+q("coding", "Write a Python function that generates a secure random password meeting configurable complexity requirements.")
+q("coding", "Create a TypeScript utility type that makes all nested properties of an object optional (deep partial).")
+q("coding", "Write a Python script that monitors CPU and memory usage and generates a simple HTML report.")
+q("coding", "Implement the Sieve of Eratosthenes in Rust to find all primes up to N.")
+q("coding", "Write a SQL query that calculates the median value of a column (without using built-in median functions).")
+q("coding", "Create a Python function that renders a simple bar chart in the terminal using Unicode block characters.")
+q("coding", "Write a Go program that implements a concurrent web crawler with a configurable maximum depth.")
+q("coding", "Implement a simple template engine in Python that supports variable substitution and for-loops.")
+q("coding", "Write a Python function that finds all anagram groups in a list of words.")
+q("coding", "Create a React custom hook in TypeScript that manages form state with validation.")
+q("coding", "Write a Python decorator that retries a function with exponential backoff on specified exceptions.")
+
+q("math_reasoning", "A circular track has circumference 400 meters. Runner A runs at 5 m/s and Runner B at 3 m/s in the same direction. How often do they meet?")
+
+q("summarization", "Summarize the key differences described here in a comparison table:\n\nSQL databases (like PostgreSQL, MySQL) use structured query language and store data in tables with predefined schemas. They enforce ACID properties (Atomicity, Consistency, Isolation, Durability) and are excellent for complex queries involving joins across multiple tables. They scale vertically (bigger servers) and are best suited for applications with well-defined schemas and complex relationships, such as financial systems and traditional web applications.\n\nNoSQL databases (like MongoDB, Cassandra, Redis) use various data models including document, key-value, column-family, and graph. They prioritize flexibility, horizontal scalability, and performance for specific access patterns. Most NoSQL databases offer eventual consistency rather than strict ACID compliance (though many now support transactions). They excel at handling large volumes of unstructured or semi-structured data, real-time applications, and use cases where the schema evolves frequently.")
+q("summarization", "Write a 280-character summary (Twitter-length) of this:\n\nThe James Webb Space Telescope (JWST), launched on December 25, 2021, is the most powerful space telescope ever built. Operating primarily in the infrared spectrum from its orbit at the L2 Lagrange point, 1.5 million kilometers from Earth, JWST has revolutionized our understanding of the universe. Its 6.5-meter gold-coated mirror, composed of 18 hexagonal segments, collects light from objects billions of light-years away with unprecedented clarity. In its first years of operation, JWST has delivered groundbreaking discoveries including the detection of the earliest galaxies formed after the Big Bang, detailed atmospheric analysis of exoplanets, stunning images of stellar nurseries, and new insights into the formation of planetary systems.")
+q("summarization", "Provide a structured outline (main points and sub-points) of this passage:\n\nEffective leadership in technology organizations requires balancing multiple dimensions. Technical leaders must maintain credibility by staying current with technology while avoiding the trap of making all technical decisions themselves. They need to create psychological safety where team members feel comfortable experimenting and failing. Communication is critical: translating business objectives into technical goals for engineers, and explaining technical constraints to business stakeholders. Great tech leaders also invest in developing their people through mentoring, challenging assignments, and creating growth opportunities. They establish engineering culture through the systems they build: code review practices, incident response processes, and architectural decision records create the norms that guide daily behavior. Finally, they must manage the tension between shipping quickly and building sustainable systems, making conscious choices about where to incur technical debt and where to invest in quality.")
+q("summarization", "Distill the following into exactly 3 key takeaways:\n\nA comprehensive study of 500 software projects found that the most successful projects shared several characteristics regardless of methodology (Agile, Waterfall, or hybrid). First, they had strong executive sponsorship with clear decision-making authority. Second, requirements were gathered through direct observation of users rather than relying solely on stakeholder interviews. Third, teams had dedicated time for knowledge sharing and documentation. Fourth, automated testing was implemented early and maintained throughout. Fifth, projects with fixed deadlines and flexible scope consistently outperformed those with fixed scope and flexible deadlines. The study also found that team continuity (keeping the same team together) was more important than individual expertise.")
+
+q("analysis_opinion", "Is it ethical to use AI-generated art in commercial products? Analyze the perspectives of artists, consumers, and technology companies.")
+
+q("instruction_howto", "How do you set up automated database backups with point-in-time recovery for PostgreSQL in production?")
+
+q("science_tech", "Explain how noise-canceling headphones work, covering both passive and active noise cancellation.")
+
+q("conversation_roleplay", "You are a grandparent explaining the internet to your grandchild in 1995. You just discovered email and you're amazed.")
+
+q("domain_specific", "Write a technical specification for a real-time fraud detection system that must process 10,000 transactions per second with sub-100ms latency.")
+
+q("creative_writing", "Write a product review for a time machine, written by a disappointed customer who can only travel 5 minutes into the past.")
+
+q("translation_language", "Explain the concept of honorific language in Japanese (keigo). How do the three levels (sonkeigo, kenjougo, teineigo) work?")
+
+q("short_factual", "What is the Pythagorean theorem?")
+q("short_factual", "Who is the current Secretary-General of the United Nations?")
+q("short_factual", "What is the largest organ in the human body?")
+q("short_factual", "What does SQL stand for?")
+q("short_factual", "What is the hardest natural substance on Earth?")
+
 # ── Generate outputs ─────────────────────────────────────────────────────────
 def main():
     out_dir = pathlib.Path(__file__).parent

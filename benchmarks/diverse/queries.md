@@ -1,25 +1,25 @@
-# Diverse Benchmark Queries (464 total)
+# Diverse Benchmark Queries (500 total)
 
 This file contains all queries used in the `diverse` benchmark preset.
 
 ## Category breakdown
 
-- **Short Factual**: 50 queries
-- **Coding**: 61 queries
-- **Creative Writing**: 50 queries
-- **Math Reasoning**: 49 queries
-- **Science Tech**: 40 queries
-- **Analysis Opinion**: 41 queries
-- **Instruction Howto**: 40 queries
-- **Summarization**: 13 queries
-- **Translation Language**: 30 queries
-- **Conversation Roleplay**: 30 queries
-- **Domain Specific**: 30 queries
+- **Short Factual**: 55 queries
+- **Coding**: 80 queries
+- **Creative Writing**: 51 queries
+- **Math Reasoning**: 50 queries
+- **Science Tech**: 41 queries
+- **Analysis Opinion**: 42 queries
+- **Instruction Howto**: 41 queries
+- **Summarization**: 17 queries
+- **Translation Language**: 31 queries
+- **Conversation Roleplay**: 31 queries
+- **Domain Specific**: 31 queries
 - **Long Form Complex**: 30 queries
 
 ---
 
-## Short Factual (50 queries)
+## Short Factual (55 queries)
 
 ### 1. What is the capital of Mongolia?
 
@@ -221,7 +221,27 @@ How many teeth does an adult human typically have?
 
 What is the national animal of Scotland?
 
-## Coding (61 queries)
+### 51. What is the Pythagorean theorem?
+
+What is the Pythagorean theorem?
+
+### 52. Who is the current Secretary-General of the United Nations?
+
+Who is the current Secretary-General of the United Nations?
+
+### 53. What is the largest organ in the human body?
+
+What is the largest organ in the human body?
+
+### 54. What does SQL stand for?
+
+What does SQL stand for?
+
+### 55. What is the hardest natural substance on Earth?
+
+What is the hardest natural substance on Earth?
+
+## Coding (80 queries)
 
 ### 1. Write a Python function that checks whether a given string is a palindrome.
 
@@ -495,7 +515,83 @@ Write a Python function that validates and parses cron expressions into human-re
 
 Create a minimal REST API in Python using FastAPI with CRUD operations for a todo list, including Pydantic models and error handling.
 
-## Creative Writing (50 queries)
+### 62. Write a Python function that implements the Levenshtein (edit) distance algorithm between two string...
+
+Write a Python function that implements the Levenshtein (edit) distance algorithm between two strings.
+
+### 63. Create a SQL migration script that adds a column to a large table without locking it (PostgreSQL).
+
+Create a SQL migration script that adds a column to a large table without locking it (PostgreSQL).
+
+### 64. Write a Python function that generates a random maze using recursive backtracking and prints it as A...
+
+Write a Python function that generates a random maze using recursive backtracking and prints it as ASCII art.
+
+### 65. Implement a simple pub/sub message broker in Python using only the standard library.
+
+Implement a simple pub/sub message broker in Python using only the standard library.
+
+### 66. Write a JavaScript function that throttles another function to execute at most once every N millisec...
+
+Write a JavaScript function that throttles another function to execute at most once every N milliseconds.
+
+### 67. Create a Python function that parses and evaluates boolean expressions like 'TRUE AND (FALSE OR TRUE...
+
+Create a Python function that parses and evaluates boolean expressions like 'TRUE AND (FALSE OR TRUE)'.
+
+### 68. Write a shell script that creates a complete project scaffold: directory structure, gitignore, READM...
+
+Write a shell script that creates a complete project scaffold: directory structure, gitignore, README, and Makefile.
+
+### 69. Implement a bloom filter in Python and explain when it's useful.
+
+Implement a bloom filter in Python and explain when it's useful.
+
+### 70. Write a Python function that generates a secure random password meeting configurable complexity requ...
+
+Write a Python function that generates a secure random password meeting configurable complexity requirements.
+
+### 71. Create a TypeScript utility type that makes all nested properties of an object optional (deep partia...
+
+Create a TypeScript utility type that makes all nested properties of an object optional (deep partial).
+
+### 72. Write a Python script that monitors CPU and memory usage and generates a simple HTML report.
+
+Write a Python script that monitors CPU and memory usage and generates a simple HTML report.
+
+### 73. Implement the Sieve of Eratosthenes in Rust to find all primes up to N.
+
+Implement the Sieve of Eratosthenes in Rust to find all primes up to N.
+
+### 74. Write a SQL query that calculates the median value of a column (without using built-in median functi...
+
+Write a SQL query that calculates the median value of a column (without using built-in median functions).
+
+### 75. Create a Python function that renders a simple bar chart in the terminal using Unicode block charact...
+
+Create a Python function that renders a simple bar chart in the terminal using Unicode block characters.
+
+### 76. Write a Go program that implements a concurrent web crawler with a configurable maximum depth.
+
+Write a Go program that implements a concurrent web crawler with a configurable maximum depth.
+
+### 77. Implement a simple template engine in Python that supports variable substitution and for-loops.
+
+Implement a simple template engine in Python that supports variable substitution and for-loops.
+
+### 78. Write a Python function that finds all anagram groups in a list of words.
+
+Write a Python function that finds all anagram groups in a list of words.
+
+### 79. Create a React custom hook in TypeScript that manages form state with validation.
+
+Create a React custom hook in TypeScript that manages form state with validation.
+
+### 80. Write a Python decorator that retries a function with exponential backoff on specified exceptions.
+
+Write a Python decorator that retries a function with exponential backoff on specified exceptions.
+
+## Creative Writing (51 queries)
 
 ### 1. Write a short story (300 words) about a lighthouse keeper who discovers that the light attracts some...
 
@@ -697,7 +793,11 @@ Write a scene where the last bookshop owner argues with the CEO of a tech compan
 
 Create a short epistolary story told through five postcards sent from increasingly strange locations.
 
-## Math Reasoning (49 queries)
+### 51. Write a product review for a time machine, written by a disappointed customer who can only travel 5 ...
+
+Write a product review for a time machine, written by a disappointed customer who can only travel 5 minutes into the past.
+
+## Math Reasoning (50 queries)
 
 ### 1. Prove that the square root of 2 is irrational.
 
@@ -908,7 +1008,11 @@ Explain the central limit theorem. Why is it important in statistics?
 
 In a room of 100 lockers (all closed) and 100 students: Student 1 toggles every locker. Student 2 toggles every 2nd. Student 3 every 3rd, etc. Which lockers are open at the end? Why?
 
-## Science Tech (40 queries)
+### 50. A circular track has circumference 400 meters. Runner A runs at 5 m/s and Runner B at 3 m/s in the s...
+
+A circular track has circumference 400 meters. Runner A runs at 5 m/s and Runner B at 3 m/s in the same direction. How often do they meet?
+
+## Science Tech (41 queries)
 
 ### 1. Explain how mRNA vaccines work, step by step, from injection to immune response.
 
@@ -1070,7 +1174,11 @@ Explain how modern GPUs achieve parallelism. What makes them better than CPUs fo
 
 What is the multiverse hypothesis? Describe the different types (Level I-IV) proposed by Max Tegmark.
 
-## Analysis Opinion (41 queries)
+### 41. Explain how noise-canceling headphones work, covering both passive and active noise cancellation.
+
+Explain how noise-canceling headphones work, covering both passive and active noise cancellation.
+
+## Analysis Opinion (42 queries)
 
 ### 1. Compare and contrast microservices architecture with monolithic architecture. When would you choose ...
 
@@ -1236,7 +1344,11 @@ Compare the philosophical approaches of utilitarianism, deontology, and virtue e
 
 Evaluate whether technical debt is always bad. When might it be a rational business decision?
 
-## Instruction Howto (40 queries)
+### 42. Is it ethical to use AI-generated art in commercial products? Analyze the perspectives of artists, c...
+
+Is it ethical to use AI-generated art in commercial products? Analyze the perspectives of artists, consumers, and technology companies.
+
+## Instruction Howto (41 queries)
 
 ### 1. Explain step by step how to set up a CI/CD pipeline using GitHub Actions for a Node.js application.
 
@@ -1398,7 +1510,11 @@ Explain how to implement a search feature in a web application, from full-text s
 
 How do you mentor a junior developer effectively? Provide concrete strategies and common pitfalls.
 
-## Summarization (13 queries)
+### 41. How do you set up automated database backups with point-in-time recovery for PostgreSQL in productio...
+
+How do you set up automated database backups with point-in-time recovery for PostgreSQL in production?
+
+## Summarization (17 queries)
 
 ### 1. Summarize the following passage in 3 bullet points:
 
@@ -1482,7 +1598,33 @@ Create an executive summary (5 bullet points) of this research finding:
 
 A longitudinal study conducted over 15 years, tracking 10,000 software development teams across 300 organizations, found that the strongest predictor of team productivity was not the programming language used, the development methodology adopted, or even individual developer skill—it was psychological safety. Teams where members felt safe to take risks, voice dissenting opinions, and admit mistakes without fear of punishment or embarrassment consistently delivered software 40% faster and with 50% fewer critical bugs than teams with low psychological safety scores. The study controlled for variables including team size, industry, company size, tech stack, and average developer experience. Interestingly, the second strongest predictor was the quality of internal documentation and knowledge management systems, followed by deployment frequency (teams that deployed daily outperformed teams deploying weekly or monthly). The research also found diminishing returns on team size: teams of 5-7 members were optimal, and adding more members beyond 9 consistently decreased per-capita productivity due to communication overhead. Finally, the study noted that mandatory overtime (>45 hours/week sustained over more than 4 weeks) correlated with a 25% increase in bug rates and a 35% increase in developer turnover within the following year.
 
-## Translation Language (30 queries)
+### 14. Summarize the key differences described here in a comparison table:
+
+Summarize the key differences described here in a comparison table:
+
+SQL databases (like PostgreSQL, MySQL) use structured query language and store data in tables with predefined schemas. They enforce ACID properties (Atomicity, Consistency, Isolation, Durability) and are excellent for complex queries involving joins across multiple tables. They scale vertically (bigger servers) and are best suited for applications with well-defined schemas and complex relationships, such as financial systems and traditional web applications.
+
+NoSQL databases (like MongoDB, Cassandra, Redis) use various data models including document, key-value, column-family, and graph. They prioritize flexibility, horizontal scalability, and performance for specific access patterns. Most NoSQL databases offer eventual consistency rather than strict ACID compliance (though many now support transactions). They excel at handling large volumes of unstructured or semi-structured data, real-time applications, and use cases where the schema evolves frequently.
+
+### 15. Write a 280-character summary (Twitter-length) of this:
+
+Write a 280-character summary (Twitter-length) of this:
+
+The James Webb Space Telescope (JWST), launched on December 25, 2021, is the most powerful space telescope ever built. Operating primarily in the infrared spectrum from its orbit at the L2 Lagrange point, 1.5 million kilometers from Earth, JWST has revolutionized our understanding of the universe. Its 6.5-meter gold-coated mirror, composed of 18 hexagonal segments, collects light from objects billions of light-years away with unprecedented clarity. In its first years of operation, JWST has delivered groundbreaking discoveries including the detection of the earliest galaxies formed after the Big Bang, detailed atmospheric analysis of exoplanets, stunning images of stellar nurseries, and new insights into the formation of planetary systems.
+
+### 16. Provide a structured outline (main points and sub-points) of this passage:
+
+Provide a structured outline (main points and sub-points) of this passage:
+
+Effective leadership in technology organizations requires balancing multiple dimensions. Technical leaders must maintain credibility by staying current with technology while avoiding the trap of making all technical decisions themselves. They need to create psychological safety where team members feel comfortable experimenting and failing. Communication is critical: translating business objectives into technical goals for engineers, and explaining technical constraints to business stakeholders. Great tech leaders also invest in developing their people through mentoring, challenging assignments, and creating growth opportunities. They establish engineering culture through the systems they build: code review practices, incident response processes, and architectural decision records create the norms that guide daily behavior. Finally, they must manage the tension between shipping quickly and building sustainable systems, making conscious choices about where to incur technical debt and where to invest in quality.
+
+### 17. Distill the following into exactly 3 key takeaways:
+
+Distill the following into exactly 3 key takeaways:
+
+A comprehensive study of 500 software projects found that the most successful projects shared several characteristics regardless of methodology (Agile, Waterfall, or hybrid). First, they had strong executive sponsorship with clear decision-making authority. Second, requirements were gathered through direct observation of users rather than relying solely on stakeholder interviews. Third, teams had dedicated time for knowledge sharing and documentation. Fourth, automated testing was implemented early and maintained throughout. Fifth, projects with fixed deadlines and flexible scope consistently outperformed those with fixed scope and flexible deadlines. The study also found that team continuity (keeping the same team together) was more important than individual expertise.
+
+## Translation Language (31 queries)
 
 ### 1. Translate the following to French, maintaining the formal tone:
 
@@ -1613,7 +1755,11 @@ What are the most significant differences between British and American English b
 
 How do sign languages differ from spoken languages structurally? Is there a universal sign language?
 
-## Conversation Roleplay (30 queries)
+### 31. Explain the concept of honorific language in Japanese (keigo). How do the three levels (sonkeigo, ke...
+
+Explain the concept of honorific language in Japanese (keigo). How do the three levels (sonkeigo, kenjougo, teineigo) work?
+
+## Conversation Roleplay (31 queries)
 
 ### 1. You are a senior software engineer mentoring a junior developer. They've just pushed code directly t...
 
@@ -1735,7 +1881,11 @@ You are a chef on a cooking show, but everything keeps going wrong. Narrate your
 
 Pretend you are GPS navigation with a personality. Guide someone through a road trip while making commentary on their driving and life choices.
 
-## Domain Specific (30 queries)
+### 31. You are a grandparent explaining the internet to your grandchild in 1995. You just discovered email ...
+
+You are a grandparent explaining the internet to your grandchild in 1995. You just discovered email and you're amazed.
+
+## Domain Specific (31 queries)
 
 ### 1. Draft a software license agreement for an open-source project that requires attribution but allows c...
 
@@ -1856,6 +2006,10 @@ Explain the concept of game theory and Nash equilibrium with examples from econo
 ### 30. Describe the process of DNA sequencing using next-generation sequencing (NGS) technology.
 
 Describe the process of DNA sequencing using next-generation sequencing (NGS) technology.
+
+### 31. Write a technical specification for a real-time fraud detection system that must process 10,000 tran...
+
+Write a technical specification for a real-time fraud detection system that must process 10,000 transactions per second with sub-100ms latency.
 
 ## Long Form Complex (30 queries)
 

@@ -72,15 +72,20 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "write_file",
         "description": (
             "Write a file to the run-specific experiment directory (results/sweep-NAME/TIMESTAMP/runllm/). "
-            "Only 'pod.yaml' and 'Makefile' are allowed. This NEVER writes to the project root "
-            "or the shared runllm/ — only to the isolated per-run copy."
+            "Allowed files: 'pod.yaml', 'Makefile', and custom code files with extensions: "
+            ".py, .sh, .json, .patch, .cfg, .toml, .txt. "
+            "Custom code files (.py, .sh, etc.) are automatically mounted into the pod at "
+            "/workspace/patches/<filename> via a ConfigMap. Your pod startup script can then "
+            "copy or apply them (e.g. 'cp /workspace/patches/custom_decoder.py /target/path/'). "
+            "Custom code files persist across runs — the next run inherits files from the best run. "
+            "This NEVER writes to the project root or the shared runllm/ — only to the isolated per-run copy."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Filename to write: 'pod.yaml' or 'Makefile'",
+                    "description": "Filename to write (e.g. 'pod.yaml', 'Makefile', 'custom_spec_decode.py', 'apply_patches.sh')",
                 },
                 "content": {"type": "string", "description": "Full file content to write"},
             },
@@ -221,6 +226,7 @@ class ToolContext:
     _benchmark_count: int = 0
     max_web_tool_calls: int = int(os.environ.get("AGENT_MAX_WEB_TOOL_CALLS", "20"))
     _web_tool_calls: int = 0
+    custom_code_files: set[str] = field(default_factory=set)
 
     tool_log: list[dict[str, Any]] = field(default_factory=list)
     log_path: Path | None = None
@@ -291,6 +297,7 @@ class AgentResult:
     conversation: list[dict[str, Any]] = field(default_factory=list)
     tool_log: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    custom_code_files: set[str] = field(default_factory=set)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -352,6 +359,8 @@ def _html_to_text(raw: str) -> str:
 
 ALLOWED_READ_PREFIXES = ("results/", "runllm/", "docs/", "scripts/")
 ALLOWED_WRITE_FILES = {"pod.yaml", "Makefile"}
+ALLOWED_WRITE_EXTENSIONS = {".py", ".sh", ".json", ".patch", ".cfg", ".toml", ".txt"}
+PATCHES_MOUNT_PATH = "/workspace/patches"
 SHELL_BLOCKLIST = re.compile(
     r"\b(rm\s+-rf|rm\s+-r|mkfs|dd\s+if|reboot|shutdown|kill\s+-9|pkill|chmod\s+777)\b", re.I
 )
@@ -508,11 +517,16 @@ def _tool_read_file(path: str, ctx: ToolContext) -> str:
 
 def _tool_write_file(path: str, content: str, ctx: ToolContext) -> str:
     basename = Path(path).name
-    if basename not in ALLOWED_WRITE_FILES:
-        return f"Denied: can only write {ALLOWED_WRITE_FILES}, got '{basename}'"
+    suffix = Path(basename).suffix.lower()
+    is_allowed_name = basename in ALLOWED_WRITE_FILES
+    is_allowed_ext = suffix in ALLOWED_WRITE_EXTENSIONS
+    if not is_allowed_name and not is_allowed_ext:
+        return (
+            f"Denied: can only write {ALLOWED_WRITE_FILES} or files with extensions "
+            f"{ALLOWED_WRITE_EXTENSIONS}, got '{basename}'"
+        )
     if not ctx.experiment_dir.exists():
         return f"Error: experiment directory does not exist: {ctx.experiment_dir}"
-    # Verify the experiment_dir is inside a sweep/run directory, not the shared runllm
     exp_resolved = ctx.experiment_dir.resolve()
     project_resolved = ctx.project_root.resolve()
     rel = str(exp_resolved.relative_to(project_resolved))
@@ -526,7 +540,12 @@ def _tool_write_file(path: str, content: str, ctx: ToolContext) -> str:
             ctx.config_content = content
             import shutil
             shutil.copy(target, ctx.run_dir / "pod_config.yaml")
-        return f"Wrote {basename} ({len(content)} bytes) to {rel}/{basename}"
+        if is_allowed_ext and not is_allowed_name:
+            ctx.custom_code_files.add(basename)
+        mount_note = ""
+        if is_allowed_ext and not is_allowed_name:
+            mount_note = f" (will be mounted at {PATCHES_MOUNT_PATH}/{basename} in the pod)"
+        return f"Wrote {basename} ({len(content)} bytes) to {rel}/{basename}{mount_note}"
     except Exception as e:
         return f"Write error: {e}"
 
@@ -757,6 +776,35 @@ def _tools_for_openai() -> list[dict[str, Any]]:
     ]
 
 
+# ── API Call Retry ──────────────────────────────────────────────────────────
+
+def _api_call_with_retry(call_fn, *, max_retries: int = 5, **kwargs):
+    """Call an LLM API with exponential backoff on transient errors."""
+    import time as _time
+    delay = 15
+    for attempt in range(max_retries + 1):
+        try:
+            return call_fn(**kwargs)
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(k in err_str for k in ("500", "502", "503", "529", "rate_limit", "overloaded"))
+            if not is_transient or attempt == max_retries:
+                raise
+            wait = min(delay * (2 ** attempt), 300)
+            print(f"  [agent] Transient API error (attempt {attempt + 1}/{max_retries + 1}): {err_str[:120]}... retrying in {wait}s")
+            _time.sleep(wait)
+
+
+def _anthropic_call_with_retry(client, *, max_retries: int = 5, **kwargs):
+    """Call client.messages.create with exponential backoff on transient errors."""
+    return _api_call_with_retry(client.messages.create, max_retries=max_retries, **kwargs)
+
+
+def _openai_call_with_retry(client, *, max_retries: int = 5, **kwargs):
+    """Call client.responses.create with exponential backoff on transient errors."""
+    return _api_call_with_retry(client.responses.create, max_retries=max_retries, **kwargs)
+
+
 # ── Anthropic Agent Loop ────────────────────────────────────────────────────
 
 def _run_anthropic_loop(
@@ -767,11 +815,12 @@ def _run_anthropic_loop(
     client = Anthropic()
     tools = _tools_for_anthropic()
     conversation: list[dict[str, Any]] = []
+    budget_boosted = False
 
     for turn in range(max_turns):
         print(f"  [agent] Anthropic call (turn {turn + 1}/{max_turns})...")
-        resp = client.messages.create(
-            model=model, max_tokens=8192, system=system,
+        resp = _anthropic_call_with_retry(
+            client, model=model, max_tokens=8192, system=system,
             messages=messages, tools=tools,
         )
 
@@ -794,6 +843,7 @@ def _run_anthropic_loop(
                 benchmark_result=ctx.benchmark_result,
                 conversation=conversation,
                 tool_log=ctx.tool_log,
+                custom_code_files=ctx.custom_code_files,
             )
 
         tool_results: list[dict[str, Any]] = []
@@ -804,6 +854,11 @@ def _run_anthropic_loop(
                 "tool_use_id": tu.id,
                 "content": result_str,
             })
+
+        if not budget_boosted and ctx.custom_code_files:
+            max_turns = max_turns + CUSTOM_CODE_BUDGET_BOOST
+            budget_boosted = True
+            print(f"  [agent] Custom code written — budget boosted to {max_turns} turns")
 
         messages.append({"role": "user", "content": tool_results})
         tool_entry = {"role": "tool_results", "content": [
@@ -882,17 +937,14 @@ def _run_openai_loop(
     tools = _tools_for_openai()
     conversation: list[dict[str, Any]] = []
     input_items: list[Any] = list(messages)
+    budget_boosted = False
 
     for turn in range(max_turns):
         print(f"  [agent] OpenAI call (turn {turn + 1}/{max_turns})...")
-        resp = client.responses.create(
-            model=model,
-            instructions=system,
-            input=input_items,
-            tools=tools,
-            tool_choice="auto",
-            parallel_tool_calls=True,
-            max_output_tokens=8192,
+        resp = _openai_call_with_retry(
+            client, model=model, instructions=system,
+            input=input_items, tools=tools, tool_choice="auto",
+            parallel_tool_calls=True, max_output_tokens=8192,
         )
 
         input_items.extend(getattr(resp, "output", []) or [])
@@ -914,6 +966,7 @@ def _run_openai_loop(
                 benchmark_result=ctx.benchmark_result,
                 conversation=conversation,
                 tool_log=ctx.tool_log,
+                custom_code_files=ctx.custom_code_files,
             )
 
         for tc in tool_calls:
@@ -932,10 +985,29 @@ def _run_openai_loop(
             conversation.append(tool_entry)
             _flush_log_entry(ctx, tool_entry)
 
+        if not budget_boosted and ctx.custom_code_files:
+            max_turns = max_turns + CUSTOM_CODE_BUDGET_BOOST
+            budget_boosted = True
+            print(f"  [agent] Custom code written — budget boosted to {max_turns} turns")
+
     return AgentResult(error="Max tool-calling turns reached", conversation=conversation, tool_log=ctx.tool_log)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
+
+CUSTOM_CODE_BUDGET_BOOST = int(os.environ.get("AGENT_CUSTOM_CODE_BUDGET_BOOST", "100"))
+
+
+def _detect_inherited_code(experiment_dir: Path) -> list[str]:
+    """Check if the experiment directory contains custom code files from a previous run."""
+    if not experiment_dir or not experiment_dir.exists():
+        return []
+    return [
+        f.name for f in experiment_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in ALLOWED_WRITE_EXTENSIONS
+        and f.name not in ALLOWED_WRITE_FILES
+    ]
+
 
 def run_agent(
     system_prompt: str,
@@ -951,6 +1023,10 @@ def run_agent(
     The agent receives the system prompt and user prompt, and can use tools
     to gather information, write configs, and optionally run benchmarks.
     Returns an AgentResult with the final state.
+
+    When the agent writes custom code files, the budget is automatically
+    increased by CUSTOM_CODE_BUDGET_BOOST (default 100) to allow for
+    iterative code development and debugging.
     """
     messages = [{"role": "user", "content": user_prompt}]
 
@@ -961,10 +1037,18 @@ def run_agent(
         _flush_log_entry(ctx, {"role": "system", "content": system_prompt})
         _flush_log_entry(ctx, {"role": "user", "content": user_prompt})
 
+    # Check if inherited custom code files exist in experiment_dir (from previous runs)
+    inherited_code = _detect_inherited_code(ctx.experiment_dir)
+    if inherited_code:
+        effective_max_turns = max(max_turns, max_turns + CUSTOM_CODE_BUDGET_BOOST)
+        print(f"  [agent] Inherited custom code files: {inherited_code} — budget boosted to {effective_max_turns} turns")
+    else:
+        effective_max_turns = max_turns
+
     if provider == "anthropic":
-        result = _run_anthropic_loop(system_prompt, messages, model, ctx, max_turns)
+        result = _run_anthropic_loop(system_prompt, messages, model, ctx, effective_max_turns)
     elif provider == "openai":
-        result = _run_openai_loop(system_prompt, messages, model, ctx, max_turns)
+        result = _run_openai_loop(system_prompt, messages, model, ctx, effective_max_turns)
     else:
         return AgentResult(error=f"Unknown provider: {provider}")
 

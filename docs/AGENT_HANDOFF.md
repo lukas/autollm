@@ -96,12 +96,28 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 
 - The agent now uses a full tool stack defined in `scripts/agent_tools.py` (10 tools: `search_web`, `fetch_url`, `read_file`, `write_file`, `list_files`, `run_shell`, `run_benchmark`, `read_logs`, `kubectl_get`, `kubectl_logs`).
 - `run_agent()` in `agent_tools.py` implements the agentic loop for both Anthropic Messages API and OpenAI Responses API.
+- Both API loops use exponential-backoff retry (up to 5 attempts, 15s–300s delay) for transient errors (HTTP 500, 502, 503, 529, rate limits). This prevents API outages from burning through sweep runs.
 - OpenAI improve runs now use the Responses API in `scripts/agent_tools.py`, so GPT-5-class models can do tool calling without falling back to older chat-completions-only models. User preference in this workspace is GPT-5.4/latest GPT or latest Anthropic only; do not silently downgrade to `gpt-4o`/`gpt-4o-mini`.
-- Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var).
+- Max tool calls per run: 50 (configurable via `AGENT_MAX_TURNS` env var). When the agent writes custom code files, the budget is automatically boosted by `AGENT_CUSTOM_CODE_BUDGET_BOOST` (default 100).
 - Conversation/tool traces are stored locally in `agent.log` files; there is no required external tracing dependency in the current workflow.
-- `write_file` is sandboxed: only writes `pod.yaml` or `Makefile` to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`.
+- `write_file` is sandboxed to the isolated per-run experiment directory (`results/sweep-NAME/TIMESTAMP/runllm/`). It never touches the shared project `runllm/`. Allowed files: `pod.yaml`, `Makefile`, and custom code files with extensions `.py`, `.sh`, `.json`, `.patch`, `.cfg`, `.toml`, `.txt`.
 - Web search uses Exa API (`EXA_API_KEY`). Falls back to DuckDuckGo HTML scraping if the key is unset. The key is read from the environment or `.env` file.
 - Web tools now keep sweep-local memory. Agents are expected to read sweep research memory first, then use web calls only to fill genuine gaps rather than rediscovering the same facts every run. The default per-run web-call budget is now 20 via `AGENT_MAX_WEB_TOOL_CALLS`.
+
+### Custom Code Files (ConfigMap Mounting)
+
+- The agent can write custom code files (`.py`, `.sh`, etc.) to the experiment directory alongside `pod.yaml`.
+- Before deploying, `_deploy_and_benchmark()` in `ai_experiment.py` automatically:
+  1. Scans the experiment directory for files with extensions in `PATCHES_CONFIGMAP_EXTENSIONS`.
+  2. Creates a K8s ConfigMap (`<pod-name>-patches`) from those files.
+  3. Injects a `volumes` entry and `volumeMounts` entry into the pod spec via YAML manipulation.
+  4. Files become available inside the pod at `/workspace/patches/<filename>` (read-only).
+- The pod's startup script (in `pod.yaml` `args`) should copy or apply patches from `/workspace/patches/`.
+- ConfigMaps are cleaned up automatically when the pod is deleted.
+- Custom code files **persist across runs**: `shutil.copytree` copies all files from the best run's `runllm/` dir to the next run's experiment dir, so custom code accumulates and evolves.
+- The agent prompt tells the agent about inherited custom code files and how to use them.
+- ConfigMap size limit: 1MB (K8s hard limit). This is sufficient for monkey-patches and custom modules but not for large binary data.
+- This enables optimizations beyond config tuning: custom speculative decoders, patched scheduling logic, custom kernels, etc.
 
 ### Run Retros
 
@@ -118,7 +134,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 - **guidellm runs as a K8s Job inside the cluster**, not locally on macOS. This was changed because guidellm 0.5.3's multiprocessing deadlocks on macOS for anything beyond trivial benchmarks, and `kubectl port-forward` is unreliable for long runs.
 - The shared module `scripts/k8s_benchmark.py` handles job creation, log streaming, result extraction, and cleanup.
 - **Networking:** The benchmark Job gets the vLLM pod's cluster IP via `kubectl get pod -o jsonpath` and connects directly (e.g. `http://10.0.0.164:8000`). No port-forward, no Service object.
-- **Image:** Currently uses `python:3.12-slim` with `pip install guidellm[recommended]` at Job startup (~30-60s overhead). Set `GUIDELLM_BENCH_IMAGE=lbiewald/guidellm-bench:latest` to use a pre-built image (build from `runllm/Dockerfile.guidellm`).
+- **Image:** Uses `python:3.12-slim` by default. guidellm is installed into a persistent venv on the PVC (`/mnt/models/.cache/guidellm-venv`) so it's only installed once — subsequent benchmark Jobs reuse the cached venv. Set `GUIDELLM_BENCH_IMAGE` to a pre-built image to skip even the cache check.
 - **Result extraction:** The Job dumps `benchmarks.json` to stdout via markers (`===BENCHMARKS_JSON_START===` / `===BENCHMARKS_JSON_END===`). The harness extracts JSON from the captured `kubectl logs` stream. This avoids `kubectl cp` which fails on completed pods.
 - **Node placement:** Benchmark Job uses the same `nodeSelector` (`lukas-4h200-pool`) as the vLLM pod for network proximity, but requests 0 GPUs (CPU + 4GB RAM only).
 - **Who calls it:**
@@ -235,7 +251,10 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 12. **EAGLE-3 for Kimi-K2.5 requires a startup patch on SGLang v0.5.9.**
    The `KimiK25ForConditionalGeneration` class in v0.5.9 lacks `set_eagle3_layers_to_capture()`, but the inner `DeepseekV3ForCausalLM` has it. The `kimi-sglang-eagle/pod.yaml` patches the outer class at startup to delegate to the inner model. This matches what SGLang main already has. Remove the patch when upgrading past v0.5.9.
 
-13. **Every runllm variant must mount the `models` PVC for model caching.**
+13. **The `diverse` benchmark preset requires the dataset on the PVC.**
+   The `diverse` preset uses `benchmarks/diverse/dataset.jsonl` which gets rewritten to `/mnt/models/benchmarks/diverse/dataset.jsonl` for K8s benchmark Jobs. Run `make sync-benchmarks` to copy the dataset to the PVC (requires a running pod with RW PVC access). If it fails because the only running pods mount the PVC read-only, create a temporary RW pod: `kubectl run pvc-writer --image=busybox --rm -it --restart=Never --overrides='...'`.
+
+14. **Every runllm variant must mount the `models` PVC for model caching.**
    Without a PVC, HuggingFace models are re-downloaded from scratch on every pod restart — hundreds of GB for large models like Kimi-K2.5. For vLLM variants, use `--download-dir /mnt/models/hf-cache`. For SGLang variants, set the `HF_HOME` env var to `/mnt/models/hf-cache`. Always add the `models` PVC volume and volumeMount. This applies to both main models and draft/speculative models. When creating a new `runllm/` variant, copy the volume config from an existing variant rather than starting without it.
 
 ---

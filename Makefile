@@ -16,7 +16,7 @@ MODEL ?= $(MODEL_DIR)
 BENCHMARK ?= medium
 DESCRIPTION ?=
 
-.PHONY: help setup sync benchmark benchmark-run benchmark-run-quick baseline sweep sweep-local full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown
+.PHONY: help setup sync benchmark benchmark-run benchmark-run-quick baseline sweep sweep-local full-sweep improve experiment experiment-inspect test-sweep-setup results-summary results-index dashboard query kubeconfig ensure-kubeconfig leaderboard sweep-pods backfill-names tensorize sweep-remote improve-remote sweep-set-runs sync-results sweep-logs sweep-status sweep-remote-teardown sync-benchmarks
 
 help:
 	@echo "autollm make targets"
@@ -28,6 +28,9 @@ help:
 	@echo ""
 	@echo "Benchmarking:"
 	@echo "  make benchmark             Deploy model and run benchmark"
+	@echo "  make benchmark BENCHMARK=diverse"
+	@echo "                             Run with 500 diverse real-world queries"
+	@echo "  make sync-benchmarks       Copy benchmark datasets to PVC (required for diverse)"
 	@echo "  make benchmark-run         Run harness against existing port-forward"
 	@echo "  make benchmark-run-quick   Quick harness-only run"
 	@echo "  make results-summary       Summarize benchmark results"
@@ -81,7 +84,7 @@ query:
 # Usage: make benchmark
 #        make benchmark BENCHMARK=quick
 #        make benchmark BENCHMARK=sweep DESCRIPTION="baseline"
-# Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req)
+# Presets: quick (5 req), sync (20 req), sweep (60s), full (200 req), diverse (500 real queries)
 benchmark: ensure-kubeconfig
 	@POD_CONFIG=runllm/$(MODEL_DIR)/pod.yaml python3 scripts/benchmark_harness.py --start-llm --benchmark "$(BENCHMARK)" --description "$(DESCRIPTION)" $(if $(MAX_REQUESTS),--max-requests $(MAX_REQUESTS),) $(if $(MAX_SECONDS),--max-seconds $(MAX_SECONDS),)
 
@@ -228,6 +231,19 @@ sweep-status: ensure-kubeconfig
 # Delete the remote controller pod (results are lost unless synced first!).
 sweep-remote-teardown: ensure-kubeconfig
 	@scripts/sweep_remote.sh teardown
+
+# ── Benchmark data ───────────────────────────────────────────────────────────
+# Sync local benchmark datasets to the models PVC so K8s Jobs can read them.
+# Uses any running pod that mounts /mnt/models (vLLM pod or sweep controller).
+# Usage: make sync-benchmarks
+sync-benchmarks: ensure-kubeconfig
+	@echo "Syncing benchmark datasets to PVC..."
+	@POD=$$(kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{" "}{end}{"\n"}{end}' 2>/dev/null | grep 'models' | head -1 | cut -f1); \
+	if [ -z "$$POD" ]; then echo "ERROR: No running pod with models PVC found. Start a model first."; exit 1; fi; \
+	echo "Using pod: $$POD"; \
+	kubectl exec $$POD -- mkdir -p /mnt/models/benchmarks/diverse; \
+	kubectl cp benchmarks/diverse/dataset.jsonl $$POD:/mnt/models/benchmarks/diverse/dataset.jsonl; \
+	echo "Done. Dataset available at /mnt/models/benchmarks/diverse/dataset.jsonl"
 
 # ── Setup / bootstrap targets ────────────────────────────────────────────────
 

@@ -77,6 +77,13 @@ BENCHMARK_PRESETS: dict[str, dict[str, str | None]] = {
         "rate": None,
         "data": "prompt_tokens=1000,output_tokens=1000",
     },
+    "diverse": {
+        "profile": "synchronous",
+        "max_requests": "500",
+        "max_seconds": "600",
+        "rate": None,
+        "data": "benchmarks/diverse/dataset.jsonl",
+    },
 }
 
 BENCHMARK_MAX_REQUESTS = {
