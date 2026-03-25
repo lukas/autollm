@@ -86,6 +86,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - full strategy text
   - structured `Changed knobs vs baseline`
   - full arg summaries extracted from YAML using structured parsing, not fragile regex
+  - per-run timing breakdown: agent thinking time, deploy (pod spin-up) time, benchmark time, and total wall time
 - Improve prompts now use a compact context window by default: top successful runs, the most recent failed runs, a short structured sweep-memory block, the newest `RUN_RETRO.md`, and a cached `FULL_RETRO.md` synthesis instead of dumping the full sweep state every run.
 - `results/sweep-NAME/AGENT_CONTEXT.md` is regenerated alongside `leaderboard.txt` as a deterministic cache for future agents/humans. It summarizes the current frontier plus repeated failure classes and harness-only patterns.
 - `FULL_RETRO.md` is the canonical sweep-level retro synthesis. The synthesis is cached and only regenerated when the sweep meaningfully changes (for example a new best run, new failure class, or updated retro content), which cuts repeated prompt cost.
@@ -176,6 +177,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
   - `autollm-sweep: "<sweep-name>"`
 - On failed deploy/health/sample-query attempts, the harness captures `pod_get.json`, `pod_describe.txt`, `pod_events.txt`, and current/previous pod logs before deleting the pod.
 - Pod cleanup happens on success, failure, and normal signal exit.
+- Before deploying, `_deploy_and_benchmark` now deletes all stale pods labeled with the same `autollm-sweep` label. This prevents GPU exhaustion from orphaned pods created by earlier failed runs with mismatched names.
 - `make sweep-pods` depends on those labels.
 
 ### runllm Surface

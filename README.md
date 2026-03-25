@@ -194,6 +194,7 @@ results/sweep-qwen-latency/
   agent.log                # full local agent conversation history (all runs)
   20260311_120000/          # improvement run
     runllm/                 # modified runllm snapshot
+    run_metadata.json       # run metadata incl. timing (agent/deploy/bench/total seconds)
     pod_config.yaml         # Pod config used
     benchmarks.json         # benchmark results
     FULL_RETRO.md           # full sweep retro snapshot as seen by this run

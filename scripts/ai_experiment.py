@@ -190,6 +190,34 @@ def _fmt_summary(m: dict) -> str:
     return " | ".join(parts) if parts else "—"
 
 
+def _fmt_timing(meta: dict) -> str:
+    """Format timing info from run metadata as a compact string."""
+    parts = []
+    agent_s = meta.get("agent_seconds")
+    deploy_s = meta.get("deploy_seconds")
+    bench_s = meta.get("benchmark_seconds")
+    total_s = meta.get("total_seconds")
+    if agent_s is not None:
+        parts.append(f"agent {_fmt_duration(agent_s)}")
+    if deploy_s is not None:
+        parts.append(f"deploy {_fmt_duration(deploy_s)}")
+    if bench_s is not None:
+        parts.append(f"bench {_fmt_duration(bench_s)}")
+    if total_s is not None:
+        parts.append(f"total {_fmt_duration(total_s)}")
+    return " | ".join(parts) if parts else ""
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as a human-readable duration like '2m30s' or '45s'."""
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s}s"
+
+
 def _fmt_detail_lines(m: dict, run_dir: Path) -> list[str]:
     """Extra detail lines for leaderboard entries: percentiles + server-side metrics."""
     lines = []
@@ -1033,7 +1061,8 @@ def _get_experiment_leaderboard(
                                       "throughput": tok or 0,
                                       "ttft": ttft or 999999,
                                       "detail_lines": _fmt_detail_lines(m, d),
-                                      "path": str(d.relative_to(project_root))})
+                                      "path": str(d.relative_to(project_root)),
+                                      "timing": _fmt_timing(meta)})
                     continue
             except Exception:
                 pass
@@ -1083,6 +1112,8 @@ def _get_experiment_leaderboard(
             lines.append(f"{header}  {s['metrics']}")
             if not compact and s.get("changes"):
                 lines.append("  changes: " + "; ".join(s["changes"][:4]))
+            if not compact and s.get("timing"):
+                lines.append("  timing:  " + s["timing"])
             lines.append("")
         if compact and len(successes) > len(shown_successes):
             lines.append(f"... {len(successes) - len(shown_successes)} more successful runs omitted")
@@ -1954,7 +1985,24 @@ def _deploy_and_benchmark(
     _write_progress("deploy_delete", {"experiment_dir": str(experiment_dir), "run_dir": str(run_dir), "pod_name": pod_name})
     _log_run(run_dir, "Deploy: delete + apply")
 
-    # Delete both the new pod name AND the base pod (from baseline) to free GPUs
+    # Kill any stale sweep pods first (prevents GPU exhaustion from orphaned pods)
+    if sweep:
+        try:
+            stale = subprocess.run(
+                ["kubectl", "get", "pods", "-l", f"autollm-sweep={sweep}",
+                 "-o", "jsonpath={.items[*].metadata.name}"],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            stale_pods = [p for p in (stale.stdout or "").split() if p and p != pod_name]
+            for sp in stale_pods:
+                _log_run(run_dir, f"Cleaning stale sweep pod: {sp}")
+                subprocess.run(
+                    ["kubectl", "delete", "pod", sp, "--ignore-not-found=true", "--wait=false"],
+                    capture_output=True, timeout=15, env=env,
+                )
+        except Exception:
+            pass
+
     delete_cmds: list[tuple[list[str], str]] = [
         (["kubectl", "delete", "pod", pod_name, "--ignore-not-found=true"], "delete failed"),
     ]
@@ -2114,6 +2162,9 @@ def _deploy_and_benchmark(
         env=env,
     )
 
+    deploy_seconds = time.time() - start
+    _update_run_metadata(run_dir, deploy_seconds=round(deploy_seconds, 1))
+
     _write_progress("benchmark", {"run_dir": str(run_dir)})
     _log_run(run_dir, f"Starting benchmark ({benchmark}) as K8s Job, run_dir={run_dir}")
 
@@ -2173,6 +2224,9 @@ def _deploy_and_benchmark(
 
     if last_queries[0] > 0:
         print()
+
+    benchmark_seconds = time.time() - bench_start
+    _update_run_metadata(run_dir, benchmark_seconds=round(benchmark_seconds, 1))
 
     if bench_rc != 0:
         _cleanup()
@@ -2667,6 +2721,7 @@ Prefer local evidence from the sweep. Read the sweep research memory first. Only
     max_attempts = 3
     failure_context: dict | None = None
     last_description = ""
+    run_start_time = time.time()
 
     for attempt in range(max_attempts):
         if attempt > 0 and failure_context:
@@ -2770,9 +2825,11 @@ When ready, call write_file('pod.yaml', <complete fixed YAML>)."""
             log_path=run_dir / "agent.log",
         )
 
+        agent_start = time.time()
         try:
             agent_result = run_agent(TOOL_SYSTEM_PROMPT, user_prompt, provider, model, ctx, max_turns=AGENT_MAX_TURNS)
         except Exception as e:
+            agent_seconds = round(time.time() - agent_start, 1)
             err_msg = f"Agent error: {e}"
             print(err_msg)
             classification = classify_failure_text(err_msg)
@@ -2784,6 +2841,7 @@ When ready, call write_file('pod.yaml', <complete fixed YAML>)."""
                 success=False,
                 result=err_msg[:1000],
                 failure_classification=classification,
+                agent_seconds=agent_seconds,
             )
             _append_result(experiment_dir, err_msg, "", results_path=results_txt)
             if sweep_dir:
@@ -2793,6 +2851,9 @@ When ready, call write_file('pod.yaml', <complete fixed YAML>)."""
                     print(stop_status["reason"])
                     return SWEEP_STOP_EXIT_CODE
             return 1
+
+        agent_seconds = round(time.time() - agent_start, 1)
+        _update_run_metadata(run_dir, agent_seconds=agent_seconds)
 
         _write_agent_result_log(run_dir, agent_result, sweep_dir)
 
@@ -2943,6 +3004,7 @@ When ready, call write_file('pod.yaml', <complete fixed YAML>)."""
             {"is_unfixable": False, "category": "success", "matched_text": "", "summary": ""}
             if success else classify_failure_text(result)
         )
+        total_seconds = round(time.time() - run_start_time, 1)
         _update_run_metadata(
             run_dir,
             success=success,
@@ -2950,6 +3012,7 @@ When ready, call write_file('pod.yaml', <complete fixed YAML>)."""
             failure_classification=failure_classification,
             attempt=attempt + 1,
             tools_used=len(agent_result.tool_log),
+            total_seconds=total_seconds,
         )
         _append_result(experiment_dir, description, result, success=success, run_dir=run_dir, results_path=results_txt)
 
