@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import subprocess
 import threading
@@ -112,6 +113,93 @@ def _yaml_resources(yaml_path: Path) -> dict[str, Any]:
     return resources if isinstance(resources, dict) else {}
 
 
+def _collect_gpu_topology(pod_name: str, env: dict[str, str]) -> dict[str, Any]:
+    """Collect GPU topology matrix and NCCL transport info from a running pod."""
+    topo: dict[str, Any] = {}
+
+    # 1. nvidia-smi topo -m
+    try:
+        r = subprocess.run(
+            ["kubectl", "exec", pod_name, "--", "nvidia-smi", "topo", "-m"],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            topo["nvidia_smi_topo"] = r.stdout.strip()
+            valid_link_types = {
+                "NV1", "NV2", "NV4", "NV8", "NV12", "NV16", "NV18", "NV24",
+                "NVL", "NVLS", "SYS", "NODE", "PIX", "PXB", "PHB",
+            }
+            links = set()
+            for line in r.stdout.splitlines():
+                for token in line.split():
+                    token = token.strip()
+                    if token in valid_link_types:
+                        links.add(token)
+            topo["link_types"] = sorted(links)
+    except Exception:
+        pass
+
+    # 2. NCCL transport from pod logs (only if NCCL_DEBUG was set).
+    #    NCCL init happens at startup so we need early log lines, not just the tail.
+    try:
+        r = subprocess.run(
+            ["kubectl", "logs", pod_name, "--limit-bytes=2000000"],
+            capture_output=True, text=True, timeout=20, env=env,
+        )
+        if r.returncode == 0 and "NCCL INFO" in r.stdout:
+            nccl_lines = [l for l in r.stdout.splitlines() if "NCCL INFO" in l]
+            transport = {}
+            for line in nccl_lines:
+                if "Using network" in line:
+                    transport["network"] = line.split("Using network")[-1].strip()
+                if "maxBw" in line and "totalBw" in line:
+                    m = re.search(r"maxBw\s+([\d.]+)\s+totalBw\s+([\d.]+)", line)
+                    if m:
+                        transport["max_bw_gbps"] = float(m.group(1))
+                        transport["total_bw_gbps"] = float(m.group(2))
+                if "type NVL" in line and "nChannels" in line:
+                    m = re.search(r"nChannels\s+(\d+).*type\s+(\S+)", line)
+                    if m and "nccl_channels" not in transport:
+                        transport["nccl_channels"] = int(m.group(1))
+                        transport["nccl_transport_type"] = m.group(2).rstrip(",.")
+                if "coll channels" in line:
+                    m = re.search(
+                        r"(\d+) coll channels, (\d+) collnet channels, (\d+) nvls channels, (\d+) p2p channels",
+                        line,
+                    )
+                    if m:
+                        transport["coll_channels"] = int(m.group(1))
+                        transport["collnet_channels"] = int(m.group(2))
+                        transport["nvls_channels"] = int(m.group(3))
+                        transport["p2p_channels"] = int(m.group(4))
+                if "via " in line and "Channel 00" in line:
+                    transport.setdefault("p2p_transport", line.split("via")[-1].strip())
+                if "NET/IB : No device" in line:
+                    transport["infiniband"] = "not_available"
+                elif "NET/IB" in line and "Using" in line and "infiniband" not in transport:
+                    transport["infiniband"] = "available"
+            if transport:
+                topo["nccl_transport"] = transport
+    except Exception:
+        pass
+
+    # 3. NVLink status (quick check)
+    try:
+        r = subprocess.run(
+            ["kubectl", "exec", pod_name, "--",
+             "nvidia-smi", "nvlink", "--status", "-i", "0"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            active_links = r.stdout.strip().count("active")
+            topo["nvlink_active_links_gpu0"] = active_links
+            topo["nvlink_status_gpu0"] = r.stdout.strip()
+    except Exception:
+        pass
+
+    return topo
+
+
 def collect_hardware_context(
     pod_name: str,
     yaml_path: Path,
@@ -153,6 +241,87 @@ def collect_hardware_context(
 
 def write_hardware_context(run_dir: Path, context: dict[str, Any]) -> None:
     (run_dir / "hardware_context.json").write_text(json.dumps(context, indent=2) + "\n")
+
+
+def cache_topology_for_sweep(
+    sweep_dir: Path | None,
+    pod_name: str,
+    env: dict[str, str],
+    node_name: str | None = None,
+) -> None:
+    """Collect and cache gpu_topology.json in the sweep directory.
+
+    Skips entirely if the cache already exists for the same node.
+    This runs ~4s of kubectl calls, so it should only be called once
+    per sweep (typically during the baseline or first improve run).
+    """
+    if not sweep_dir or not sweep_dir.exists():
+        return
+    topo_path = sweep_dir / "gpu_topology.json"
+
+    if topo_path.exists():
+        if not node_name:
+            return  # cache exists, no node to compare, skip
+        try:
+            existing = json.loads(topo_path.read_text())
+            if existing.get("node_name") == node_name:
+                return  # same node, skip
+        except Exception:
+            pass
+
+    gpu_topo = _collect_gpu_topology(pod_name, env)
+    if not gpu_topo:
+        return
+
+    cached = {
+        "node_name": node_name or "unknown",
+        "captured_at": datetime.now().isoformat(),
+        **gpu_topo,
+    }
+    summary_lines = [f"Node: {node_name or 'unknown'}"]
+    nccl = gpu_topo.get("nccl_transport", {})
+    if nccl:
+        summary_lines.append(f"NCCL network: {nccl.get('network', 'unknown')}")
+        if nccl.get("nccl_transport_type"):
+            summary_lines.append(f"Transport type: {nccl['nccl_transport_type']}")
+        if nccl.get("max_bw_gbps"):
+            summary_lines.append(f"Max bandwidth: {nccl['max_bw_gbps']} GB/s")
+        if nccl.get("p2p_transport"):
+            summary_lines.append(f"P2P transport: {nccl['p2p_transport']}")
+        ch = []
+        if nccl.get("coll_channels") is not None:
+            ch.append(f"{nccl['coll_channels']} coll")
+        if nccl.get("nvls_channels") is not None:
+            ch.append(f"{nccl['nvls_channels']} NVLS")
+        if nccl.get("p2p_channels") is not None:
+            ch.append(f"{nccl['p2p_channels']} P2P")
+        if ch:
+            summary_lines.append(f"Channels: {', '.join(ch)}")
+        if nccl.get("infiniband"):
+            summary_lines.append(f"InfiniBand: {nccl['infiniband']}")
+    links = gpu_topo.get("link_types")
+    if links:
+        summary_lines.append(f"GPU link types: {', '.join(links)}")
+    cached["summary"] = "\n".join(summary_lines)
+
+    topo_path.write_text(json.dumps(cached, indent=2) + "\n")
+
+
+def get_topology_context(sweep_dir: Path | None) -> str:
+    """Return a compact topology summary string for agent prompt context."""
+    if not sweep_dir:
+        return ""
+    topo_path = sweep_dir / "gpu_topology.json"
+    if not topo_path.exists():
+        return ""
+    try:
+        cached = json.loads(topo_path.read_text())
+        summary = cached.get("summary", "")
+        if summary:
+            return f"## GPU Topology & Interconnect\n\n{summary}\n"
+    except Exception:
+        pass
+    return ""
 
 
 def write_vllm_snapshot(
@@ -319,6 +488,7 @@ class VLLMProfiler:
         yaml_path: Path,
         interval_sec: float = 5.0,
         log_fn=None,
+        sweep_dir: Path | None = None,
     ) -> None:
         self.pod_name = pod_name
         self.run_dir = run_dir
@@ -337,6 +507,10 @@ class VLLMProfiler:
         self._started = time.time()
         self.hardware_context = collect_hardware_context(pod_name, yaml_path, env)
         write_hardware_context(run_dir, self.hardware_context)
+        cache_topology_for_sweep(
+            sweep_dir, pod_name, env,
+            node_name=self.hardware_context.get("node_name"),
+        )
 
     def _log(self, message: str) -> None:
         if self.log_fn:

@@ -37,7 +37,7 @@ from sweep_state import (
     write_sweep_overview,
 )
 from sweep_utils import completed_request_count, is_valid_run, metric_mean, sweep_objective, sweep_ranking_label
-from vllm_profiling import VLLMProfiler, write_vllm_snapshot
+from vllm_profiling import VLLMProfiler, get_topology_context, write_vllm_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -2143,6 +2143,7 @@ def _deploy_and_benchmark(
         _cleanup()
         return False, "Sample query returned invalid JSON"
     _log_run(run_dir, "Sample query OK (model responded)")
+    _sweep_dir = (RESULTS_DIR / f"sweep-{sweep.lower().replace(' ', '-')}") if sweep else None
     profiler = VLLMProfiler(
         pod_name=pod_name,
         run_dir=run_dir,
@@ -2150,6 +2151,7 @@ def _deploy_and_benchmark(
         yaml_path=vllm_yaml,
         interval_sec=float(os.environ.get("VLLM_PROFILE_INTERVAL_SEC", "5")),
         log_fn=lambda msg: _log_run(run_dir, msg),
+        sweep_dir=_sweep_dir,
     )
     profiler.start()
 
@@ -2486,6 +2488,9 @@ def main() -> int:
         _write_agent_context_cache(sweep_dir)
     workload = _get_workload_description(runs_for_context)
     profile_context = _get_profile_context(runs_for_context, PROJECT_ROOT)
+    topology_context = get_topology_context(sweep_dir)
+    if topology_context:
+        profile_context = topology_context + "\n" + profile_context
     known_issues_section = _build_known_issues_section(runs_for_context)
     research_memory_section = ""
     if sweep_dir:

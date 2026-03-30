@@ -77,6 +77,7 @@ Practical guidance for future agents running `autollm` sweeps. This is based on 
 
 1. Verify the benchmark is the right one and comparisons are apples-to-apples.
 2. Confirm the current best config is semantically correct with the exact sample query path used by the harness.
-3. Read the latest `FULL_RETRO.md`, then inspect the winner's `vllm_metrics_profile.json`.
-4. Choose one high-leverage knob adjacent to the current winner; avoid broad pivots unless the evidence says the current axis is exhausted.
-5. If the measured gain is small, rerun or validate against variance before declaring victory.
+3. **Profile the baseline** using `scripts/profile_model.py` (or `make profile`). Read `latency_table.txt` to understand latency scaling and `kernel_summary.txt` to identify GPU bottlenecks. See `docs/PROFILING_GUIDE.md` for interpretation.
+4. Read the latest `FULL_RETRO.md`, then inspect the winner's `vllm_metrics_profile.json`.
+5. Use the profiling data to choose one high-leverage knob: if communication-bound, reduce TP or increase batching; if attention-bound, try FlashAttention3 or FP8 KV cache; if compute-bound, try quantization.
+6. If the measured gain is small, rerun or validate against variance before declaring victory.

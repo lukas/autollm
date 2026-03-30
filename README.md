@@ -189,6 +189,7 @@ results/sweep-qwen-latency/
   FULL_RETRO.md            # current sweep-wide retro synthesis
   RESEARCH_LOG.md          # append-only log of sweep web research
   RESEARCH_MEMORY.md       # cached synthesized research findings reused by later runs
+  gpu_topology.json         # GPU interconnect topology + NCCL transport (cached once per node)
   best-runllm -> .../runllm  # symlink to best config's runllm
   results.txt              # experiment log
   agent.log                # full local agent conversation history (all runs)
@@ -257,8 +258,28 @@ Remote sweep bookkeeping notes:
 | `make experiment` | Standalone AI experiment (no sweep) |
 | `make leaderboard SWEEP=name` | Refresh `results/sweep-name/leaderboard.txt` |
 | `make sweep-pods SWEEP=name` | List running labeled pods for a sweep |
+| `make profile POD=name MODEL_NAME=hf/name` | Profile a running pod: latency by sequence length + optional nsys GPU kernel breakdown |
 | `make dashboard` | Web dashboard at http://localhost:8765/ |
 | `make query PROMPT="Hello"` | Send a query to running vLLM |
+
+## Profiling
+
+Profile any running serving pod to understand latency scaling and GPU bottlenecks before tuning:
+
+```bash
+# Latency sweep across different output lengths (~2 min):
+make profile POD=sglang-kimi-bench MODEL_NAME=moonshotai/Kimi-K2.5
+
+# With nsys GPU kernel profiling (pod must be started under nsys launch):
+make profile POD=sglang-kimi-bench MODEL_NAME=moonshotai/Kimi-K2.5 NSYS=1 NSYS_SESSION=kimi_profile
+
+# Custom output lengths:
+make profile POD=vllm-qwen MODEL_NAME=Qwen/Qwen2.5-1.5B-Instruct LENGTHS=16,64,256,1024,4096
+```
+
+Outputs land in `results/profile-<pod>/`: `latency_table.txt`, `latency_vs_seqlen.png`, and optionally `kernel_summary.txt` with top GPU kernels by sequence length. See `docs/PROFILING_GUIDE.md` for interpretation.
+
+Sweeps also auto-collect GPU topology and NCCL transport info (once per sweep, cached in `gpu_topology.json`) so the agent knows the interconnect before making optimization decisions.
 
 ## Environment variables
 

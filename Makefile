@@ -248,6 +248,13 @@ sync-benchmarks: ensure-kubeconfig
 # ── Setup / bootstrap targets ────────────────────────────────────────────────
 
 # One-time local bootstrap for a fresh checkout.
+# Profile a running pod: latency by sequence length + optional nsys kernel breakdown.
+# Usage: make profile POD=sglang-kimi-bench MODEL_NAME=moonshotai/Kimi-K2.5
+#        make profile POD=vllm-qwen MODEL_NAME=Qwen/Qwen2.5-1.5B-Instruct
+#        make profile POD=sglang-kimi-bench MODEL_NAME=moonshotai/Kimi-K2.5 NSYS=1 NSYS_SESSION=kimi_profile
+profile: ensure-kubeconfig
+	python3 scripts/profile_model.py --pod "$(POD)" --model "$(MODEL_NAME)" $(if $(NSYS),--nsys --nsys-session "$(or $(NSYS_SESSION),profile_session)",) $(if $(LENGTHS),--lengths "$(LENGTHS)",) $(if $(REPS),--reps $(REPS),)
+
 setup: sync ensure-kubeconfig
 
 # Generate kubeconfig from .env (KUBECONFIG_SERVER, KUBECONFIG_TOKEN). kubeconfig is gitignored.

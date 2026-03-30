@@ -66,6 +66,8 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `sweep-controller-rbac.yaml` | RBAC: ServiceAccount, Role, RoleBinding for controller to manage vLLM pods |
 | `runllm/<model>/` | Per-model vLLM deploy/query/test directories (e.g. `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-trt/`). Each has `pod.yaml`, `Makefile`, `query.py`, `test_smoke.sh`. |
 | `docs/BENCHMARK_HARNESS.md` | Current harness and sweep docs |
+| `docs/PROFILING_GUIDE.md` | How to profile latency-by-length + nsys GPU kernels; decision trees for what to optimize |
+| `scripts/profile_model.py` | Standalone profiling script: latency sweep + nsys kernel breakdown against any running pod |
 | `docs/SWEEP_BEST_PRACTICES.md` | One-page synthesis of cross-sweep lessons for future optimization agents |
 | `results/sweep-NAME/AGENT_CONTEXT.md` | Generated compact sweep memory for prompts: top frontier, repeated failures, and harness-only patterns |
 | `results/sweep-NAME/RESEARCH_LOG.md` | Append-only log of external research (`search_web` / `fetch_url`) done during the sweep |
@@ -143,6 +145,44 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
   - `ai_experiment.py` (improve runs) calls `run_benchmark_k8s()` directly in `_deploy_and_benchmark()`. Port-forward is no longer used.
   - `run_guideline_experiment.py` also uses `run_benchmark_k8s()` and expects `EXPERIMENT_POD_NAME` env var.
 - If the serving config uses `--trust-remote-code`, the benchmark Job must pass `--processor-args '{"trust_remote_code": true}'` so guidellm can load the same tokenizer/processor path. This is required for Kimi-K2.5.
+
+### Profiling (Latency-by-Length + nsys GPU Kernels)
+
+`scripts/profile_model.py` is a standalone tool that profiles any running serving pod:
+
+```bash
+# Quick latency sweep (no nsys, ~2 min):
+make profile POD=sglang-kimi-bench MODEL_NAME=moonshotai/Kimi-K2.5
+
+# With nsys kernel profiling (pod must be started under nsys launch):
+make profile POD=sglang-kimi-bench MODEL_NAME=moonshotai/Kimi-K2.5 NSYS=1 NSYS_SESSION=kimi_profile
+```
+
+Outputs in `results/profile-<pod>/`: `latency_table.txt` (compact table for agent context), `kernel_summary.txt` (GPU kernel breakdown by output length), `latency_vs_seqlen.png` (graph).
+
+Agents can run this via `run_shell` before planning optimization strategies:
+- Read `latency_table.txt` to understand how latency/throughput scales with sequence length
+- Read `kernel_summary.txt` to identify whether the bottleneck is communication, attention, or compute
+- See `docs/PROFILING_GUIDE.md` for the full decision tree
+
+For nsys, the serving pod must be started with `nsys launch --session-new=<name> --trace=cuda,nvtx ...` wrapping the serve command. Set `restartPolicy: Never` during profiling.
+
+### Auto-Collected GPU Topology & NCCL Transport
+
+The first run of each sweep collects GPU interconnect info and caches it in `results/sweep-NAME/gpu_topology.json`. Subsequent runs skip collection entirely (~0ms overhead). Re-collected only if the pod lands on a different node.
+
+Data collected:
+- **`nvidia-smi topo -m`**: GPU topology matrix (NVLink, NVSwitch, PIX, SYS connections)
+- **NCCL transport**: network type, bandwidth, channel counts, P2P transport, NVLS status, InfiniBand availability (only when pod has `NCCL_DEBUG=INFO`)
+- **NVLink status**: active link count per GPU
+
+A compact summary is automatically included in every improve prompt so the agent knows the interconnect. To get the full NCCL transport info (not just nvidia-smi topo), add these env vars to the pod spec:
+```yaml
+- name: NCCL_DEBUG
+  value: "INFO"
+- name: NCCL_DEBUG_SUBSYS
+  value: "INIT,NET,GRAPH"
+```
 
 ### Deploy Watchdog (Activity-Aware Timeout)
 

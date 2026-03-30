@@ -273,6 +273,12 @@ def main() -> None:
         _log(run_dir, "run.log", "vLLM ready")
 
     # 5. Run benchmark
+    # Detect sweep_dir from run path (results/sweep-NAME/baseline/ or results/sweep-NAME/TS/)
+    _sweep_dir = None
+    if run_dir.parent.name.startswith("sweep-"):
+        _sweep_dir = run_dir.parent
+    elif run_dir.parent.parent.name.startswith("sweep-"):
+        _sweep_dir = run_dir.parent.parent
     profiler = VLLMProfiler(
         pod_name=VLLM_POD,
         run_dir=run_dir,
@@ -280,6 +286,7 @@ def main() -> None:
         yaml_path=POD_YAML,
         interval_sec=float(os.environ.get("VLLM_PROFILE_INTERVAL_SEC", "5")),
         log_fn=lambda msg: _log(run_dir, "run.log", msg),
+        sweep_dir=_sweep_dir,
     )
     profiler.start()
     _log(
