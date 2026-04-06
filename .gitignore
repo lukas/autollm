@@ -8,3 +8,6 @@ results.txt
 runllm-*/
 sweep*.log
 sglang/
+
+# grist is a separate repo (github.com/lukas/grist)
+grist/

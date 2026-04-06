@@ -73,6 +73,8 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `results/sweep-NAME/RESEARCH_LOG.md` | Append-only log of external research (`search_web` / `fetch_url`) done during the sweep |
 | `results/sweep-NAME/RESEARCH_MEMORY.md` | Cached synthesized research memory that future runs should read before doing more web research |
 
+**Nested repo:** `grist/` is gitignored here; it is its own project at [github.com/lukas/grist](https://github.com/lukas/grist). Clone into `./grist` beside this tree if needed.
+
 ---
 
 ## Behavior That Was Intentionally Added
@@ -184,6 +186,20 @@ A compact summary is automatically included in every improve prompt so the agent
   value: "INIT,NET,GRAPH"
 ```
 
+### Model-Specific Insights
+
+`results/<model-family>-insights/` directories contain durable profiling and optimization knowledge for each model family. These are automatically loaded into improve prompts when the sweep's `model_family` matches.
+
+| Directory | Contents |
+|-----------|----------|
+| `results/kimi-insights/` | Kimi-K2.5: kernel breakdown, latency profile, GPU topology, NVLS experiment, optimization strategy |
+
+Each directory has:
+- `SUMMARY.md` — consolidated summary (loaded into agent prompt, truncated to 3000 chars)
+- Individual insight files (topology, kernel breakdown, latency, experiment results)
+
+To add insights for a new model: create `results/<family>-insights/SUMMARY.md`. The `_get_model_insights()` function in `ai_experiment.py` loads it by matching on `model_family` from `sweep_metadata.json`.
+
 ### Deploy Watchdog (Activity-Aware Timeout)
 
 The health check watchdog in `ai_experiment.py` uses an activity-aware strategy instead of a flat timer:
@@ -222,7 +238,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 ### runllm Surface
 
-- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`, `kimi-sglang-eagle/`, `kimi-sglang-tensorizer/`).
+- `autollm/runllm/` contains per-model deployment variants (for example `qwen2.5-1.5b/`, `qwen3-235b/`, `kimi-vllm/`, `kimi-sglang/`, `kimi-sglang-eagle/`, `kimi-sglang-concurrent/`, `kimi-sglang-tensorizer/`).
 - Each model dir is self-contained with `pod.yaml`, `Makefile`, `query.py`, `test_smoke.sh`.
 - `query.py` and `test_smoke.sh` use `/v1/chat/completions`.
 - Each Makefile respects exported `KUBECONFIG` and otherwise falls back to `../../kubeconfig` (relative to the model dir).
@@ -249,6 +265,7 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 - **Sweep prompt contract:** The agent prompt in `ai_experiment.py` tells the LLM to PRESERVE the `command:` block, PVC volumes, and tensorizer flags. Only `vllm serve` flags (after `exec vllm serve ... \`) may be tuned. The model extraction regex looks for `--served-model-name` first.
 - **Kimi vLLM exception:** Kimi-K2.5 on vLLM currently does *not* use tensorizer. It serves from HF safetensors cached under `/mnt/models/hf-cache` with `--trust-remote-code`. Tensorizer hit multiple incompatibilities with the multimodal + quantized Kimi stack on vLLM.
 - **Kimi SGLang tensorizer:** `kimi-sglang-tensorizer/` is an experimental variant that adds tensorizer support to SGLang. The SGLang source at `autollm/sglang/` is patched with a `TensorizerModelLoader` (in `model_loader/loader.py`) that supports direct GPU deserialization via `load_into_module()`. Requires a one-time serialization step (`make tensorize` in the variant dir) and a custom Docker image (`lbiewald/sglang-tensorizer:latest`, built from `autollm/sglang/Dockerfile.tensorizer`). Serialized weights go to `/mnt/models/sglang/moonshotai/Kimi-K2.5/v1/model-rank-NNN.tensors`. The serialization hook uses `SGLANG_TENSORIZE_OUTPUT_DIR` / `SGLANG_TENSORIZE_AND_EXIT` env vars in `model_runner.py`.
+- **Kimi concurrent variant:** `kimi-sglang-concurrent/` is based on the best sequential config from `sweep-kimi-sglang-large` (EAGLE3 + SPEC_V2 + fa3/flashinfer attention) but adapted for high-concurrency workloads: `--max-running-requests` removed (was 1), `--cuda-graph-max-bs 64` (was 16), `--num-continuous-decode-steps` removed (was 2, can starve concurrent requests), `--mem-fraction-static 0.80` (was 0.85, more KV cache headroom).
 - **Kimi EAGLE-3 variant:** `kimi-sglang-eagle/` serves Kimi-K2.5 on SGLang with EAGLE-3 speculative decoding using `lightseekorg/kimi-k2.5-eagle3` as the draft model. Both the main model and draft model are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`. The `pod.yaml` applies a startup patch to backport `set_eagle3_layers_to_capture` / `get_embed_and_head` / `set_embed_and_head` onto `KimiK25ForConditionalGeneration` (present on SGLang main but missing in v0.5.9). Remove the patch when upgrading past v0.5.9. Tested: ~2.6 tokens/step accept length, 65% acceptance rate.
 - **Multithreaded safetensors loading:** SGLang variants use `--load-format safetensors --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}'` to load weights in parallel. This reduced Kimi-K2.5 loading from ~35 min to ~4 min on the NFS-backed `models` PVC. Available since SGLang v0.5.8+.
 - **Kimi TensorRT-LLM variant:** `kimi-trt/` serves Kimi-K2.5 via `trtllm-serve` with `--backend pytorch` and 8× GPU tensor parallelism. Model weights are cached on the PVC via `HF_HOME=/mnt/models/hf-cache`. First startup may be slower due to engine optimization. Not yet tested end-to-end.

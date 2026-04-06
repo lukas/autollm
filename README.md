@@ -10,6 +10,9 @@ AI-driven vLLM optimization on Kubernetes. Deploys vLLM, benchmarks latency/thro
 git clone --recurse-submodules https://github.com/lukas/autollm
 cd autollm
 
+# Optional: related repo [grist](https://github.com/lukas/grist) (not a submodule; `.gitignore`d if present):
+# git clone https://github.com/lukas/grist.git grist
+
 # 1. Bootstrap local deps + kubeconfig:
 make setup
 
@@ -280,6 +283,22 @@ make profile POD=vllm-qwen MODEL_NAME=Qwen/Qwen2.5-1.5B-Instruct LENGTHS=16,64,2
 Outputs land in `results/profile-<pod>/`: `latency_table.txt`, `latency_vs_seqlen.png`, and optionally `kernel_summary.txt` with top GPU kernels by sequence length. See `docs/PROFILING_GUIDE.md` for interpretation.
 
 Sweeps also auto-collect GPU topology and NCCL transport info (once per sweep, cached in `gpu_topology.json`) so the agent knows the interconnect before making optimization decisions.
+
+### Model-specific insights
+
+Durable profiling and optimization knowledge lives in `results/<model-family>-insights/`:
+
+```
+results/kimi-insights/
+  SUMMARY.md              # consolidated summary (auto-loaded into sweep prompts)
+  gpu_topology.md         # NVLink/NVSwitch topology, NCCL transport
+  kernel_breakdown.md     # GPU kernel time % by category and sequence length
+  latency_profile.md      # latency-by-sequence-length table
+  nvls_experiment.md      # NVLS experiment results
+  optimization_strategy.md # prioritized strategies with rationale
+```
+
+When a sweep's `model_family` matches a directory name, `SUMMARY.md` is automatically included in the agent's improve prompt. To add insights for a new model, create `results/<family>-insights/SUMMARY.md`.
 
 ## Environment variables
 
