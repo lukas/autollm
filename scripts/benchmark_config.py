@@ -63,6 +63,13 @@ BENCHMARK_PRESETS: dict[str, dict[str, str | None]] = {
         "rate": "16",
         "data": "prompt_tokens=256,output_tokens=128",
     },
+    "concurrent-32": {
+        "profile": "concurrent",
+        "max_requests": "200",
+        "max_seconds": "300",
+        "rate": "32",
+        "data": "prompt_tokens=256,output_tokens=128",
+    },
     "concurrent-large": {
         "profile": "concurrent",
         "max_requests": "500",

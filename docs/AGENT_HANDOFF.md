@@ -73,7 +73,7 @@ The older `scripts/ai_benchmark_optimizer.py` / dashboard flow still exists, but
 | `results/sweep-NAME/RESEARCH_LOG.md` | Append-only log of external research (`search_web` / `fetch_url`) done during the sweep |
 | `results/sweep-NAME/RESEARCH_MEMORY.md` | Cached synthesized research memory that future runs should read before doing more web research |
 
-**Nested repo:** `grist/` is gitignored here; it is its own project at [github.com/lukas/grist](https://github.com/lukas/grist). Clone into `./grist` beside this tree if needed.
+**Nested repo:** `grist/` is gitignored here; it is its own project at [github.com/lukas/grist](https://github.com/lukas/grist). Clone into `./grist` beside this tree if needed. Current Grist builds include a restored Claude/Cursor-style skill system with bundled skills, a Skills modal, global/project install roots at `~/.grist/skills/` and `<repo>/.grist/skills/`, a typed manager-worker swarm contract (`manager`, `scout`, `implementer`, `reviewer`, `verifier`, `summarizer`) with structured artifacts and an `AGENTS.md` repo contract, git-first bootstrap with local per-agent branches/worktrees, selective best-effort Docker runtimes with persisted port/runtime metadata and cleanup, a stricter greenfield path that drops empty-repo scouts, keeps one main implementer, and bumps that implementer's step budget, command execution that now resolves relative `cwd` values inside the task worktree instead of the Grist repo, adaptive verifier checks that stop after the first hard failure and can use build/startup smoke when `npm test` is absent, reducer gating that keeps summarizers blocked until non-reducer work is finished and dependency artifacts exist, safer shell-command chaining that only permits individually allowlisted segments, a more forgiving internal `apply_patch` tool (`diff` or `patch` input), automatic verifier-driven repair tasks on the same worktree, one post-verify wrap-up implementer for cleanup/docs/PR/memory work, verified source-file apply-back into the canonical repo, verifier-gated completion so runs do not finish while the latest relevant verifier is still failing, softer verifier/summarizer failure recovery after successful implementation, a calmer task feed that collapses patch-heavy tool output into compact diff summaries, viewport-level blocker tooltips so hover text is not clipped by the scrollable sidebar, single-instance Electron startup, a shareable `docs/SWARM_STRATEGY_SUMMARY.md` review doc, and a clean shutdown path that stops scheduler timers before closing SQLite. `task_diff` rows stay compact by default and expand into a single focused diff panel instead of showing metadata/debug structure.
 
 ---
 
@@ -315,6 +315,9 @@ The health check watchdog in `ai_experiment.py` uses an activity-aware strategy 
 
 14. **Every runllm variant must mount the `models` PVC for model caching.**
    Without a PVC, HuggingFace models are re-downloaded from scratch on every pod restart — hundreds of GB for large models like Kimi-K2.5. For vLLM variants, use `--download-dir /mnt/models/hf-cache`. For SGLang variants, set the `HF_HOME` env var to `/mnt/models/hf-cache`. Always add the `models` PVC volume and volumeMount. This applies to both main models and draft/speculative models. When creating a new `runllm/` variant, copy the volume config from an existing variant rather than starting without it.
+
+15. **Do not patch `node_modules/electron/dist/Electron.app` during Grist dev builds on macOS.**
+   Rewriting `Info.plist` in-place can leave the dev app bundle in a bad state and cause `npm run dev` to die with an Electron `SIGKILL`. Keep the stock Electron app bundle untouched and customize app naming from Grist's own Electron code instead.
 
 ---
 

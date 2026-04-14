@@ -40,6 +40,33 @@ from sweep_utils import completed_request_count, is_valid_run, metric_mean, swee
 from vllm_profiling import VLLMProfiler, get_topology_context, write_vllm_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RESULTS_DIR = PROJECT_ROOT / "results"
+
+MODEL_INSIGHTS_CHAR_LIMIT = 3000
+
+
+def _get_model_insights(model_family: str) -> str:
+    """Load model-specific insights from results/<family>-insights/SUMMARY.md."""
+    if not model_family:
+        return ""
+    candidates = [
+        RESULTS_DIR / f"{model_family}-insights" / "SUMMARY.md",
+        RESULTS_DIR / f"{model_family.split('-')[0]}-insights" / "SUMMARY.md",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                text = path.read_text().strip()
+                if text:
+                    truncated = text[:MODEL_INSIGHTS_CHAR_LIMIT]
+                    return (
+                        f"\n## Model-specific insights (from profiling & past experiments)\n\n"
+                        f"{truncated}\n"
+                    )
+            except Exception:
+                pass
+    return ""
+
 
 _DEFAULT_KUBECONFIG = PROJECT_ROOT / "kubeconfig"
 if not os.environ.get("KUBECONFIG") and _DEFAULT_KUBECONFIG.exists():
@@ -76,7 +103,6 @@ signal.signal(signal.SIGTERM, _handle_signal)
 RUNLLM = PROJECT_ROOT / "runllm"
 DEFAULT_MODEL_DIR = "qwen2.5-1.5b"
 RUNS_DIR = PROJECT_ROOT / "results" / "runs"
-RESULTS_DIR = PROJECT_ROOT / "results"
 PROGRESS_FILE = PROJECT_ROOT / "results" / "experiment_progress.json"
 
 # If no log activity for this many seconds during deploy/health phases, abort.
@@ -2491,6 +2517,7 @@ def main() -> int:
     topology_context = get_topology_context(sweep_dir)
     if topology_context:
         profile_context = topology_context + "\n" + profile_context
+    model_insights_section = _get_model_insights(model_family)
     known_issues_section = _build_known_issues_section(runs_for_context)
     research_memory_section = ""
     if sweep_dir:
@@ -2667,7 +2694,7 @@ These files persist: the next run will inherit your changes if this run becomes 
 ## Experiment leaderboard
 
 {leaderboard}
-{known_issues_section}{research_memory_section}{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}{custom_code_section}
+{known_issues_section}{research_memory_section}{model_insights_section}{profile_context}{latest_retro_section}{full_retro_section}{meta_feedback_section}{backend_templates_section}{custom_code_section}
 ## Hard constraints (DO NOT violate)
 
 - {backend_constraints_section}
